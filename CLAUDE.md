@@ -1,0 +1,111 @@
+# CLAUDE.md
+
+Project operating manual for Claude Code sessions on LLMwiki_StudyGroup. Auto-loaded at session start.
+
+## Prime directive: plan-first, human-approved
+
+No autonomous coding without human sign-off. Every non-trivial change follows:
+
+1. **Plan** — write the plan to `.harness/active_plan.md` (create or overwrite).
+2. **Council** — invoke the Gemini council against the plan (see below).
+3. **Approve** — surface the Lead Architect synthesis to the human; wait for explicit approval.
+4. **Execute** — implement in small, testable increments.
+5. **Reflect** — append a KEEP / IMPROVE / INSIGHT / COUNCIL block to `.harness/learnings.md`.
+
+Trivial changes that skip the council: typo fixes, single-line bug fixes, comment edits, reverting a failed change. Everything else routes through council.
+
+## Circuit breaker
+
+If `.harness_halt` exists at repo root, stop all work. Print the file's contents to the user and do nothing else until the file is removed. See `.harness/halt_instructions.md`.
+
+## Session I/O protocol
+
+**At session start:**
+- Read `.harness/session_state.json` to learn the active plan, last council run, current focus area, last commit.
+- Read the last ~20 lines of `.harness/yolo_log.jsonl` to understand recent events.
+- Skim `.harness/learnings.md` for accumulated context — especially the most recent COUNCIL and INSIGHT entries.
+
+**At session end (or after each meaningful task):**
+- Append a reflection block to `.harness/learnings.md`:
+  ```
+  ## <YYYY-MM-DD HH:MM> — <task title>
+  ### KEEP
+  - <what worked>
+  ### IMPROVE
+  - <what to change next time>
+  ### INSIGHT
+  - <non-obvious thing worth remembering>
+  ### COUNCIL
+  - <notable feedback from the council, if run>
+  ```
+- Update `.harness/session_state.json` (`active_plan`, `focus_area`, `last_council` as applicable).
+- `.harness/yolo_log.jsonl` is append-only; add an event line describing the outcome.
+
+The `post-commit` git hook handles `last_commit` bookkeeping automatically — do not edit that field by hand.
+
+## When to run the council
+
+Invoke `python3 .harness/scripts/council.py --plan .harness/active_plan.md` before writing code when any of these apply:
+
+- New feature (anything user-facing or adding a new route/component/job).
+- Database migration or RLS change.
+- New runtime dependency.
+- Auth or secrets surface change.
+- New external API call (Claude, Gemini, Voyage, AssemblyAI, Reducto, etc.).
+- Cost-impacting change (token budget, model swap, cache policy).
+- Change that crosses the server/client boundary in Next.js.
+
+For diff-review after a change is implemented but before commit:
+`python3 .harness/scripts/council.py --diff`
+
+The council reads the seven personas in `.harness/council/` and produces `.harness/last_council.md`. The Lead Architect synthesis is the authoritative plan; present it verbatim to the human before executing.
+
+**Hard cost cap:** 15 Gemini calls per run. The script enforces this.
+
+## Non-negotiables (no council run can override these)
+
+- **RLS on every Supabase table.** No exceptions. Cohort isolation is the security model.
+- **Service-role Supabase keys never reach the client.** Server-only.
+- **No raw SQL string interpolation.** Use Supabase client or parameterized queries.
+- **No untrusted ingested content in `dangerouslySetInnerHTML`.** Sanitize or render as text.
+- **No PII or API keys in logs.** Redact before logging.
+- **Rate-limit every Claude/Gemini/embedding/transcription call.** Budget is $75–110/mo total.
+- **Conventional commits** (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`). See `CONTRIBUTING.md`.
+- **TypeScript strict mode.** No `any` without a one-line justification comment.
+
+## Cost posture
+
+Target: $75–110/month total. Route by model capability:
+
+- **Claude Haiku 4.5** — bulk summarization, tagging, extraction, simple classification.
+- **Claude Opus 4.6** — complex reasoning, multi-step synthesis, plan critique (rare).
+- **Gemini 2.5 Pro** — council reviews only (local dev tool, not production path).
+- **Voyage-3** — embeddings (preferred over OpenAI for quality/price).
+- **AssemblyAI** — transcription (better on technical vocabulary than Whisper).
+
+Every API callsite documents its expected call volume and per-call cost in a comment at the callsite.
+
+## Stack invariants
+
+- **Next.js 15 App Router** — server components by default, client components only when needed.
+- **Supabase** — Postgres + pgvector + Auth + Realtime. RLS always.
+- **Inngest** — all async work (ingestion, embeddings, SRS updates). Idempotent, retry-safe.
+- **TypeScript strict**, **ESLint**, **Prettier**, **Tailwind** for styling.
+- **FSRS** for spaced repetition (not SM-2).
+- **Three-tier memory:** Bedrock (always-on) / Active (current semester) / Cold (archived, searchable).
+
+## Before committing
+
+1. `npm run lint` passes (once scaffolding exists).
+2. `npm run typecheck` passes.
+3. `npm test` passes for touched modules.
+4. `.harness/scripts/security_checklist.md` reviewed for any surface this change touches.
+5. Conventional-commit message.
+
+## References
+
+- `.harness/README.md` — one-time setup and file map.
+- `.harness/council/` — persona definitions.
+- `.harness/model-upgrade-audit.md` — 5-layer checklist for any model swap.
+- `.harness/halt_instructions.md` — circuit breaker.
+- `CONTRIBUTING.md` — human-facing contribution workflow.
