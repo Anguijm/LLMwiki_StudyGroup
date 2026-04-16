@@ -46,7 +46,9 @@ python3 .harness/scripts/council.py -h    # → help text, no import errors
 │   ├── council.py           # Gemini council runner (local)
 │   ├── install_hooks.sh     # one-time: git config core.hooksPath
 │   ├── requirements.txt     # Python deps for council.py
-│   └── security_checklist.md# authoritative non-negotiables (loaded by council)
+│   ├── security_checklist.md# authoritative non-negotiables (loaded by council)
+│   ├── pr_watcher_budget.py # monthly run-count pre-flight for PR watcher
+│   └── log_pr_watch.sh      # appends pr_watch_run entries after watcher runs
 ├── hooks/
 │   └── post-commit          # auto-updates session_state.json + yolo_log.jsonl
 ├── memory/                  # session snapshots (agent-written, gitignored contents OK)
@@ -123,6 +125,7 @@ Three tiers, each optimized for a different consumer:
 {"ts": "...", "event": "harness_init", "note": "..."}
 {"ts": "...", "event": "commit", "commit": { "hash": "...", "short": "...", "subject": "...", ... }}
 {"ts": "...", "event": "council_run", "source": "...", "model": "...", "scores": { ... }}
+{"ts": "...", "event": "pr_watch_run", "pr": "...", "trigger": "...", "over_budget": false}
 {"ts": "...", "event": "task_complete", "title": "...", "summary": "..."}
 ```
 
@@ -159,8 +162,32 @@ When you swap any model (Claude tier, Gemini version, embedding model, transcrip
 ## What's not here (yet)
 
 - **Quality gates** (`npm run lint` / `typecheck` / `test` wrappers for the council to consume). Deferred until the Next.js scaffolding exists. When they land, they'll live at `.harness/scripts/quality_gates.sh`.
-- **GitHub Actions workflow.** Intentional — council is local-only to keep the `GEMINI_API_KEY` out of GitHub secrets and PR comments out of the review noise.
 - **Tick/tock hourly cron.** That's a yolo-projects pattern for generating many small apps; this repo is one complex app, so it's the wrong mode.
+
+## PR watcher (GitHub Actions)
+
+Separate from the local Gemini council: the repo has a **Claude-powered PR watcher** that reacts to events on every open PR — Codex review comments, CI failures, and `@claude` mentions. Triage-only; every action is bounded by the scope policy.
+
+Files:
+- `.github/workflows/pr-watch.yml` — workflow.
+- `.github/claude-pr-watcher-prompt.md` — the watcher's system prompt (scope policy lives here).
+- `.harness/scripts/pr_watcher_budget.py` — monthly run-count pre-flight (cap: 150 runs/month).
+- `.harness/scripts/log_pr_watch.sh` — appends `{event: "pr_watch_run", ...}` to `yolo_log.jsonl` after every run.
+
+One-time setup (required):
+- Add `ANTHROPIC_API_KEY` as a repo secret (*Settings → Secrets and variables → Actions → New repository secret*). User-owned GitHub accounts cannot share secrets across repos; copy the value from wherever else you have it.
+
+Scope (enforced by the prompt, not the workflow):
+- Watcher edits `.harness/` (except `council/*.md`, `scripts/council.py`, and `CLAUDE.md`) and source files for localized lint/type/test fixes.
+- Watcher asks the human for: migrations, RLS changes, dependency bumps, auth/secret/CSP edits, workflow edits, any change > 200 LOC, Codex P0/`critical` comments.
+- Watcher never merges, force-pushes, amends, or pushes to `main`.
+- Uses Claude Haiku 4.5 by default; ~$3–6/month expected.
+
+Relationship to the local council:
+- **Council = pre-plan advisor, run by you before writing code. Gemini-powered. Local-only.**
+- **Watcher = post-PR triage, runs in CI without a session attached. Claude-powered.**
+
+They don't overlap. The council edits what you're about to do; the watcher reacts to what's already been pushed.
 
 ## Troubleshooting
 

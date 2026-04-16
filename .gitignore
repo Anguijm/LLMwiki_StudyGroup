@@ -1,3 +1,5 @@
-# Harness working files — regenerated each plan/council run.
-.harness/active_plan.md
+# Harness ephemeral files — regenerated each council run, not reviewable.
 .harness/last_council.md
+
+# active_plan.md is intentionally tracked: it's the artifact reviewed before
+# execution and approved by the human, so it must travel to CI/Codespace/origin.
