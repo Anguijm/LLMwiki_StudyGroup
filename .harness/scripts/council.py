@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -86,6 +87,14 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
 
     if args.diff:
         base = args.base
+        diff = ""
+        base_used = base
+        missing_ref_markers = (
+            "unknown revision",
+            "bad revision",
+            "ambiguous argument",
+            "not a tree object",
+        )
         try:
             diff = subprocess.check_output(
                 ["git", "diff", f"{base}...HEAD"],
@@ -94,7 +103,18 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
                 stderr=subprocess.STDOUT,
             )
         except subprocess.CalledProcessError as e:
-            die(f"git diff failed: {e.output}")
+            output = (e.output or "").strip()
+            if any(m in output.lower() for m in missing_ref_markers):
+                tail = output.splitlines()
+                reason = tail[-1] if tail else "unknown error"
+                print(
+                    f"[council] base ref '{base}' unavailable ({reason}); "
+                    f"falling back to working-tree diff (git diff HEAD).",
+                    file=sys.stderr,
+                )
+                base_used = "HEAD (working tree, base missing)"
+            else:
+                die(f"git diff {base}...HEAD failed:\n{output}")
         if not diff.strip():
             try:
                 diff = subprocess.check_output(
@@ -102,11 +122,13 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
                     cwd=REPO_ROOT,
                     text=True,
                 )
+                if base_used == base:
+                    base_used = "HEAD (working tree, empty vs base)"
             except subprocess.CalledProcessError as e:
                 die(f"git diff HEAD failed: {e}")
         if not diff.strip():
             die("No diff to review (neither vs base nor working tree).")
-        return f"DIFF vs {base}", diff
+        return f"DIFF vs {base_used}", diff
 
     die("Pass --plan <path> or --diff.")
 
@@ -123,9 +145,40 @@ def build_prompt(persona_body: str, source_label: str, source_text: str, extra: 
     )
 
 
-def call_gemini(client, model: str, prompt: str, retries: int = 2) -> str:
+class RequestBudget:
+    """Thread-safe counter that bounds total Gemini requests including retries."""
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.used = 0
+        self._lock = threading.Lock()
+
+    def try_charge(self) -> bool:
+        with self._lock:
+            if self.used >= self.cap:
+                return False
+            self.used += 1
+            return True
+
+    def snapshot(self) -> tuple[int, int]:
+        with self._lock:
+            return self.used, self.cap
+
+
+def call_gemini(
+    client,
+    model: str,
+    prompt: str,
+    budget: "RequestBudget",
+    retries: int = 2,
+) -> str:
     last_err: Exception | None = None
     for attempt in range(retries + 1):
+        if not budget.try_charge():
+            return (
+                f"(skipped: global request budget of {budget.cap} exhausted "
+                f"before attempt {attempt + 1})"
+            )
         try:
             resp = client.generate_content(prompt)
             return (resp.text or "").strip() or "(empty response)"
@@ -212,9 +265,11 @@ def main() -> int:
     model_client = genai.GenerativeModel(args.model)
 
     checklist = load_security_checklist()
+    budget = RequestBudget(CALL_CAP)
 
     print(f"[council] Model: {args.model}")
     print(f"[council] Source: {source_label}")
+    print(f"[council] Request budget: {CALL_CAP} (includes retries)")
     print(f"[council] Dispatching {len(personas)} angle reviews in parallel...")
 
     critiques: dict[str, str] = {}
@@ -227,7 +282,7 @@ def main() -> int:
                 else ""
             )
             prompt = build_prompt(body, source_label, source_text, extra=extra)
-            futures[pool.submit(call_gemini, model_client, args.model, prompt)] = name
+            futures[pool.submit(call_gemini, model_client, args.model, prompt, budget)] = name
         for fut in as_completed(futures):
             name = futures[fut]
             critiques[name] = fut.result()
@@ -245,10 +300,19 @@ def main() -> int:
     for name, text in sorted(critiques.items()):
         synthesis_payload += f"\n### {name}\n{text}\n"
     lead_prompt = build_prompt(lead_body, source_label, synthesis_payload)
-    synthesis = call_gemini(model_client, args.model, lead_prompt)
+    synthesis = call_gemini(model_client, args.model, lead_prompt, budget)
+    used, cap = budget.snapshot()
+    print(f"[council] Requests consumed: {used}/{cap}")
 
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    report = [f"# Council report — {ts}", "", f"**Source:** {source_label}", "", "## Scores"]
+    report = [
+        f"# Council report — {ts}",
+        "",
+        f"**Source:** {source_label}",
+        f"**Requests:** {used}/{cap}",
+        "",
+        "## Scores",
+    ]
     for name in sorted(critiques):
         score = scores[name]
         report.append(f"- `{name}`: {score if score is not None else 'n/a'}")
@@ -271,6 +335,8 @@ def main() -> int:
             "source": source_label,
             "model": args.model,
             "scores": scores,
+            "requests_used": used,
+            "requests_cap": cap,
         }
     )
     update_session_state_council(scores, source_label)
