@@ -89,6 +89,12 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
         base = args.base
         diff = ""
         base_used = base
+        missing_ref_markers = (
+            "unknown revision",
+            "bad revision",
+            "ambiguous argument",
+            "not a tree object",
+        )
         try:
             diff = subprocess.check_output(
                 ["git", "diff", f"{base}...HEAD"],
@@ -97,14 +103,18 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
                 stderr=subprocess.STDOUT,
             )
         except subprocess.CalledProcessError as e:
-            tail = (e.output or "").strip().splitlines()
-            reason = tail[-1] if tail else "unknown error"
-            print(
-                f"[council] base ref '{base}' unavailable ({reason}); "
-                f"falling back to working-tree diff (git diff HEAD).",
-                file=sys.stderr,
-            )
-            base_used = "HEAD (working tree, base missing)"
+            output = (e.output or "").strip()
+            if any(m in output.lower() for m in missing_ref_markers):
+                tail = output.splitlines()
+                reason = tail[-1] if tail else "unknown error"
+                print(
+                    f"[council] base ref '{base}' unavailable ({reason}); "
+                    f"falling back to working-tree diff (git diff HEAD).",
+                    file=sys.stderr,
+                )
+                base_used = "HEAD (working tree, base missing)"
+            else:
+                die(f"git diff {base}...HEAD failed:\n{output}")
         if not diff.strip():
             try:
                 diff = subprocess.check_output(
@@ -112,7 +122,8 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
                     cwd=REPO_ROOT,
                     text=True,
                 )
-                base_used = "HEAD (working tree)"
+                if base_used == base:
+                    base_used = "HEAD (working tree, empty vs base)"
             except subprocess.CalledProcessError as e:
                 die(f"git diff HEAD failed: {e}")
         if not diff.strip():
