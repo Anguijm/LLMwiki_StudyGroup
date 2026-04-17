@@ -1,11 +1,12 @@
-# LLMwiki_StudyGroup — production scaffold (v0, revision 4)
+# LLMwiki_StudyGroup — production scaffold (v0, revision 5)
 
 ## Status
 
 - r1 council (SHA `b9109fa`): **REVISE**. security 3, a11y 5, bugs 6, cost 9, arch 9, product 10. 2 × codex P2.
-- r2 council (SHA `990d2f7`): **REVISE**. security 3, a11y **9**, bugs 6, cost 9, arch **10**, product 10. 3 new security non-negotiables + 5 new bug classes.
-- r3 council (SHA `845af75`): **REVISE**. security **9**, a11y 9, bugs **5**, cost **10**, arch 10, product **8** (hardening pushback). 7 blockers: 5 bugs + 2 security must-dos. No non-negotiable violations.
-- r4 folds every r3 blocker (idempotency × 2, orphaned storage, realtime race, ON DELETE, HTTP timeouts, Realtime RLS test, dep-vetting). Product 10→8 pushback explicitly rejected — hardening is what earned the 3→9 security jump; trimming it would regress security, and the friction is near-zero for a 4-user cohort (only the 100k-token/hr budget is even potentially user-visible). No prior fix regresses.
+- r2 council (SHA `990d2f7`): **REVISE**. security 3, a11y 9, bugs 6, cost 9, arch 10, product 10.
+- r3 council (SHA `845af75`): **REVISE**. security 9, a11y 9, bugs 5, cost 10, arch 10, product 8.
+- r4 council (SHA `1e2e59a`): **REVISE**. security 9 (0 non-negotiable violations), a11y 9, bugs **9**, cost 10, arch 10, product **9**. Two narrow security must-dos (Storage RLS, concept_links cross-cohort integrity); three bug nice-to-haves (token refund on failure, slug collision handling, parser Zod); two product metrics.
+- r5 folds all 7 r4 items (2 must-dos + 3 bugs + 2 product). No prior fix regresses.
 
 ## Goal
 
@@ -39,7 +40,8 @@ Files under `/supabase/migrations`:
   - `id` is generated application-side in the Inngest `persist` step (not `default gen_random_uuid()`), so the slug hash and the row's primary key are the same UUID and land in a single INSERT. **r2 bug fix.**
   - **`source_ingestion_id` is `unique`** (r3 bug fix 2): a retried `persist` step hits the unique constraint on the second insert; the step catches the conflict and resolves idempotently by selecting the existing row. No duplicate notes.
   - **All foreign keys are `on delete restrict`** (r3 bug fix 4): explicit behavior on cohort/user deletion. Prevents silent cascades or surprising failures.
-- `concept_links(source_note_id uuid fk notes, target_note_id uuid fk notes, cohort_id uuid fk cohorts not null, strength real, created_at, primary key (source_note_id, target_note_id))` — denormalized `cohort_id` for fast RLS.
+- `concept_links(source_note_id uuid fk notes on delete restrict, target_note_id uuid fk notes on delete restrict, cohort_id uuid fk cohorts on delete restrict not null, strength real, created_at, primary key (source_note_id, target_note_id))` — denormalized `cohort_id` for fast RLS.
+  - **Cross-cohort integrity trigger (r4 security must-do 2):** a `CONSTRAINT TRIGGER` fires BEFORE INSERT OR UPDATE on `concept_links` and raises if `(select cohort_id from notes where id = NEW.source_note_id) <> NEW.cohort_id` OR `(select cohort_id from notes where id = NEW.target_note_id) <> NEW.cohort_id`. RLS is a SELECT/WRITE control, not an integrity control — this trigger enforces the invariant even for service-role writers that bypass RLS. pgTAP: asserts cross-cohort insert raises `concept_links_cohort_mismatch`.
 - `srs_cards(id uuid pk, note_id uuid fk notes, question text, answer text, fsrs_state jsonb, due_at timestamptz, user_id uuid fk auth.users, cohort_id uuid fk cohorts not null, created_at)` — shipped, unpopulated.
 - `review_history(id uuid pk, card_id uuid fk srs_cards, user_id uuid fk auth.users, rating smallint, reviewed_at, prev_state jsonb, next_state jsonb)` — shipped.
 - `ingestion_jobs(id uuid pk, idempotency_key text not null, kind text, status text check (status in ('queued','running','completed','failed','cancelled')), owner_id uuid fk auth.users on delete restrict, cohort_id uuid fk cohorts on delete restrict not null, storage_path text, error jsonb, chunk_count int, reserved_tokens int, started_at timestamptz, created_at, updated_at)`.
@@ -49,7 +51,7 @@ Files under `/supabase/migrations`:
   - `started_at` supports the stuck-job watchdog (r2 bug fix 7).
   - All FKs `on delete restrict` (r3 bug fix 4).
 
-pgTAP tests in `/supabase/tests/rls.sql` exercise every RLS policy with per-verb assertions (council architecture recommendation). **Additional test for Realtime RLS isolation** (r3 security must-do 1): a dedicated pgTAP case seeds two cohorts, two users, and an `ingestion_jobs` row in cohort A, then confirms that a `SELECT` issued with cohort-B's `auth.uid()` returns zero rows — this is the exact predicate Supabase Realtime uses to filter push messages, so the test transitively proves cross-cohort push isolation.
+pgTAP tests in `/supabase/tests/rls.sql` exercise every RLS policy with per-verb assertions (council architecture recommendation). **Realtime RLS isolation case** (r3 security must-do 1): a pgTAP case seeds two cohorts, two users, and an `ingestion_jobs` row in cohort A, then confirms that `SELECT`, `INSERT`, and `UPDATE` predicates issued with cohort-B's `auth.uid()` all evaluate to zero-match — the exact predicates Supabase Realtime uses to filter push messages for every change type (r4 security nice-to-have: covers INSERT/UPDATE, not just SELECT). **`concept_links` integrity case:** asserts cross-cohort insert raises and equal-cohort insert succeeds.
 
 ### 3. RLS policies (every table, explicit per verb)
 
@@ -63,6 +65,15 @@ pgTAP tests in `/supabase/tests/rls.sql` exercise every RLS policy with per-verb
   - INSERT: `owner_id = auth.uid()` + cohort membership.
   - **UPDATE: `using (false)` for `authenticated`** (service role bypasses). **r1 security non-negotiable 3.**
   - DELETE: `using (false)`.
+
+### 3a. Storage RLS (r4 security must-do 1)
+
+Supabase Storage has its own RLS surface (`storage.objects`) separate from the DB tables. The `ingest` bucket is private and carries explicit policies keyed to `ingestion_jobs`:
+
+- **SELECT / INSERT / UPDATE / DELETE** by an `authenticated` role on an object in the `ingest` bucket are allowed iff the object's `name` corresponds to an `ingestion_jobs` row owned by `auth.uid()`. Naming convention is `ingest/<job_id>.pdf`, so the predicate is `bucket_id = 'ingest' AND exists (select 1 from ingestion_jobs ij where ij.id::text = split_part(name, '.', 1) AND ij.owner_id = auth.uid())`.
+- Service role bypasses RLS and is the only path that deletes objects during the Inngest `onFailure` hook (below) or the watchdog cleanup.
+- No public bucket in v0. If/when we add one it ships with a separate plan + council run.
+- pgTAP covers Storage policies via `storage.objects` table asserts using the same seeded-user-in-other-cohort pattern.
 
 ### 4. Secret boundary — `server-only` package (r2 security non-negotiable 3)
 
@@ -85,13 +96,17 @@ Event chain, every step `step.run`, idempotent by `ingestion_jobs.id` and by eve
    - Budget exhausted → job fails with `error.kind='token_budget_exhausted'` and a user-readable "resets at HH:MM" message.
 5. **`simplify`** → Haiku 4.5 on batches of ≤ 8 chunks per call. `<untrusted_content>` XML framing (r1 security non-negotiable 1) + Anthropic prompt caching on the stable system-prompt prefix. All Haiku response bodies validated by Zod in `/packages/lib/ai/anthropic.ts` (r2 bug fix 8). HTTP timeout **30s per request** (r3 bug fix 5): a hung upstream fails the step with `AiRequestTimeoutError` instead of burning the Inngest step budget.
 6. **`embed`** → Voyage-3 on concatenated simplified body. If length exceeds Voyage's max-token limit, FAIL with `error.kind='embed_input_too_long'` (r2 bug fix 6). Zod validation + 30s HTTP timeout (r3 bug fix 5).
-7. **`persist`** — idempotent (r3 bug fix 2).
+7. **`persist`** — idempotent (r3 bug fix 2) + slug-collision resilient (r4 bug fix 3).
    - Generate `id = crypto.randomUUID()` in the step.
-   - Single `INSERT ... ON CONFLICT (source_ingestion_id) DO NOTHING RETURNING id` — the unique index on `notes.source_ingestion_id` turns a retry into a no-op. If `RETURNING` yields zero rows, `SELECT id FROM notes WHERE source_ingestion_id = $1` and use that existing id.
-   - `slug = slugify(title, { lower, strict, locale: 'en' }) + '-' + short_hash(id)`. Slugify handles unicode, emoji, URL-unsafe chars; if the slugified title is empty the slug is `'-' + short_hash(id)` — still valid, still unique.
+   - Primary path: `INSERT ... ON CONFLICT (source_ingestion_id) DO NOTHING RETURNING id` — the unique index on `notes.source_ingestion_id` turns a retry into a no-op. If `RETURNING` yields zero rows, `SELECT id FROM notes WHERE source_ingestion_id = $1` and use that existing id.
+   - `slug = slugify(title, { lower, strict, locale: 'en' }) + '-' + short_hash(id, 6)`. Slugify handles unicode, emoji, URL-unsafe chars; if the slugified title is empty the slug is `'-' + short_hash(id, 6)` — still valid.
+   - **Slug collision handling:** the insert can raise `23505` unique_violation on `notes_slug_key` (distinct from the `source_ingestion_id` conflict) if two different notes collide on title + hash prefix. The step catches this specific error, regenerates with a 12-char hash, retries once; if it collides again (astronomically unlikely) the slug falls back to the full `id` string. Unit test seeds two notes whose titles slugify identically, asserts both inserts succeed with distinct slugs.
 8. **`post-ingest.enqueue`** → emit `note.created.link` + `note.created.flashcards` (v0 no-op stubs).
 
-**Function-level `onFailure` hook** (r3 bug fix 3): when the Inngest ingest function enters a terminal-failed state, the hook deletes `ingest/<job_id>.pdf` from Supabase Storage. No orphaned uploads. Emits `ingestion.storage.cleaned_count`. The hook tolerates the "already deleted" case (idempotent) so watchdog-driven failures don't error on cleanup.
+**Function-level `onFailure` hook** (r3 bug fix 3, r4 bug fix 1 token refund, r4 security nice-to-have for Storage timeout): when the Inngest ingest function enters a terminal-failed state, the hook performs three idempotent actions, each wrapped in a 10s timeout so a hung Storage or Upstash can't stall the hook:
+  1. Deletes `ingest/<job_id>.pdf` from Supabase Storage (service-role client). Tolerates "already deleted". Storage unreachable → log and proceed; the watchdog re-runs the hook on its next pass.
+  2. **Refunds `reserved_tokens`** to the user's Upstash sliding-window counter via `INCRBY -reserved_tokens` if `ingestion_jobs.reserved_tokens` is non-null; then nulls out the column in the same transaction so a re-run of the hook cannot double-refund.
+  3. Emits `ingestion.storage.cleaned_count` and `ingestion.tokens.refunded_count` metrics.
 
 Every step emits `ingestion.step.duration_seconds` with a `{step, status}` label. Reducto/LlamaParse calls also pass through a 30s HTTP timeout in `/packages/lib/ai/pdfparser.ts` (r3 bug fix 5). On any terminal failure the job's `status` goes to `failed` and the typed error is persisted.
 
@@ -117,7 +132,7 @@ Both tiers: Upstash unreachable → **fail closed** on writes (reject with 503),
 
 ### 8. Provider abstraction — `/packages/lib/ai`
 
-- `anthropic.ts`, `voyage.ts`, `pdfparser.ts` — vendor wrappers. Every function returns a Zod-validated shape (r2 bug fix 8).
+- `anthropic.ts`, `voyage.ts`, `pdfparser.ts` — vendor wrappers. **Every function, across all three vendors including Reducto/LlamaParse, returns a Zod-validated shape** (r2 bug fix 8 + r4 bug fix 2 explicit parser coverage). A 200-OK response with `{"error": "..."}` or a truncated JSON body from any vendor raises `AiResponseShapeError`, the step fails with a typed reason, and the job terminates cleanly instead of producing a `TypeError` deep in the pipeline.
 - **30s HTTP timeout on every outbound request** (r3 bug fix 5), implemented via `AbortController` + a shared `withTimeout(ms, promise)` helper; a timeout raises `AiRequestTimeoutError` with a typed error reason that the calling Inngest step surfaces to the job.
 - `index.ts` — typed interface exports. Business logic never imports vendor SDKs directly.
 - `__mocks__/*.ts` for vitest; injected via `vi.mock`. Tests include a "hung upstream" fixture that asserts timeouts fire cleanly.
@@ -148,10 +163,13 @@ Structured log emitters consumable by Vercel + Supabase log drain.
 
 v0 metrics:
 - `ingestion.jobs.success_rate` (from `status` column).
-- `ingestion.step.duration_seconds` histogram — labels `{step, status}` (council product nice-to-have).
-- `ingestion.parse.failure_reason_count` — labels `{reason}` (council product nice-to-have).
+- `ingestion.step.duration_seconds` histogram — labels `{step, status}`.
+- `ingestion.parse.failure_reason_count` — labels `{reason}`.
+- `ingestion.upload.file_size_bytes` histogram (r4 product nice-to-have) — surfaces user-behavior distribution so we can size parser + storage limits empirically.
 - `ingestion.watchdog.rescued_count`.
+- `ingestion.storage.cleaned_count`, `ingestion.tokens.refunded_count`.
 - `notes.created.count` — per-user, per-day.
+- `notes.view.count` — per-note, per-user, per-day (r4 product nice-to-have) — powers the user-centric kill criterion below.
 
 ### 12. `.env.example`
 
@@ -170,7 +188,7 @@ v0 metrics:
 ### 13. README deploy runbook + rollback
 
 - `pnpm install`, copy `.env.example`, provision Upstash free tier, `supabase link && supabase db push`, seed cohort, `vercel link && vercel env pull`, register Inngest app at the Vercel URL, upload PDF → view rendered note.
-- **Rollback:** web → `vercel rollback`; schema → `supabase db reset` + re-run migrations from last known-good commit (pre-launch, no prod data yet).
+- **Rollback:** web → `vercel rollback`; schema → `supabase db reset` + re-run migrations from last known-good commit. **Caveat (r4 security nice-to-have): this pattern is v0-only** — as soon as real cohort data lives in the DB, every migration must ship with a reversible `down.sql`. Flagged as the first item in the v1 plan so we don't carry the `db reset` habit into production.
 
 ### 14. Harness housekeeping
 
@@ -204,7 +222,9 @@ YouTube/image/DOCX/MD/TXT ingest, URL ingest (no `source_url` column), concept-l
 ## Security surface v0 (consolidated)
 
 - RLS on every table, explicit per-verb policies. `ingestion_jobs.UPDATE` = `using (false)`.
-- pgTAP exercises every verb + a dedicated Realtime-isolation case (r3 security must-do 1).
+- **Storage RLS** on the `ingest` bucket, keyed to `ingestion_jobs.owner_id` (r4 security must-do 1).
+- pgTAP exercises every verb + dedicated Realtime-isolation case (SELECT/INSERT/UPDATE) + `concept_links` cohort-integrity case.
+- **`concept_links` cohort integrity trigger** (r4 security must-do 2) — enforces invariant even against service-role writes.
 - All foreign keys `on delete restrict` — explicit behavior, no silent cascades.
 - `server-only` package enforces service-role boundary at build time.
 - No `source_url` column in v0 — SSRF vector removed entirely rather than gated by a comment.
@@ -241,7 +261,8 @@ YouTube/image/DOCX/MD/TXT ingest, URL ingest (no `source_url` column), concept-l
 
 - Success: `ingestion.jobs.success_rate > 95%` steady-state (kill if sustained < 90% for a week).
 - Duration: p90 `ingestion.jobs.duration_seconds < 300s` (kill if sustained > 300s for a week).
-- Diagnose: `ingestion.parse.failure_reason_count` by reason, `ingestion.step.duration_seconds` p90 by step.
+- **User-centric kill (r4 product nice-to-have):** if zero newly ingested notes are viewed (`notes.view.count` = 0 across the cohort) within the first week post-launch, halt feature work and reassess the core value proposition before building more on top.
+- Diagnose: `ingestion.parse.failure_reason_count` by reason, `ingestion.step.duration_seconds` p90 by step, `ingestion.upload.file_size_bytes` distribution.
 
 ## Open tradeoffs still worth naming
 
