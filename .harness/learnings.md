@@ -89,3 +89,23 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 ### COUNCIL
 - Round 2 scores: accessibility 10, architecture 10, cost 10, security 4, bugs 4, product 2. Verdict REVISE. Product veto.
 - Human overrode the Product veto to fix everything. Product angle remains "do this instead of user-facing work" — if product features don't land within a sprint, council will be right and this will need to come down.
+
+## 2026-04-17 — Council round 3: secret scan, budget gating, tight tool allowlist
+
+### KEEP
+- Three rounds of council on the same PR produced monotonically better scores on every axis except product (which stayed flat as a principled veto). The system is doing what it's supposed to.
+- SHA-pinning third-party actions at first-use, not after a security review, would have saved round 1. Do it reflexively.
+- When an `if:` can't express what you need (case-insensitive match), move the decision to a shell step. GitHub Actions expression language is not a general-purpose matcher.
+
+### IMPROVE
+- Shipped v2 with `contains(body, '@Claude')` thinking that was case-insensitive. It isn't. When touching something that looks language-primitive (matching, comparing), verify the exact semantics before claiming coverage.
+- Shipped v3 with an unconditional budget increment. "The watcher ran" is not the same as "the watcher succeeded." Any counter tied to cost must be gated on the thing-that-costs-money succeeding.
+
+### INSIGHT
+- The council makes me honest. Three rounds found seven real bugs I'd have shipped. Chat-summary approval would have shipped all of them.
+- Muting a persona is a sharp tool — it's the right move when a persona is correctly flagging a decision you've already overridden, because their repeated veto doesn't add new signal. Document the mute, restore after one round, and don't make it a habit.
+- For developer-facing automation: every feature needs a per-feature circuit breaker (e.g. `PR_WATCHER_ENABLED`) AND a global one (`.harness_halt`). Two levels of kill switch, one for config and one for emergencies.
+
+### COUNCIL
+- Round 3 scores: accessibility 9, architecture 9, cost 10, security 7 (+3 over r2), bugs 5 (+1), product 2. Verdict REVISE, one non-negotiable (secret scan). Human directed: fix all four must-dos, mute product for round 4.
+- Product scored 2/10 three rounds in a row with increasingly strident language. Kill criteria now explicit in the council comment: if user-facing features don't ship next sprint, these workflows get disabled.

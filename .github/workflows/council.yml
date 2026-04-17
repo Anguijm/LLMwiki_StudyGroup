@@ -23,6 +23,7 @@ permissions:
   contents: read
   pull-requests: write
   actions: write  # save/restore cache
+  security-events: write  # gitleaks SARIF upload
 
 jobs:
   council:
@@ -37,6 +38,16 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      # Secret scan BEFORE any LLM call. Fails the workflow if gitleaks
+      # detects a key/PII in the PR diff, preventing exfiltration to Gemini.
+      - name: Scan diff for secrets (gitleaks)
+        # Pinned to commit SHA (supply-chain guard) — currently resolves to tag v2.
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc
+        with:
+          config-path: .gitleaks.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Case-insensitive [skip council] check. GitHub Actions expression
       # language has no toLower(), so we do it in a shell step.

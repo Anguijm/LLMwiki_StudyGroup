@@ -1,44 +1,49 @@
-# Auto-PR-watcher GitHub Action — v3 (council-round-2 fixes)
+# Auto-PR-watcher GitHub Action — v4 (council-round-3 fixes)
 
 ## Status
 
-- Round 1 council (plan-time): product 1, security 5, bugs 3. Verdict REVISE → demoted watcher to read-only, pinned action to SHA, added `check_suite`, fixed checkout/case-sensitivity.
-- Round 2 council (post-implementation diff): product 2, security 4, bugs 4, cost 10. Verdict REVISE with Product veto.
-- Human override (2026-04-17): "override veto, fix everything."
+- Round 1: product 1, security 5, bugs 3. Demotion + SHA pin + checkout fix.
+- Round 2: product 2, security 4, bugs 4. Cache budgets + concurrency + case-insensitive skip.
+- Round 3: product 2, security 7, bugs 5. Verdict REVISE with one non-negotiable (secret scan).
+- Human override: "Fix all four. Mute product for this next run."
 
-## Round-2 fixes in this commit
+## Round-3 fixes
 
-- **Denial-of-Wallet fixed.** File-based `yolo_log.jsonl` budget scripts replaced with GitHub Actions cache. A PR can no longer modify the budget counter — state lives outside the repo in the Actions cache namespace. TOCTOU race acknowledged as accepted tradeoff per council.
-- **Concurrency group unified.** `pr-watch.yml` now keys concurrency on the PR number for every trigger type (was mixing PR number and `check_suite.id`, which allowed two parallel runs for the same logical change).
-- **Case-insensitive `[skip council]`.** `council.yml` now lowercases the PR title before matching, so `[Skip Council]` / `[SKIP COUNCIL]` also skip.
-- **Model ID documented.** `claude-haiku-4-5-20251001` is correct per Anthropic's 2025-10-01 dated release of Haiku 4.5 (verified against the model registry). Added inline comment explaining the pin and pointing at `model-upgrade-audit.md` for upgrades.
+- **Secret-scan step before LLM calls** (security non-negotiable): `gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc` added in both `pr-watch.yml` and `council.yml`, immediately after checkout and before the LLM call. If gitleaks flags a key/PII in the PR diff, the workflow fails and the LLM step never runs. Config in `.gitleaks.toml` extends the default ruleset and allowlists docs/persona files that mention placeholder keys.
+- **Budget-gated on success** (bug): `pr-watch.yml` now gates the increment + save steps on `steps.claude-watcher.outcome == 'success'`. Previous version consumed budget even when tool runs failed.
+- **Case-insensitive `@claude`** (bug): Replaced the `if:`-level string match with a shell step using `${BODY,,}`. `@claude`, `@Claude`, `@CLAUDE`, `@ClauDe` all match. Coarse `if:` now only filters on event type + actor.
+- **Tightened tool allowlist** (security): `Bash(gh api:*GET*)` removed entirely. Agent has `gh pr view|diff|comment|review` which cover the supported use cases; anything else requires asking the human.
 
-## Files touched (v3)
+## Product muted
 
-- **Rewritten:** `.github/workflows/pr-watch.yml`, `.github/workflows/council.yml`.
-- **Deleted:** `.harness/scripts/pr_watcher_budget.py`, `.harness/scripts/council_budget.py`. Both obsoleted by cache-based budget.
-- **Edited:** `.harness/README.md` (remove budget scripts from file map, note cache-based state).
-- **Unchanged:** prompt file, personas, council.py, CLAUDE.md.
+- Per human direction, `.harness/council/product.md` renamed to `product.md.disabled` for this one round. Council runner skips anything not ending in `.md`. **Rename it back** after the next successful round to restore the feedback loop. Tracked in verification checklist.
+
+## Files touched (v4)
+
+- **New:** `.gitleaks.toml`.
+- **Edited:** `.github/workflows/pr-watch.yml`, `.github/workflows/council.yml`, `.harness/scripts/security_checklist.md`.
+- **Renamed:** `.harness/council/product.md` → `product.md.disabled` (temporary).
+- **Unchanged:** prompt file, council.py, CLAUDE.md.
 
 ## Explicitly still out of scope
 
-- `council.py` unit-test refactor.
+- `council.py` mockable git helpers (architecture persona nice-to-have).
 - Slack/Discord alerts.
 - Formal DPA with third-party LLM providers.
-- Secret-scanning step pre-LLM-call (council nice-to-have; not in the critical path).
-- Tightening `gh api:*GET*` to a specific endpoint allowlist (council nice-to-have).
+- i18n of status messages (accessibility nice-to-have).
 
 ## Verification
 
-- [ ] `PR_WATCHER_ENABLED` unset → watcher skips (current state on PR #3).
-- [ ] First pr-watch run → cache miss, count starts at 0 → 1 → save.
-- [ ] Second run → cache restore hits → count reads 1 → 2 → save.
-- [ ] Seed cache with count=150 via a throwaway run, subsequent run over-budget-skips with a PR comment.
-- [ ] PR title `[Skip Council]` / `[SKIP COUNCIL]` → council job body skips (no Gemini calls, no comment).
-- [ ] Rapid events fire both `pull_request:synchronize` and `check_suite:completed` for the same PR → only one watcher run proceeds (the other is cancelled by the shared concurrency group).
+- [ ] `PR_WATCHER_ENABLED` unset → watcher skips (current state).
+- [ ] `@CLAUDE` in a PR comment → watcher fires.
+- [ ] PR with a fake `sk-ant-example` string outside the allowlisted files → gitleaks fails the workflow, no LLM call made.
+- [ ] PR that triggers the watcher but `npm run lint` fails → budget counter **not** incremented on subsequent runs.
+- [ ] `[Skip Council]` in PR title → council job body skips.
+- [ ] **Restore `product.md`** (`git mv product.md.disabled product.md`) after the next green council round. Do NOT leave product muted long-term.
 
 ## Audit trail
 
-- Council round 1 report: PR #3 comment marker `<!-- council-report -->`, dated 2026-04-17T01:15:34Z.
-- Council round 2 report: same comment, edited in place, dated 2026-04-17T03:10:15Z.
-- Human decisions: "demotion" (round 1), "override veto, fix everything" (round 2). Both in chat transcript.
+- Round 1 report: PR #3 comment `<!-- council-report -->`, 2026-04-17T01:15:34Z.
+- Round 2 report: same comment, updated 2026-04-17T03:10:15Z.
+- Round 3 report: same comment, updated 2026-04-17T03:31:55Z.
+- Human decisions: "demotion" (r1), "override veto, fix everything" (r2), "fix all four, mute product for next run" (r3).
