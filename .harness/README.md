@@ -43,7 +43,7 @@ python3 .harness/scripts/council.py -h    # → help text, no import errors
 │   ├── accessibility.md     # persona: WCAG AA, keyboard, screen reader
 │   └── lead-architect.md    # resolver: synthesizes the six into one plan
 ├── scripts/
-│   ├── council.py           # Gemini council runner (local)
+│   ├── council.py           # Gemini council runner (local and CI)
 │   ├── install_hooks.sh     # one-time: git config core.hooksPath
 │   ├── requirements.txt     # Python deps for council.py
 │   └── security_checklist.md# authoritative non-negotiables (loaded by council)
@@ -123,6 +123,7 @@ Three tiers, each optimized for a different consumer:
 {"ts": "...", "event": "harness_init", "note": "..."}
 {"ts": "...", "event": "commit", "commit": { "hash": "...", "short": "...", "subject": "...", ... }}
 {"ts": "...", "event": "council_run", "source": "...", "model": "...", "scores": { ... }}
+{"ts": "...", "event": "pr_watch_run", "pr": "...", "trigger": "...", "over_budget": false}
 {"ts": "...", "event": "task_complete", "title": "...", "summary": "..."}
 ```
 
@@ -159,8 +160,56 @@ When you swap any model (Claude tier, Gemini version, embedding model, transcrip
 ## What's not here (yet)
 
 - **Quality gates** (`npm run lint` / `typecheck` / `test` wrappers for the council to consume). Deferred until the Next.js scaffolding exists. When they land, they'll live at `.harness/scripts/quality_gates.sh`.
-- **GitHub Actions workflow.** Intentional — council is local-only to keep the `GEMINI_API_KEY` out of GitHub secrets and PR comments out of the review noise.
 - **Tick/tock hourly cron.** That's a yolo-projects pattern for generating many small apps; this repo is one complex app, so it's the wrong mode.
+
+## Council action (PR-time, GitHub Actions)
+
+In addition to the local Gemini council, every PR triggers `.github/workflows/council.yml`, which runs the same `council.py` against the PR diff and posts the Lead Architect synthesis as a single comment (re-edited on every push, not stacked).
+
+Setup:
+- Add `GEMINI_API_KEY` as a repo secret (*Settings → Secrets and variables → Actions → New repository secret*).
+- That's it. Opens a PR → action runs → council comment appears in ~60s.
+
+Behavior:
+- Runs on `pull_request` opened/synchronize/reopened and on manual `workflow_dispatch`.
+- Skipped automatically if `[skip council]` appears in the PR title.
+- Skipped automatically for PRs from forks (secrets unavailable to fork PRs by GitHub policy).
+- Skipped if `.harness_halt` exists in the PR branch.
+- Cost: ~7 Gemini-2.5-pro calls per PR (the runner enforces a 15-call per-run cap, and the workflow enforces a 60-run monthly cap via GitHub Actions cache — state lives outside the repo so a PR cannot reset it). At ~10 PRs/month → $1–3/month.
+- Read-only repo permissions: the action does not push state-file updates back to the branch. CI runs are ephemeral; local runs (when you also run `council.py` from your shell) capture state durably.
+
+Relationship to local council:
+- **Local council** (`python3 .harness/scripts/council.py --plan ...`): pre-plan, before you write code.
+- **Action council** (this workflow): post-PR, against the diff. Read on your phone, type "approved" to me, I execute.
+
+Both use the same personas in `.harness/council/`. Add a new persona once → it shows up in both.
+
+## PR watcher (Claude in CI, read-only reviewer)
+
+Separate from the Gemini council: the repo has a **Claude-powered PR watcher** that reacts to events on every open PR — Codex review comments, CI failures, and `@claude` mentions. The watcher is a **read-only reviewer**; it writes GitHub suggestion blocks in review comments that the human can accept with one tap.
+
+Demoted from its original "autonomous committer" design after the 2026-04-17 council flagged the write-permission as unacceptable prompt-injection surface. See `.harness/learnings.md` for the decision trail.
+
+Files:
+- `.github/workflows/pr-watch.yml` — workflow (budget state kept in GitHub Actions cache; cap: 150 runs/month).
+- `.github/claude-pr-watcher-prompt.md` — system prompt (scope policy lives here).
+
+One-time setup (required):
+- Add `ANTHROPIC_API_KEY` as a repo secret.
+- Set repository *variable* `PR_WATCHER_ENABLED=true` (Settings → Secrets and variables → Actions → Variables). The workflow skips all jobs when this is unset — visible, explicit toggle.
+
+Scope (enforced by both the workflow's `permissions:` block and the prompt):
+- Watcher **cannot push** — `contents: read`, no `Edit`/`Write`/`Bash(git:*)` tools.
+- Watcher writes review comments only. Single-file fixes use GitHub suggestion blocks you tap to accept; multi-file fixes are written prose.
+- Watcher asks the human for: migrations, RLS changes, dep bumps, auth/secret/CSP edits, workflow edits, any diff > 50 lines, Codex P0/`critical` comments, changes to `CLAUDE.md`/`.harness/council/*`/`council.py`/`.github/workflows/*`.
+- Action pinned to a specific commit SHA (not `@v1` floating tag) for supply-chain safety.
+- Uses Claude Haiku 4.5; ~$3–6/month expected.
+
+Relationship to the council:
+- **Council (Gemini)** — reviews plans and diffs. Runs locally *and* on every PR.
+- **Watcher (Claude)** — responds to PR-time events with suggestions. Never runs locally. Never commits.
+
+They don't overlap. Council critiques; watcher suggests.
 
 ## Troubleshooting
 

@@ -1,0 +1,239 @@
+name: Council Review (Gemini)
+
+# Runs the Gemini multi-persona council on every PR and posts the Lead
+# Architect synthesis as a single (re-edited) PR comment.
+#
+# Setup:
+#   1. Add GEMINI_API_KEY as a repo secret.
+#   2. That's it.
+#
+# Cost: ~7 Gemini-2.5-pro calls per PR. Monthly cap via GitHub Actions
+# cache (Denial-of-Wallet-safe; state is outside the repo).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: council-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write  # save/restore cache
+  security-events: write  # gitleaks SARIF upload
+
+jobs:
+  council:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Base filter: fork PRs can't access secrets; skip them.
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      # Secret scan BEFORE any LLM call. Fails the workflow if gitleaks
+      # detects a key/PII in the PR diff, preventing exfiltration to Gemini.
+      - name: Scan diff for secrets (gitleaks)
+        # Pinned to commit SHA (supply-chain guard) — currently resolves to tag v2.
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc
+        with:
+          config-path: .gitleaks.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Case-insensitive [skip council] check. GitHub Actions expression
+      # language has no toLower(), so we do it in a shell step.
+      - name: Check skip directive
+        id: skip
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          TITLE_LOWER="${TITLE,,}"
+          if [[ "$TITLE_LOWER" == *"[skip council]"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Circuit breaker
+        id: halt
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -f .harness_halt ]; then
+            REASON="$(cat .harness_halt)"
+            if [ -z "$REASON" ]; then REASON="(no reason given in .harness_halt)"; fi
+            echo "halted=true" >> "$GITHUB_OUTPUT"
+            if [ -n "$PR" ]; then
+              # Use --body-file to avoid shell-injection if the halt reason
+              # contains quotes, backticks, or $() expressions.
+              BODY_FILE="$(mktemp)"
+              printf 'Council skipped — circuit breaker active (`.harness_halt`). Reason:\n\n%s\n' "$REASON" > "$BODY_FILE"
+              gh pr comment "$PR" --body-file "$BODY_FILE"
+            fi
+          else
+            echo "halted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify GEMINI_API_KEY secret
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            MSG="Council action could not run: \`GEMINI_API_KEY\` secret is not set. Add it at Settings → Secrets and variables → Actions."
+            if [ -n "$PR" ]; then
+              gh pr comment "$PR" --body "$MSG"
+            fi
+            echo "::error::$MSG"
+            exit 1
+          fi
+
+      - name: Compute month key
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: month
+        run: echo "key=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # Cache-based monthly budget. Storing state in the repo would be a
+      # Denial-of-Wallet vector (a PR could modify yolo_log.jsonl to reset
+      # the counter). GH Actions cache is outside the PR's blast radius.
+      - name: Restore budget counter
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: budget-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .budget
+          key: council-budget-${{ steps.month.outputs.key }}-latest
+          restore-keys: |
+            council-budget-${{ steps.month.outputs.key }}-
+
+      - name: Read budget
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: budget
+        env:
+          MONTHLY_CAP: 60
+        run: |
+          mkdir -p .budget
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then
+            COUNT="$RAW"
+          else
+            echo "::warning::.budget/count not numeric ('$RAW'); defaulting to 0."
+            COUNT=0
+          fi
+          echo "used=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
+            echo "over_budget=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_budget=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment over-budget
+        if: steps.budget.outputs.over_budget == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "${PR:-}" ]; then
+            gh pr comment "$PR" --body "Council skipped — monthly cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Wait until next month or raise \`MONTHLY_CAP\` in \`.github/workflows/council.yml\`."
+          fi
+
+      - name: Setup Python
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: .harness/scripts/requirements.txt
+
+      - name: Install council deps
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        run: pip install -r .harness/scripts/requirements.txt
+
+      - name: Run council
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        id: council-run
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+        # No || fallbacks. If council.py fails, the job fails — loud and
+        # visible. The post-comment step still runs (always()) so the human
+        # sees what happened.
+        #
+        # CRITICAL: --allow-untracked is FORBIDDEN in CI. That flag exists
+        # so local devs can bootstrap with a scratch plan file; in CI it
+        # would let an attacker-controlled PR ship an "approval" against a
+        # plan that's not in git history. The whole point of the tracked-
+        # plan gate (see CLAUDE.md "What counts as approval") is to make
+        # approvals auditable. Never add --allow-untracked here.
+        run: python3 .harness/scripts/council.py --diff --base "$BASE_REF"
+
+      - name: Post or update council comment
+        if: always() && steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- council-report -->'
+          BODY_FILE="$(mktemp)"
+          {
+            echo "$MARKER"
+            echo
+            if [ -f .harness/last_council.md ]; then
+              cat .harness/last_council.md
+            else
+              echo "Council failed to produce a report. See [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+            fi
+            echo
+            echo "---"
+            echo "_Auto-posted by \`.github/workflows/council.yml\`. Add \`[skip council]\` (any case) to PR title to bypass next push._"
+          } > "$BODY_FILE"
+
+          if [ -z "${PR:-}" ]; then
+            echo "Not a PR context (workflow_dispatch?). Skipping comment."
+            exit 0
+          fi
+
+          # gh api failures here are real auth/API problems and should fail
+          # the step; do not swallow with `|| true`.
+          EXISTING_ID="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)"
+
+          if [ -n "$EXISTING_ID" ]; then
+            jq -Rs '{body: .}' < "$BODY_FILE" \
+              | gh api "repos/$REPO/issues/comments/$EXISTING_ID" --method PATCH --input -
+            echo "Updated existing council comment $EXISTING_ID."
+          else
+            gh pr comment "$PR" --body-file "$BODY_FILE"
+            echo "Posted new council comment."
+          fi
+
+      - name: Increment budget counter
+        if: steps.council-run.outcome == 'success'
+        run: |
+          mkdir -p .budget
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then CURR="$RAW"; else CURR=0; fi
+          echo $((CURR + 1)) > .budget/count
+
+      - name: Save budget counter
+        if: steps.council-run.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .budget
+          key: council-budget-${{ steps.month.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}

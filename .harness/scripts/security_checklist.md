@@ -28,6 +28,7 @@ A "non-negotiable" means: if the change touches the surface and violates the rul
 - [ ] Tool-use responses are validated against a schema before execution. No eval-style tool handlers.
 - [ ] Output that will be rendered as Markdown/HTML is sanitized (DOMPurify or `rehype-sanitize` with a strict allowlist).
 - [ ] Output that will be stored and later re-prompted (summaries, discussion prompts) is itself treated as untrusted on re-use.
+- [ ] **PR diffs sent to external services (Gemini council, Claude watcher) are secret-scanned first.** The `.github/workflows/council.yml` and `pr-watch.yml` gitleaks steps fail the workflow if a key or PII is detected, so the diff never reaches the third-party LLM. Adding new LLM-facing workflows? Add the same `gitleaks/gitleaks-action` step before the LLM call.
 
 ## XSS / rendering
 

@@ -76,6 +76,30 @@ def load_security_checklist() -> str:
     return "(security_checklist.md not found — Security reviewer will proceed without it.)"
 
 
+def _plan_is_tracked(path: Path) -> bool:
+    try:
+        subprocess.check_output(
+            ["git", "ls-files", "--error-unmatch", str(path.relative_to(REPO_ROOT))],
+            cwd=REPO_ROOT,
+            stderr=subprocess.STDOUT,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _plan_has_unstaged_changes(path: Path) -> bool:
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain", str(path.relative_to(REPO_ROOT))],
+            cwd=REPO_ROOT,
+            text=True,
+        )
+        return bool(out.strip())
+    except subprocess.CalledProcessError:
+        return False
+
+
 def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
     if args.plan:
         p = Path(args.plan)
@@ -83,6 +107,22 @@ def get_plan_text(args: argparse.Namespace) -> tuple[str, str]:
             p = REPO_ROOT / p
         if not p.exists():
             die(f"Plan file not found: {p}")
+        if not args.allow_untracked and not _plan_is_tracked(p):
+            die(
+                f"Plan file is untracked: {p.relative_to(REPO_ROOT)}\n"
+                f"  Council refuses to run against a plan that does not exist in git — \n"
+                f"  a chat-summary approval is not a council approval. Commit the plan first:\n"
+                f"    git add {p.relative_to(REPO_ROOT)} && git commit -m 'docs: add active plan'\n"
+                f"  Or pass --allow-untracked if you know what you are doing.",
+                code=6,
+            )
+        if not args.allow_untracked and _plan_has_unstaged_changes(p):
+            die(
+                f"Plan file has unstaged changes: {p.relative_to(REPO_ROOT)}\n"
+                f"  Commit the in-progress edits before running council, so the reviewed \n"
+                f"  artifact matches what gets pushed. Or pass --allow-untracked.",
+                code=7,
+            )
         return f"PLAN FILE: {p.relative_to(REPO_ROOT)}", p.read_text()
 
     if args.diff:
@@ -229,6 +269,11 @@ def main() -> int:
     parser.add_argument("--diff", action="store_true", help="Review git diff instead of a plan file.")
     parser.add_argument("--base", default="origin/main", help="Diff base (default origin/main).")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model ID.")
+    parser.add_argument(
+        "--allow-untracked",
+        action="store_true",
+        help="Allow council to run against an untracked or dirty plan file (escape hatch; default off).",
+    )
     args = parser.parse_args()
 
     check_halt()

@@ -1,0 +1,236 @@
+name: PR Watcher
+
+# Claude-powered PR triage — read-only reviewer.
+# Scope policy: .github/claude-pr-watcher-prompt.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+
+concurrency:
+  # Fall back to github.run_id when no PR number is resolvable (e.g.
+  # check_suite fires on a non-PR commit, making pull_requests[] empty).
+  # Without the fallback, all such events share the empty group
+  # "pr-watch-" and cancel each other.
+  group: pr-watch-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+  actions: write  # save/restore cache
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Coarse event + actor filter. The case-insensitive @claude match happens
+    # in a shell step below so capitalization variants don't bypass it.
+    if: |
+      vars.PR_WATCHER_ENABLED == 'true' &&
+      github.actor != 'github-actions[bot]' &&
+      (
+        (github.event_name == 'pull_request') ||
+        (github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested') ||
+        (github.event_name == 'pull_request_review_comment') ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request != null) ||
+        (github.event_name == 'check_suite' &&
+          github.event.check_suite.conclusion == 'failure' &&
+          github.event.check_suite.pull_requests[0] != null)
+      )
+    steps:
+      # Case-insensitive trigger match. For comment-type events, only proceed
+      # if the body mentions @claude (any case) OR the commenter is Codex bot.
+      # For pull_request and check_suite events, always proceed.
+      - name: Resolve trigger match
+        id: trigger
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          matched=false
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|check_suite)
+              matched=true
+              ;;
+            issue_comment|pull_request_review_comment)
+              BODY_LOWER="${COMMENT_BODY,,}"
+              if [[ "$BODY_LOWER" == *"@claude"* ]]; then
+                matched=true
+              elif [[ "$COMMENTER" == "chatgpt-codex-connector[bot]" ]]; then
+                matched=true
+              fi
+              ;;
+          esac
+          echo "matched=$matched" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve PR number
+        if: steps.trigger.outputs.matched == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+              ;;
+            issue_comment)
+              echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+              ;;
+            check_suite)
+              NUM=$(jq -r '.check_suite.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
+              if [ -z "$NUM" ]; then
+                echo "No PR attached to this check_suite; exiting."
+                exit 0
+              fi
+              echo "number=$NUM" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Compute month key
+        if: steps.trigger.outputs.matched == 'true'
+        id: month
+        run: echo "key=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # Budget state lives in the GitHub Actions cache, NOT in a repo file,
+      # so a PR cannot tamper with the counter.
+      - name: Restore budget counter
+        if: steps.trigger.outputs.matched == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .budget
+          key: pr-watch-budget-${{ steps.month.outputs.key }}-latest
+          restore-keys: |
+            pr-watch-budget-${{ steps.month.outputs.key }}-
+
+      - name: Read budget
+        if: steps.trigger.outputs.matched == 'true'
+        id: budget
+        env:
+          MONTHLY_CAP: 150
+        run: |
+          mkdir -p .budget
+          # Validate the cached counter is a non-negative integer. If the
+          # cache file is corrupted or missing, fall back to 0 so the
+          # workflow proceeds rather than failing on $((X+1)) syntax errors.
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then
+            COUNT="$RAW"
+          else
+            echo "::warning::.budget/count not numeric ('$RAW'); defaulting to 0."
+            COUNT=0
+          fi
+          echo "used=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
+            echo "over_budget=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_budget=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo
+        if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out PR head
+        if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget != 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr checkout "${{ steps.pr.outputs.number }}"
+
+      # Secret scan BEFORE any LLM call. If gitleaks finds a high-entropy or
+      # known-pattern secret in the PR diff, fail the workflow and skip the
+      # LLM so we don't exfiltrate to Anthropic.
+      - name: Scan diff for secrets (gitleaks)
+        if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget != 'true'
+        id: secret-scan
+        # Pinned to commit SHA (supply-chain guard) — currently resolves to tag v2.
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc
+        with:
+          # No license key; gitleaks-action supports non-org solo-dev free tier.
+          config-path: .gitleaks.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Circuit breaker
+        if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget != 'true'
+        id: halt
+        run: |
+          if [ -f .harness_halt ]; then
+            REASON=$(cat .harness_halt)
+            if [ -z "$REASON" ]; then REASON="(no reason given in .harness_halt)"; fi
+            echo "halt_reason=$REASON" >> "$GITHUB_OUTPUT"
+            echo "halted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "halted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment halt reason
+        if: steps.halt.outputs.halted == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REASON: ${{ steps.halt.outputs.halt_reason }}
+        run: |
+          # Use --body-file to neutralize shell metacharacters that might
+          # appear in the halt reason.
+          BODY_FILE="$(mktemp)"
+          printf 'PR watcher skipped — circuit breaker active (`.harness_halt`). Reason:\n\n%s\n' "$REASON" > "$BODY_FILE"
+          gh pr comment "${{ steps.pr.outputs.number }}" --body-file "$BODY_FILE"
+
+      - name: Comment over-budget
+        if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --body "PR watcher skipped — monthly cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Raise \`MONTHLY_CAP\` in \`.github/workflows/pr-watch.yml\` or wait until next month."
+
+      - name: Run Claude watcher (read-only)
+        if: steps.trigger.outputs.matched == 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        id: claude-watcher
+        # Pinned to commit SHA (supply-chain guard) — currently resolves to tag v1.
+        uses: anthropics/claude-code-action@496f0537244eccbaa9b0eeff94084c64e1fe6a56
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: .github/claude-pr-watcher-prompt.md
+          # claude-haiku-4-5-20251001 = Haiku 4.5 dated release (2025-10-01).
+          # Verified against Anthropic model catalog on 2026-04-17.
+          # To upgrade, walk .harness/model-upgrade-audit.md.
+          model: claude-haiku-4-5-20251001
+          max_turns: 8
+          trigger_phrase: "@claude"
+          # Tight allowlist. gh api removed entirely — if the agent needs data
+          # beyond these specific commands, it must ask the human via a comment.
+          allowed_tools: "Bash(npm run lint),Bash(npm run typecheck),Bash(npm test),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr review:*),Read,Grep,Glob"
+
+      # Only increment budget on SUCCESSFUL watcher runs. Previous version
+      # consumed budget even on step failures, letting a PR-that-breaks-lint
+      # drain the cap without any LLM work happening.
+      - name: Increment budget counter
+        if: steps.claude-watcher.outcome == 'success'
+        run: |
+          mkdir -p .budget
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then CURR="$RAW"; else CURR=0; fi
+          echo $((CURR + 1)) > .budget/count
+
+      - name: Save budget counter
+        if: steps.claude-watcher.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .budget
+          key: pr-watch-budget-${{ steps.month.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
