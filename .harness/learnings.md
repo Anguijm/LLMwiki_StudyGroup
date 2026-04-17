@@ -109,3 +109,21 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 ### COUNCIL
 - Round 3 scores: accessibility 9, architecture 9, cost 10, security 7 (+3 over r2), bugs 5 (+1), product 2. Verdict REVISE, one non-negotiable (secret scan). Human directed: fix all four must-dos, mute product for round 4.
 - Product scored 2/10 three rounds in a row with increasingly strident language. Kill criteria now explicit in the council comment: if user-facing features don't ship next sprint, these workflows get disabled.
+
+## 2026-04-17 — Council round 4: PROCEED + merge
+
+### KEEP
+- Four council rounds on one PR produced scores 3/5/7/9 on security and 3/4/5/6 on bugs. Every round surfaced real bugs and pushed the design. The system works as intended.
+- Lead Architect said "ready for human approval" at round 4. Stopped here — further rounds are diminishing returns on polish.
+
+### IMPROVE
+- The budget counter "validate-numeric" step was a two-line bug that stood for two commits. Defensive validation of in-cache state should be the default pattern — don't assume external state is well-formed.
+- `--body-file` for any `gh pr comment` call with untrusted content should be a rule, not a case-by-case decision. Adding to the security checklist.
+
+### INSIGHT
+- Forbidden flags deserve comments at the use site, not buried in docs. If a future contributor adds `--allow-untracked` to `council.yml` and a reviewer misses it, the tracked-plan gate silently stops working. The comment is a cheap tripwire.
+- Hardening the system prompt with a "security-review this suggestion" footer is a cheap adversarial-injection defense that costs zero runtime and one reviewer second. Every agent-suggestion-to-human path should include a skepticism nudge.
+
+### COUNCIL
+- Round 4 scores: accessibility 7, architecture 10, bugs 6, cost 10, security 9. Product muted by prior direction. Verdict: PROCEED.
+- Tracking issue #4 opened to restore `.harness/council/product.md` within 7 days.

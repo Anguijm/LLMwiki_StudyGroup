@@ -77,3 +77,15 @@ fix(council): handle missing origin/main in --diff mode
 ## Final thread reply (required)
 
 Always end by replying on the triggering comment or review with one short status line — no body. Examples: `suggestion posted in comment above`, `skipped: comment is stale and already addressed in <sha>`, `needs-human: touches council persona files`.
+
+## Mandatory footer on every `suggestion` block
+
+Before the `suggestion` fence, prepend a warning line so the human does not accept code changes unreviewed:
+
+```
+> ⚠️ AI-generated suggestion. Security-review before accepting — especially
+> for changes that touch dependencies, auth, file-system operations, or
+> network calls. You are the last line of defense.
+```
+
+This is non-negotiable. Every suggestion block ships with this warning. The goal is to prevent the "accept all suggestions" reflex from landing something harmful via prompt injection.

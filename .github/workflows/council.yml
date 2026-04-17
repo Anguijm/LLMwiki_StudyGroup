@@ -71,10 +71,15 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           if [ -f .harness_halt ]; then
-            REASON=$(cat .harness_halt)
+            REASON="$(cat .harness_halt)"
+            if [ -z "$REASON" ]; then REASON="(no reason given in .harness_halt)"; fi
             echo "halted=true" >> "$GITHUB_OUTPUT"
             if [ -n "$PR" ]; then
-              gh pr comment "$PR" --body "Council skipped — circuit breaker active (\`.harness_halt\`). Reason: $REASON"
+              # Use --body-file to avoid shell-injection if the halt reason
+              # contains quotes, backticks, or $() expressions.
+              BODY_FILE="$(mktemp)"
+              printf 'Council skipped — circuit breaker active (`.harness_halt`). Reason:\n\n%s\n' "$REASON" > "$BODY_FILE"
+              gh pr comment "$PR" --body-file "$BODY_FILE"
             fi
           else
             echo "halted=false" >> "$GITHUB_OUTPUT"
@@ -121,7 +126,13 @@ jobs:
           MONTHLY_CAP: 60
         run: |
           mkdir -p .budget
-          COUNT=$(cat .budget/count 2>/dev/null || echo 0)
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then
+            COUNT="$RAW"
+          else
+            echo "::warning::.budget/count not numeric ('$RAW'); defaulting to 0."
+            COUNT=0
+          fi
           echo "used=$COUNT" >> "$GITHUB_OUTPUT"
           echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
           if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
@@ -161,6 +172,13 @@ jobs:
         # No || fallbacks. If council.py fails, the job fails — loud and
         # visible. The post-comment step still runs (always()) so the human
         # sees what happened.
+        #
+        # CRITICAL: --allow-untracked is FORBIDDEN in CI. That flag exists
+        # so local devs can bootstrap with a scratch plan file; in CI it
+        # would let an attacker-controlled PR ship an "approval" against a
+        # plan that's not in git history. The whole point of the tracked-
+        # plan gate (see CLAUDE.md "What counts as approval") is to make
+        # approvals auditable. Never add --allow-untracked here.
         run: python3 .harness/scripts/council.py --diff --base "$BASE_REF"
 
       - name: Post or update council comment
@@ -209,7 +227,8 @@ jobs:
         if: steps.council-run.outcome == 'success'
         run: |
           mkdir -p .budget
-          CURR=$(cat .budget/count 2>/dev/null || echo 0)
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then CURR="$RAW"; else CURR=0; fi
           echo $((CURR + 1)) > .budget/count
 
       - name: Save budget counter

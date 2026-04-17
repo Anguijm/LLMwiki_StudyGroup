@@ -16,7 +16,11 @@ on:
     types: [completed]
 
 concurrency:
-  group: pr-watch-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.pull_requests[0].number }}
+  # Fall back to github.run_id when no PR number is resolvable (e.g.
+  # check_suite fires on a non-PR commit, making pull_requests[] empty).
+  # Without the fallback, all such events share the empty group
+  # "pr-watch-" and cancel each other.
+  group: pr-watch-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.pull_requests[0].number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -118,7 +122,16 @@ jobs:
           MONTHLY_CAP: 150
         run: |
           mkdir -p .budget
-          COUNT=$(cat .budget/count 2>/dev/null || echo 0)
+          # Validate the cached counter is a non-negative integer. If the
+          # cache file is corrupted or missing, fall back to 0 so the
+          # workflow proceeds rather than failing on $((X+1)) syntax errors.
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then
+            COUNT="$RAW"
+          else
+            echo "::warning::.budget/count not numeric ('$RAW'); defaulting to 0."
+            COUNT=0
+          fi
           echo "used=$COUNT" >> "$GITHUB_OUTPUT"
           echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
           if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
@@ -170,9 +183,13 @@ jobs:
         if: steps.halt.outputs.halted == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REASON: ${{ steps.halt.outputs.halt_reason }}
         run: |
-          gh pr comment "${{ steps.pr.outputs.number }}" \
-            --body "PR watcher skipped — circuit breaker active (\`.harness_halt\`). Reason: ${{ steps.halt.outputs.halt_reason }}"
+          # Use --body-file to neutralize shell metacharacters that might
+          # appear in the halt reason.
+          BODY_FILE="$(mktemp)"
+          printf 'PR watcher skipped — circuit breaker active (`.harness_halt`). Reason:\n\n%s\n' "$REASON" > "$BODY_FILE"
+          gh pr comment "${{ steps.pr.outputs.number }}" --body-file "$BODY_FILE"
 
       - name: Comment over-budget
         if: steps.trigger.outputs.matched == 'true' && steps.budget.outputs.over_budget == 'true' && steps.pr.outputs.number != ''
@@ -207,7 +224,8 @@ jobs:
         if: steps.claude-watcher.outcome == 'success'
         run: |
           mkdir -p .budget
-          CURR=$(cat .budget/count 2>/dev/null || echo 0)
+          RAW="$(cat .budget/count 2>/dev/null || echo 0)"
+          if [[ "$RAW" =~ ^[0-9]+$ ]]; then CURR="$RAW"; else CURR=0; fi
           echo $((CURR + 1)) > .budget/count
 
       - name: Save budget counter
