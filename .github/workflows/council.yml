@@ -1,14 +1,14 @@
 name: Council Review (Gemini)
 
-# Runs the Gemini multi-persona council on every PR and posts the Lead Architect
-# synthesis as a single (re-edited) PR comment. Lets you approve from your phone:
-# read the comment, type "approved" to me in chat, I execute.
+# Runs the Gemini multi-persona council on every PR and posts the Lead
+# Architect synthesis as a single (re-edited) PR comment.
 #
 # Setup:
-#   1. Add GEMINI_API_KEY as a repo secret (Settings → Secrets → Actions).
-#   2. Open or push to a PR. The action runs and comments.
+#   1. Add GEMINI_API_KEY as a repo secret.
+#   2. That's it.
 #
-# Cost: ~7 Gemini-2.5-pro calls per PR. With ~10 PRs/month → ~$1–3/month.
+# Cost: ~7 Gemini-2.5-pro calls per PR. Monthly cap via GitHub Actions
+# cache (Denial-of-Wallet-safe; state is outside the repo).
 
 on:
   pull_request:
@@ -22,15 +22,15 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  actions: write  # save/restore cache
 
 jobs:
   council:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Skip when title or commits opt out, and when from a fork (secrets unavailable).
+    # Base filter: fork PRs can't access secrets; skip them.
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      !contains(github.event.pull_request.title, '[skip council]')
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout PR
         uses: actions/checkout@v4
@@ -38,8 +38,23 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
+      # Case-insensitive [skip council] check. GitHub Actions expression
+      # language has no toLower(), so we do it in a shell step.
+      - name: Check skip directive
+        id: skip
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          TITLE_LOWER="${TITLE,,}"
+          if [[ "$TITLE_LOWER" == *"[skip council]"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Circuit breaker
         id: halt
+        if: steps.skip.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
@@ -55,7 +70,7 @@ jobs:
           fi
 
       - name: Verify GEMINI_API_KEY secret
-        if: steps.halt.outputs.halted != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -70,8 +85,52 @@ jobs:
             exit 1
           fi
 
+      - name: Compute month key
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: month
+        run: echo "key=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # Cache-based monthly budget. Storing state in the repo would be a
+      # Denial-of-Wallet vector (a PR could modify yolo_log.jsonl to reset
+      # the counter). GH Actions cache is outside the PR's blast radius.
+      - name: Restore budget counter
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: budget-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .budget
+          key: council-budget-${{ steps.month.outputs.key }}-latest
+          restore-keys: |
+            council-budget-${{ steps.month.outputs.key }}-
+
+      - name: Read budget
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true'
+        id: budget
+        env:
+          MONTHLY_CAP: 60
+        run: |
+          mkdir -p .budget
+          COUNT=$(cat .budget/count 2>/dev/null || echo 0)
+          echo "used=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
+            echo "over_budget=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_budget=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment over-budget
+        if: steps.budget.outputs.over_budget == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "${PR:-}" ]; then
+            gh pr comment "$PR" --body "Council skipped — monthly cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Wait until next month or raise \`MONTHLY_CAP\` in \`.github/workflows/council.yml\`."
+          fi
+
       - name: Setup Python
-        if: steps.halt.outputs.halted != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -79,38 +138,22 @@ jobs:
           cache-dependency-path: .harness/scripts/requirements.txt
 
       - name: Install council deps
-        if: steps.halt.outputs.halted != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
         run: pip install -r .harness/scripts/requirements.txt
 
-      - name: Monthly budget check
-        if: steps.halt.outputs.halted != 'true'
-        id: budget
-        env:
-          MONTHLY_CAP: 60
-        run: python3 .harness/scripts/council_budget.py
-
-      - name: Comment when over budget
-        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          if [ -n "${PR:-}" ]; then
-            gh pr comment "$PR" --body "Council skipped — monthly run cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Raise \`MONTHLY_CAP\` in \`.github/workflows/council.yml\` or wait until next month."
-          fi
-
       - name: Run council
-        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        id: council-run
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BASE_REF: origin/${{ github.event.pull_request.base.ref }}
         # No || fallbacks. If council.py fails, the job fails — loud and
-        # visible in the Actions UI. The post-comment step still runs in
-        # the always() block below so the human sees what happened.
+        # visible. The post-comment step still runs (always()) so the human
+        # sees what happened.
         run: python3 .harness/scripts/council.py --diff --base "$BASE_REF"
 
       - name: Post or update council comment
-        if: always() && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        if: always() && steps.skip.outputs.skip != 'true' && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -129,7 +172,7 @@ jobs:
             fi
             echo
             echo "---"
-            echo "_Auto-posted by \`.github/workflows/council.yml\`. Add \`[skip council]\` to PR title to bypass next push._"
+            echo "_Auto-posted by \`.github/workflows/council.yml\`. Add \`[skip council]\` (any case) to PR title to bypass next push._"
           } > "$BODY_FILE"
 
           if [ -z "${PR:-}" ]; then
@@ -137,8 +180,8 @@ jobs:
             exit 0
           fi
 
-          # Find an existing council comment. `gh api` failures here are real
-          # auth / API problems and should fail the step; do not swallow with `|| true`.
+          # gh api failures here are real auth/API problems and should fail
+          # the step; do not swallow with `|| true`.
           EXISTING_ID="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
             --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)"
 
@@ -150,3 +193,17 @@ jobs:
             gh pr comment "$PR" --body-file "$BODY_FILE"
             echo "Posted new council comment."
           fi
+
+      - name: Increment budget counter
+        if: steps.council-run.outcome == 'success'
+        run: |
+          mkdir -p .budget
+          CURR=$(cat .budget/count 2>/dev/null || echo 0)
+          echo $((CURR + 1)) > .budget/count
+
+      - name: Save budget counter
+        if: steps.council-run.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .budget
+          key: council-budget-${{ steps.month.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}

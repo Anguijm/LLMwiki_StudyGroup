@@ -70,3 +70,22 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 
 ### COUNCIL
 - Ran on PR #3 diff (2026-04-17). Scores: accessibility 10, architecture 10, cost 9, security 5, bugs 3, product 1. Verdict: REVISE. Seven ordered steps in the synthesis; six implemented this round (unit-test refactor of `council.py` deferred). Full report in the PR #3 comment thread.
+
+## 2026-04-17 — Council round 2: cache-based budgets + concurrency fix
+
+### KEEP
+- Running the council twice on the same PR caught the Denial-of-Wallet issue in the v2 budget scripts. First pass missed it (scripts didn't exist yet); second pass saw the actual implementation and flagged it. Two rounds = two different signals.
+- GitHub Actions expression language has no `toLower()`. Shell step with `${TITLE,,}` is the clean workaround.
+
+### IMPROVE
+- Should have reached for GH Actions cache for budget state from the start, not file-in-repo. "If a PR can modify it, it's not a safety mechanism" is a durable rule — add to the security checklist.
+- Next time a council persona gives a harsh score (Product 1→2), don't move on until the human has *explicitly* heard the concern in first person, not via chat summary. I did this right in round 1 (AskUserQuestion), wrong in round 0 (gitignored plan).
+
+### INSIGHT
+- Budget/rate-limit state must live OUTSIDE the artifact being rate-limited. File-in-repo looks convenient but is self-referential. Cache, external KV, or platform variable are correct.
+- Concurrency groups must use a key that's invariant across all event types for the same logical subject. `check_suite.id` is per-event; `pull_requests[0].number` is per-PR. The former is wrong for serializing "events about the same PR."
+- `contains()` in GitHub Actions expression language is case-sensitive. When skip-directives matter, do the check in a shell step where you control the semantics.
+
+### COUNCIL
+- Round 2 scores: accessibility 10, architecture 10, cost 10, security 4, bugs 4, product 2. Verdict REVISE. Product veto.
+- Human overrode the Product veto to fix everything. Product angle remains "do this instead of user-facing work" — if product features don't land within a sprint, council will be right and this will need to come down.

@@ -46,9 +46,7 @@ python3 .harness/scripts/council.py -h    # → help text, no import errors
 │   ├── council.py           # Gemini council runner (local and CI)
 │   ├── install_hooks.sh     # one-time: git config core.hooksPath
 │   ├── requirements.txt     # Python deps for council.py
-│   ├── security_checklist.md# authoritative non-negotiables (loaded by council)
-│   ├── pr_watcher_budget.py # monthly run-count pre-flight for PR watcher
-│   └── council_budget.py    # monthly run-count pre-flight for council action
+│   └── security_checklist.md# authoritative non-negotiables (loaded by council)
 ├── hooks/
 │   └── post-commit          # auto-updates session_state.json + yolo_log.jsonl
 ├── memory/                  # session snapshots (agent-written, gitignored contents OK)
@@ -177,7 +175,7 @@ Behavior:
 - Skipped automatically if `[skip council]` appears in the PR title.
 - Skipped automatically for PRs from forks (secrets unavailable to fork PRs by GitHub policy).
 - Skipped if `.harness_halt` exists in the PR branch.
-- Cost: ~7 Gemini-2.5-pro calls per PR (the runner enforces a 15-call per-run cap, and the workflow enforces a 60-run monthly cap via `council_budget.py`). At ~10 PRs/month → $1–3/month.
+- Cost: ~7 Gemini-2.5-pro calls per PR (the runner enforces a 15-call per-run cap, and the workflow enforces a 60-run monthly cap via GitHub Actions cache — state lives outside the repo so a PR cannot reset it). At ~10 PRs/month → $1–3/month.
 - Read-only repo permissions: the action does not push state-file updates back to the branch. CI runs are ephemeral; local runs (when you also run `council.py` from your shell) capture state durably.
 
 Relationship to local council:
@@ -193,9 +191,8 @@ Separate from the Gemini council: the repo has a **Claude-powered PR watcher** t
 Demoted from its original "autonomous committer" design after the 2026-04-17 council flagged the write-permission as unacceptable prompt-injection surface. See `.harness/learnings.md` for the decision trail.
 
 Files:
-- `.github/workflows/pr-watch.yml` — workflow.
+- `.github/workflows/pr-watch.yml` — workflow (budget state kept in GitHub Actions cache; cap: 150 runs/month).
 - `.github/claude-pr-watcher-prompt.md` — system prompt (scope policy lives here).
-- `.harness/scripts/pr_watcher_budget.py` — monthly run-count pre-flight (cap: 150 runs/month).
 
 One-time setup (required):
 - Add `ANTHROPIC_API_KEY` as a repo secret.

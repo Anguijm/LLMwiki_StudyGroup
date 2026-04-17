@@ -1,46 +1,44 @@
-# Auto-PR-watcher GitHub Action — REVISED per council (2026-04-17)
+# Auto-PR-watcher GitHub Action — v3 (council-round-2 fixes)
 
 ## Status
 
-Original plan scored: accessibility 10, architecture 10, cost 9, security 5, bugs 3, product 1. Lead Architect verdict: **REVISE**. This plan is the revision approved by the human on 2026-04-17.
+- Round 1 council (plan-time): product 1, security 5, bugs 3. Verdict REVISE → demoted watcher to read-only, pinned action to SHA, added `check_suite`, fixed checkout/case-sensitivity.
+- Round 2 council (post-implementation diff): product 2, security 4, bugs 4, cost 10. Verdict REVISE with Product veto.
+- Human override (2026-04-17): "override veto, fix everything."
 
-## What changed from v1
+## Round-2 fixes in this commit
 
-- **Watcher is now read-only.** `contents: write` → `contents: read`. No `Edit`, no `Write`, no `Bash(git:*)`. The watcher writes GitHub suggestion blocks in review comments; the human taps "Commit suggestion" to apply.
-- **Third-party action pinned.** `anthropics/claude-code-action@v1` → `anthropics/claude-code-action@496f0537244eccbaa9b0eeff94084c64e1fe6a56` (SHA for current v1). Supply-chain guard.
-- **`check_suite` trigger added.** The watcher now triggers on failed CI check suites, matching the original promise (Codex P2).
-- **`@claude` matching is case-insensitive.** Was `startsWith('@claude')`; now includes `@Claude` variant (bugs persona flag).
-- **`issue_comment` checkout bug fixed.** Was falling back to `github.ref` (base branch); now resolves PR number first and calls `gh pr checkout <number>` (Codex P1).
-- **Self-recursion guard.** Workflow now skips when `github.actor == 'github-actions[bot]'` so watcher can't react to its own comments.
-- **`log_pr_watch.sh` deleted.** It did a read-modify-write on `session_state.json` and push-back, both of which are now unnecessary (no CI commits) and were racy (bugs persona).
-- **Error suppression removed from council.yml.** `|| echo warning` and `|| true` patterns gone; script failures now fail the job visibly.
-- **Council action gains a monthly cap.** New `.harness/scripts/council_budget.py` mirrors the watcher's budget, default 60 runs/month, configurable via env (cost persona).
+- **Denial-of-Wallet fixed.** File-based `yolo_log.jsonl` budget scripts replaced with GitHub Actions cache. A PR can no longer modify the budget counter — state lives outside the repo in the Actions cache namespace. TOCTOU race acknowledged as accepted tradeoff per council.
+- **Concurrency group unified.** `pr-watch.yml` now keys concurrency on the PR number for every trigger type (was mixing PR number and `check_suite.id`, which allowed two parallel runs for the same logical change).
+- **Case-insensitive `[skip council]`.** `council.yml` now lowercases the PR title before matching, so `[Skip Council]` / `[SKIP COUNCIL]` also skip.
+- **Model ID documented.** `claude-haiku-4-5-20251001` is correct per Anthropic's 2025-10-01 dated release of Haiku 4.5 (verified against the model registry). Added inline comment explaining the pin and pointing at `model-upgrade-audit.md` for upgrades.
 
-## Files touched
+## Files touched (v3)
 
-- **New:** `.harness/scripts/council_budget.py`.
-- **Rewritten:** `.github/workflows/pr-watch.yml`, `.github/claude-pr-watcher-prompt.md`.
-- **Edited:** `.github/workflows/council.yml`, `.harness/README.md`, `.harness/learnings.md`.
-- **Deleted:** `.harness/scripts/log_pr_watch.sh`.
-- **Unchanged:** application code (still zero), `CLAUDE.md`, `.harness/council/*.md`, `.harness/scripts/council.py`.
+- **Rewritten:** `.github/workflows/pr-watch.yml`, `.github/workflows/council.yml`.
+- **Deleted:** `.harness/scripts/pr_watcher_budget.py`, `.harness/scripts/council_budget.py`. Both obsoleted by cache-based budget.
+- **Edited:** `.harness/README.md` (remove budget scripts from file map, note cache-based state).
+- **Unchanged:** prompt file, personas, council.py, CLAUDE.md.
 
-## Explicitly out of scope this round
+## Explicitly still out of scope
 
-- Unit tests for `council.py` (architecture persona suggested this; deferring — it's a medium refactor and not a blocker).
-- Slack/Discord alerts when the watcher responds (security persona nice-to-have; deferring).
-- Formal DPA with Anthropic/Google (security nice-to-have; deferring — acknowledged risk).
-- Changes to the Gemini council's persona library or scoring rubric.
+- `council.py` unit-test refactor.
+- Slack/Discord alerts.
+- Formal DPA with third-party LLM providers.
+- Secret-scanning step pre-LLM-call (council nice-to-have; not in the critical path).
+- Tightening `gh api:*GET*` to a specific endpoint allowlist (council nice-to-have).
 
-## Verification plan
+## Verification
 
-- [ ] `PR_WATCHER_ENABLED` unset → watcher skips all events (already confirmed on PR #3 current state).
-- [ ] Set `PR_WATCHER_ENABLED=true` on a throwaway test PR → watcher reacts to Codex comment with a suggestion block (no commit).
-- [ ] `@Claude` (capital C) in a PR comment → watcher still reacts.
-- [ ] Trigger a CI failure → watcher runs on the `check_suite.completed` event.
-- [ ] `council.py` deliberately made to exit 1 → council workflow job fails visibly (not silently warning).
-- [ ] Monthly cap: seed `yolo_log.jsonl` with 60 fake `council_run` entries this month → workflow skips with an explanatory comment.
-- [ ] No `.harness/session_state.json` or `.harness/yolo_log.jsonl` commits from CI appear on the PR branch.
+- [ ] `PR_WATCHER_ENABLED` unset → watcher skips (current state on PR #3).
+- [ ] First pr-watch run → cache miss, count starts at 0 → 1 → save.
+- [ ] Second run → cache restore hits → count reads 1 → 2 → save.
+- [ ] Seed cache with count=150 via a throwaway run, subsequent run over-budget-skips with a PR comment.
+- [ ] PR title `[Skip Council]` / `[SKIP COUNCIL]` → council job body skips (no Gemini calls, no comment).
+- [ ] Rapid events fire both `pull_request:synchronize` and `check_suite:completed` for the same PR → only one watcher run proceeds (the other is cancelled by the shared concurrency group).
 
-## Approval
+## Audit trail
 
-Council-reviewed on 2026-04-17 (scores above). Human approved the demotion path after comparing trade-offs vs. full-kill. Recording the trail in `.harness/learnings.md` for the audit chain.
+- Council round 1 report: PR #3 comment marker `<!-- council-report -->`, dated 2026-04-17T01:15:34Z.
+- Council round 2 report: same comment, edited in place, dated 2026-04-17T03:10:15Z.
+- Human decisions: "demotion" (round 1), "override veto, fix everything" (round 2). Both in chat transcript.

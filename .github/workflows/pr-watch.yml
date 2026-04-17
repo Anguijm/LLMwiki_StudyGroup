@@ -2,8 +2,7 @@ name: PR Watcher
 
 # Claude-powered PR triage — read-only reviewer.
 # Demoted from "code committer" to "review-comment writer" per the 2026-04-17
-# Gemini council run (Security/Bugs angles flagged unacceptable risk on
-# contents: write). Scope policy lives in .github/claude-pr-watcher-prompt.md.
+# Gemini council run. Scope policy lives in .github/claude-pr-watcher-prompt.md.
 
 on:
   pull_request:
@@ -17,13 +16,12 @@ on:
   check_suite:
     types: [completed]
 
+# Concurrency group is ALWAYS keyed on the PR number (never check_suite.id)
+# so rapid events for the same PR serialize correctly. See council round 2.
 concurrency:
-  group: pr-watch-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.id }}
+  group: pr-watch-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.pull_requests[0].number }}
   cancel-in-progress: true
 
-# Least privilege. Read-only on contents; write on PR/issue threads only so the
-# watcher can leave review comments and suggestions (which GitHub treats as a
-# PR-level write, not a contents write).
 permissions:
   contents: read
   pull-requests: write
@@ -34,7 +32,6 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Self-recursion guard + trigger allowlist.
     if: |
       vars.PR_WATCHER_ENABLED == 'true' &&
       github.actor != 'github-actions[bot]' &&
@@ -54,9 +51,6 @@ jobs:
           github.event.check_suite.pull_requests[0] != null)
       )
     steps:
-      # For issue_comment / check_suite / review events the default ref is the
-      # base branch, not the PR head. Resolve the PR number and check it out
-      # via gh pr checkout so the watcher always sees the right code.
       - name: Resolve PR number
         id: pr
         env:
@@ -84,19 +78,51 @@ jobs:
               ;;
           esac
 
+      - name: Compute month key
+        id: month
+        run: echo "key=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # Budget state lives in the GitHub Actions cache, NOT in a repo file.
+      # This closes the Denial-of-Wallet vector: a PR cannot modify the cache.
+      - name: Restore budget counter
+        id: budget-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .budget
+          key: pr-watch-budget-${{ steps.month.outputs.key }}-latest
+          restore-keys: |
+            pr-watch-budget-${{ steps.month.outputs.key }}-
+
+      - name: Read budget
+        id: budget
+        env:
+          MONTHLY_CAP: 150
+        run: |
+          mkdir -p .budget
+          COUNT=$(cat .budget/count 2>/dev/null || echo 0)
+          echo "used=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "cap=$MONTHLY_CAP" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -ge "$MONTHLY_CAP" ]; then
+            echo "over_budget=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_budget=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repo (any ref)
+        if: steps.budget.outputs.over_budget != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Check out PR head
-        if: steps.pr.outputs.number != ''
+        if: steps.budget.outputs.over_budget != 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr checkout "${{ steps.pr.outputs.number }}"
 
       - name: Circuit breaker
         id: halt
+        if: steps.budget.outputs.over_budget != 'true'
         run: |
           if [ -f .harness_halt ]; then
             REASON=$(cat .harness_halt)
@@ -114,12 +140,13 @@ jobs:
           gh pr comment "${{ steps.pr.outputs.number }}" \
             --body "PR watcher skipped — circuit breaker active (\`.harness_halt\` present). Reason: ${{ steps.halt.outputs.halt_reason }}"
 
-      - name: Monthly budget check
-        if: steps.halt.outputs.halted != 'true'
-        id: budget
+      - name: Comment over-budget
+        if: steps.budget.outputs.over_budget == 'true' && steps.pr.outputs.number != ''
         env:
-          MONTHLY_CAP: 150
-        run: python3 .harness/scripts/pr_watcher_budget.py
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --body "PR watcher skipped — monthly cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Wait until next month or raise the cap in \`.github/workflows/pr-watch.yml\`."
 
       - name: Run Claude watcher (read-only)
         if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
@@ -128,9 +155,28 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt_file: .github/claude-pr-watcher-prompt.md
+          # claude-haiku-4-5-20251001 = Haiku 4.5 dated release.
+          # Verified against Anthropic model catalog on 2026-04-17.
+          # To upgrade, walk .harness/model-upgrade-audit.md.
           model: claude-haiku-4-5-20251001
           max_turns: 8
           trigger_phrase: "@claude"
           # Read-only tool allowlist. No Edit, no Write, no Bash(git:*) that
           # could push. npm scripts are fine (they do not mutate the remote).
           allowed_tools: "Bash(npm run lint),Bash(npm run typecheck),Bash(npm test),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*GET*),Read,Grep,Glob"
+
+      - name: Increment budget counter
+        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        run: |
+          mkdir -p .budget
+          CURR=$(cat .budget/count 2>/dev/null || echo 0)
+          echo $((CURR + 1)) > .budget/count
+
+      - name: Save budget counter
+        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .budget
+          # Unique key per run so saves don't collide. Restore picks the
+          # latest via the restore-keys prefix above.
+          key: pr-watch-budget-${{ steps.month.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
