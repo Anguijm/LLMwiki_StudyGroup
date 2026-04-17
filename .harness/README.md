@@ -164,7 +164,29 @@ When you swap any model (Claude tier, Gemini version, embedding model, transcrip
 - **Quality gates** (`npm run lint` / `typecheck` / `test` wrappers for the council to consume). Deferred until the Next.js scaffolding exists. When they land, they'll live at `.harness/scripts/quality_gates.sh`.
 - **Tick/tock hourly cron.** That's a yolo-projects pattern for generating many small apps; this repo is one complex app, so it's the wrong mode.
 
-## PR watcher (GitHub Actions)
+## Council action (PR-time, GitHub Actions)
+
+In addition to the local Gemini council, every PR triggers `.github/workflows/council.yml`, which runs the same `council.py` against the PR diff and posts the Lead Architect synthesis as a single comment (re-edited on every push, not stacked).
+
+Setup:
+- Add `GEMINI_API_KEY` as a repo secret (*Settings → Secrets and variables → Actions → New repository secret*).
+- That's it. Opens a PR → action runs → council comment appears in ~60s.
+
+Behavior:
+- Runs on `pull_request` opened/synchronize/reopened and on manual `workflow_dispatch`.
+- Skipped automatically if `[skip council]` appears in the PR title.
+- Skipped automatically for PRs from forks (secrets unavailable to fork PRs by GitHub policy).
+- Skipped if `.harness_halt` exists in the PR branch.
+- Cost: ~7 Gemini-2.5-pro calls per PR (the runner enforces a 15-call hard cap with `RequestBudget`). At ~10 PRs/month → $1–3/month.
+- Read-only repo permissions: the action does not push state-file updates back to the branch. CI runs are ephemeral; local runs (when you also run `council.py` from your shell) capture state durably.
+
+Relationship to local council:
+- **Local council** (`python3 .harness/scripts/council.py --plan ...`): pre-plan, before you write code.
+- **Action council** (this workflow): post-PR, against the diff. Read on your phone, type "approved" to me, I execute.
+
+Both use the same personas in `.harness/council/`. Add a new persona once → it shows up in both.
+
+## PR watcher (Claude in CI)
 
 Separate from the local Gemini council: the repo has a **Claude-powered PR watcher** that reacts to events on every open PR — Codex review comments, CI failures, and `@claude` mentions. Triage-only; every action is bounded by the scope policy.
 
@@ -183,11 +205,11 @@ Scope (enforced by the prompt, not the workflow):
 - Watcher never merges, force-pushes, amends, or pushes to `main`.
 - Uses Claude Haiku 4.5 by default; ~$3–6/month expected.
 
-Relationship to the local council:
-- **Council = pre-plan advisor, run by you before writing code. Gemini-powered. Local-only.**
-- **Watcher = post-PR triage, runs in CI without a session attached. Claude-powered.**
+Relationship to the council:
+- **Council (Gemini)** — reviews plans and diffs. Runs locally *and* on every PR (see Council action above).
+- **Watcher (Claude)** — reacts to PR events: triage, fixes, comments. Never runs locally.
 
-They don't overlap. The council edits what you're about to do; the watcher reacts to what's already been pushed.
+They don't overlap. Council critiques; watcher acts.
 
 ## Troubleshooting
 
