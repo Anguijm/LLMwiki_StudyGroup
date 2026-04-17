@@ -1,13 +1,14 @@
-# LLMwiki_StudyGroup — production scaffold (v0, revision 6)
+# LLMwiki_StudyGroup — production scaffold (v0, revision 7)
 
 ## Status
 
-- r1 (SHA `b9109fa`): REVISE. security 3 / a11y 5 / bugs 6 / cost 9 / arch 9 / product 10. 2 × codex P2.
-- r2 (SHA `990d2f7`): REVISE. security 3 / a11y 9 / bugs 6 / cost 9 / arch 10 / product 10.
-- r3 (SHA `845af75`): REVISE. security 9 / a11y 9 / bugs 5 / cost 10 / arch 10 / product 8.
-- r4 (SHA `1e2e59a`): REVISE. security 9 (0 non-negotiable violations) / a11y 9 / bugs 9 / cost 10 / arch 10 / product 9.
-- r5 (SHA `f02992e`): REVISE. security 9 (0 non-negotiable violations) / a11y 9 / bugs 8 / cost 10 / arch 10 / product **6**. 4 narrow must-dos + 4 bug nice-to-haves.
-- r6 folds all 4 must-dos (token refund ordering, server-side 25 MB, visible focus, color contrast) + all 4 bug nice-to-haves (watchdog 2h, `pdf_no_text_content`, getContext empty-query guard, date hydration) + the two security nice-to-haves (Storage RLS comment, PDF image-strip doc). Product 6 pushback explicitly rejected for the second time, same rationale as r3: the hardening is what earned security 3→9 and the human has twice confirmed security over velocity; Lead Architect already out-of-scopes the pushback ("trading speed-of-initial-learning for longer-term iteration velocity").
+- r1 (`b9109fa`): REVISE. security 3 / a11y 5 / bugs 6 / cost 9 / arch 9 / product 10. 2 × codex P2.
+- r2 (`990d2f7`): REVISE. security 3 / a11y 9 / bugs 6 / cost 9 / arch 10 / product 10.
+- r3 (`845af75`): REVISE. security 9 / a11y 9 / bugs 5 / cost 10 / arch 10 / product 8.
+- r4 (`1e2e59a`): REVISE. security 9 (0 violations) / a11y 9 / bugs 9 / cost 10 / arch 10 / product 9.
+- r5 (`f02992e`): REVISE. security 9 / a11y 9 / bugs 8 / cost 10 / arch 10 / product 6.
+- r6 (`82ed7f3`): REVISE. security 9 / a11y **10** / bugs 9 / cost 10 / arch 10 / product 7. Lead Architect: "Non-negotiables: None." 2 narrow blockers (scrub unused secrets, double-refund unit test), 3 bug nice-to-haves, 1 fail-closed clarification, 2 security nice-to-haves.
+- r7 folds everything r6 surfaced. Product pushback now appears in the Lead Architect's own out-of-scope block ("deliberate trade-off, prioritizing long-term iteration velocity and security over validating the core value proposition with a minimal scaffold") — the council has internalized the verdict, so r7 carries the line forward without re-relitigating.
 
 ## Goal
 
@@ -47,7 +48,7 @@ Files under `/supabase/migrations`:
 - `review_history(id uuid pk, card_id uuid fk srs_cards, user_id uuid fk auth.users, rating smallint, reviewed_at, prev_state jsonb, next_state jsonb)` — shipped.
 - `ingestion_jobs(id uuid pk, idempotency_key text not null, kind text, status text check (status in ('queued','running','completed','failed','cancelled')), owner_id uuid fk auth.users on delete restrict, cohort_id uuid fk cohorts on delete restrict not null, storage_path text, error jsonb, chunk_count int, reserved_tokens int, started_at timestamptz, created_at, updated_at)`.
   - **`source_url` removed from v0 entirely** (r2 security non-negotiable 1). No URL-ingest path in v0; reintroduce in v1 with SSRF guards (private-IP block + domain allowlist).
-  - **`idempotency_key`** is `not null` with a partial unique index `(owner_id, idempotency_key)` — client generates a v4 UUID on upload start, carries it through `ingest.pdf.requested`; duplicate submits collide on the index and the API route returns the existing job's id (r2 bug fix 5).
+  - **`idempotency_key`** is `not null` with a partial unique index `(owner_id, idempotency_key)` — **client computes `sha256(file_bytes)` and uses it as the key** (r6 bug fix 1). Content-hash idempotency means: two different files in two tabs cannot collide on the same key; re-uploading the same file (even from another tab or after a retry) correctly maps to the same job. Duplicate submits collide on the unique index and the API route returns the existing job's id. (Old r2 design of "v4 UUID on first interaction" had a cross-tab collision risk.)
   - **`reserved_tokens` (nullable int)** makes the `token_budget_reserve` step idempotent (r3 bug fix 1). The step writes a value atomically on first run; retry reads the existing value and skips the Upstash `INCRBY`. Detail in Step 4 of the ingest pipeline.
   - `started_at` supports the stuck-job watchdog (r2 bug fix 7).
   - All FKs `on delete restrict` (r3 bug fix 4).
@@ -73,6 +74,7 @@ Supabase Storage has its own RLS surface (`storage.objects`) separate from the D
 
 - **SELECT / INSERT / UPDATE / DELETE** by an `authenticated` role on an object in the `ingest` bucket are allowed iff the object's `name` corresponds to an `ingestion_jobs` row owned by `auth.uid()`. Naming convention is `ingest/<job_id>.pdf`, so the predicate is `bucket_id = 'ingest' AND exists (select 1 from ingestion_jobs ij where ij.id::text = split_part(name, '.', 1) AND ij.owner_id = auth.uid())`.
 - **Naming-convention comment (r5 security nice-to-have)** committed alongside the policy SQL: this RLS is brittle to the `ingest/<job_id>.pdf` path shape; changing the path must be accompanied by a matching policy edit and a pgTAP change. The pgTAP test gates schema deploys, so a drift can't ship silently, but the comment is the primary signal for human editors.
+- **v1 forward-note (r6 security nice-to-have):** the path-parsing approach is a v0 pattern chosen for simplicity; v1 should move `owner_id` into `storage.objects.metadata` and rewrite the policy to read `(metadata->>'owner_id')::uuid = auth.uid()`, eliminating the dependency on object-name parsing entirely. Logged in the v1 kickoff plan.
 - Service role bypasses RLS and is the only path that deletes objects during the Inngest `onFailure` hook (below) or the watchdog cleanup.
 - No public bucket in v0. If/when we add one it ships with a separate plan + council run.
 - pgTAP covers Storage policies via `storage.objects` table asserts using the same seeded-user-in-other-cohort pattern.
@@ -117,6 +119,7 @@ Event chain, every step `step.run`, idempotent by `ingestion_jobs.id` and by eve
      - If `RETURNING` yields a non-null value → `INCRBY` the user's Upstash sliding-window counter with that amount and emit `ingestion.tokens.refunded_count`.
      - If `RETURNING` is NULL → a previous hook run already refunded; no-op.
      - **This order matters:** claim-via-DB first, act-on-Upstash second. Worst case is Upstash `INCRBY` fails after the DB nulls — the refund is lost for up to an hour until the sliding window expires; user-visible impact is bounded and non-fatal. The reverse order (Upstash first) would double-refund on retry.
+     - **Required test (r6 security must-do 2):** a vitest case mocks the Postgres and Upstash clients, invokes `onFailure(job_id)` twice sequentially, and asserts `upstashMock.incrby` was called exactly once. Ships in the same commit as the hook.
   2. Deletes `ingest/<job_id>.pdf` from Supabase Storage (service-role client). Tolerates "already deleted". Storage unreachable → log + emit `ingestion.storage.cleanup_failed_count`; the watchdog re-runs the hook on its next pass.
   3. Emits `ingestion.storage.cleaned_count`.
 
@@ -130,7 +133,27 @@ Every step emits `ingestion.step.duration_seconds` with a `{step, status}` label
 
 **Tier B (usage-based token budget):** per-user sliding-window counter, 100 000 tokens/hour (r2 security non-negotiable 2). Decremented by `token_budget_reserve` step before external LLM/embedding calls. On exhaustion: job fails with typed reason; user sees `"token budget exhausted; resets at <time>"`.
 
-Both tiers: Upstash unreachable → **fail closed** on writes (reject with 503), fail open on reads (serve, log warning).
+**Failure behavior (r6 bugs clarification):**
+- Tier A — event limiter, ingest writes: Upstash unreachable → **fail closed** (reject with 503). Cost-bearing.
+- Tier A — event limiter, note-page reads: Upstash unreachable → **fail open** (serve the page, log warning). No cost exposure.
+- Tier B — token budget (always cost-bearing regardless of which step checks it): Upstash unreachable → **fail closed** (job fails with `error.kind='ratelimit_unavailable'`). Never serve a budget-gated action on a "didn't check" answer.
+
+### 6a. API error handler (r6 bug fix 3)
+
+All Next.js API routes and server actions pipe through a single `/apps/web/lib/api-error-handler.ts` helper that maps typed errors to user-facing responses. Explicitly covers the Postgres codes that `on delete restrict` + our triggers can raise, so users see "Cohort not found" instead of a generic 500:
+
+| source | HTTP | user message |
+|---|---|---|
+| Postgres `23503` foreign_key_violation | 404 | "Cohort not found" (cohort deleted mid-flow) |
+| Postgres `23505` unique_violation on `ingestion_jobs_owner_key_idx` | 200 + existing job id | (idempotent replay) |
+| Postgres `23505` on `notes_slug_key` after collision-handler exhausts | 500 | "Please retry" (astronomically unlikely) |
+| Postgres `23514` check_violation | 400 | "Invalid request" |
+| Custom `AiResponseShapeError` / `AiRequestTimeoutError` | 502 | "Upstream service unavailable" |
+| Custom `RateLimitExceededError` (Tier A event) | 429 | "Too many uploads; try again in N minutes" |
+| Custom `TokenBudgetExhaustedError` (Tier B) | 429 | "Token budget exhausted; resets at HH:MM" |
+| fallthrough | 500 | "Internal error" + log a correlation id |
+
+Unit tests cover every mapping. No raw Postgres errors reach the client.
 
 ### 7. Frontend (v0)
 
@@ -161,7 +184,9 @@ export async function getContext(
 ): Promise<Note[]>
 ```
 
-- **Input guard (r5 bug fix 3):** if `query.trim().length === 0`, return `[]` immediately without calling Voyage. Avoids a wasted embedding call and a 4xx from the vendor, and covers the common "empty note body", "empty search input" cases.
+- **Input guards (r5 bug fix 3, r6 bug fix 2):**
+  - If `query.trim().length === 0` → return `[]` immediately (no Voyage call).
+  - If `query.length > VOYAGE_MAX_INPUT_CHARS` (conservative bound mapping to Voyage-3's token limit; `VOYAGE_MAX_INPUT_CHARS = 30_000` initially, tunable without code change via env) → truncate to that length before embedding. Truncation logs a warning metric `getcontext.query_truncated_count` so we see if it bites in practice.
 - Otherwise embeds `query` via Voyage, runs pgvector cosine search on `notes` filtered by `tier in (...)`, cohort RLS enforced by Supabase. Top-k (default 5). Used by `/note/[slug]` "Related notes" block.
 
 ### 10. Prompts + evals
@@ -186,19 +211,36 @@ v0 metrics:
 - `notes.created.count` — per-user, per-day.
 - `notes.view.count` — per-note, per-user, per-day (r4 product nice-to-have) — powers the user-centric kill criterion below.
 
-### 12. `.env.example`
+### 12. `.env.example` (r6 security must-do 1: v0-only; no unused secrets)
 
+Only keys that v0 reads at runtime ship in `.env.example`. v1+ keys (AssemblyAI, Discord webhook, web-push VAPID keys) are added in the PR that actually wires up the feature, alongside its rate-limit + security controls. Shipping a populated-but-unused secret is a footgun: it invites a teammate to consume it without implementing the surrounding safety nets.
+
+v0 keys:
 - `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` (server only), `SUPABASE_PROJECT_REF`
 - `ANTHROPIC_API_KEY`
 - `VOYAGE_API_KEY`
 - `REDUCTO_API_KEY`, `LLAMAPARSE_API_KEY`
 - `PDF_PARSER` (`reducto` | `llamaparse`)
 - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`
-- `ASSEMBLYAI_API_KEY` (v1+)
 - `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY`
-- `DISCORD_WEBHOOK_URL` (v1+)
-- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` (v1+)
 - `APP_BASE_URL`
+
+Explicitly NOT in v0: `ASSEMBLYAI_API_KEY`, `DISCORD_WEBHOOK_URL`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`. A CI grep gate (`rg 'ASSEMBLYAI|DISCORD|VAPID' .env.example` must return empty) keeps them out until the feature PRs add them with their safety controls.
+
+### 12a. Realtime exposure map (r6 security nice-to-have)
+
+A dedicated section in the README documents exactly which tables publish change notifications over Supabase Realtime in v0, so future developers don't accidentally expose PII by enabling a publication without review:
+
+| table | Realtime enabled? | filter |
+|---|---|---|
+| `ingestion_jobs` | yes | cohort membership (via RLS SELECT policy) |
+| `notes` | **no** in v0 | (would fan out edit events; add only if product needs live-edit UI) |
+| `concept_links` | no | — |
+| `srs_cards`, `review_history` | no | — |
+| `cohorts`, `cohort_members` | no | — |
+| `auth.*`, `storage.*` | no | Supabase defaults |
+
+Adding a table to a publication is a security-review event; pgTAP must include a fresh isolation case before the publication is enabled.
 
 ### 13. README deploy runbook + rollback
 
