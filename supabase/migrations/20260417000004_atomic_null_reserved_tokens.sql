@@ -6,8 +6,12 @@
 -- non-null return value refunds Upstash. A retried hook reads NULL and
 -- no-ops.
 --
--- The supabase-js .update().select() pattern returns the POST-update row,
--- so we cannot use it for this. A SQL function is the clean pattern.
+-- Implementation: SELECT ... FOR UPDATE in the same transaction captures
+-- the pre-update value, then the UPDATE sets it to NULL. Supabase js's
+-- .update().select() returns the POST-update row, so we need this SQL
+-- helper to read the previous value. Both statements live in a single
+-- function-call transaction in Postgres, so the read+write is atomic
+-- under concurrent access.
 
 create or replace function public.atomic_null_reserved_tokens(_job_id uuid)
 returns table (reserved_tokens_before int)
@@ -15,20 +19,18 @@ language plpgsql security invoker as $$
 declare
   prev int;
 begin
+  -- Lock the row and capture the pre-update value.
+  select reserved_tokens
+    into prev
+    from public.ingestion_jobs
+    where id = _job_id
+    for update;
+
+  -- Null it out in the same transaction.
   update public.ingestion_jobs
-  set reserved_tokens = null
-  where id = _job_id
-  returning (
-    -- Postgres executes RETURNING against the new row; we need the old
-    -- value, so grab it in a CTE pattern via a separate select.
-    (select ij.reserved_tokens from public.ingestion_jobs ij where ij.id = _job_id)
-  ) into prev;
-  -- NOTE: the above RETURNING trick reads the NEW row (already null).
-  -- Switch to the canonical approach: select-then-update in a single
-  -- transaction. Supabase's single statement is already in a tx; we just
-  -- do two statements:
-  select reserved_tokens into prev from public.ingestion_jobs where id = _job_id for update;
-  update public.ingestion_jobs set reserved_tokens = null where id = _job_id;
+    set reserved_tokens = null
+    where id = _job_id;
+
   reserved_tokens_before := prev;
   return next;
 end;

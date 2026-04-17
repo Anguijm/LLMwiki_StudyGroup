@@ -108,13 +108,22 @@ export async function POST(req: NextRequest) {
     const svc = supabaseService();
     const title = sanitizeNoteTitle(rawTitle);
 
+    // Pre-allocate the job id client-side so we can write storage_path on
+    // the INSERT. Closes the orphan-file window where Storage upload
+    // succeeds but a follow-up UPDATE of storage_path fails, leaving the
+    // watchdog with no path to clean up (council batch-6-8 bug nice-to-have).
+    const preJobId = crypto.randomUUID();
+    const preStoragePath = `${preJobId}.pdf`;
+
     const { data: insertResult, error: insertError } = await svc
       .from('ingestion_jobs')
       .insert({
+        id: preJobId,
         idempotency_key: idempotencyKey,
         owner_id: user.id,
         cohort_id: cohortId,
         status: 'queued',
+        storage_path: preStoragePath,
       })
       .select('id, status, storage_path')
       .single();
@@ -141,7 +150,7 @@ export async function POST(req: NextRequest) {
     if (insertError) throw insertError;
 
     const jobId = insertResult.id as string;
-    const storagePath = `${jobId}.pdf`;
+    const storagePath = insertResult.storage_path as string;
 
     // --- upload to Storage (service role; RLS gates the READ path) ----
     const bytes = new Uint8Array(await file.arrayBuffer());
@@ -162,7 +171,7 @@ export async function POST(req: NextRequest) {
         { status: 500 },
       );
     }
-    await svc.from('ingestion_jobs').update({ storage_path: storagePath }).eq('id', jobId);
+    // storage_path was written on INSERT above — no follow-up UPDATE needed.
 
     // --- dispatch Inngest event ---------------------------------------
     await inngest.send({
