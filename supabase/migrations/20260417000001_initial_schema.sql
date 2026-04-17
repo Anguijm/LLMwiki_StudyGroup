@@ -65,8 +65,14 @@ create table if not exists public.ingestion_jobs (
 );
 
 -- Idempotency: (owner, key) unique; sha256(file_bytes) on the client side.
+-- Partial index (r2-diff council bug fix): excludes terminally-failed jobs so
+-- the "Retry" CTA on a system_transient failure can create a new job with the
+-- same content-hash key. Without this, re-uploading the same file after a
+-- failure would collide on the old row and silently "succeed" against the
+-- failed job.
 create unique index if not exists ingestion_jobs_owner_key_idx
-  on public.ingestion_jobs(owner_id, idempotency_key);
+  on public.ingestion_jobs(owner_id, idempotency_key)
+  where status not in ('failed', 'cancelled');
 
 create trigger ingestion_jobs_set_updated_at
   before update on public.ingestion_jobs

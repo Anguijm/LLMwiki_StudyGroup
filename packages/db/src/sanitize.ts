@@ -31,3 +31,19 @@ export function sanitizeNoteTitle(input: string): string {
 export function sanitizeContextQuery(input: string): string {
   return sanitizeUserText(input, GETCONTEXT_QUERY_MAX);
 }
+
+/**
+ * Sanitize a filename before it's used anywhere in a storage path (r2-diff
+ * council defense-in-depth). Drops path-separators, null bytes, controls, and
+ * anything that could make the result escape its intended prefix.
+ *
+ * NOTE: v0 actually uses `ingest/<job_id>.pdf` — the filename never touches
+ * the path. This helper is a backstop for future code that might.
+ */
+const UNSAFE_FILENAME_CHARS = /[^A-Za-z0-9._-]/g;
+export function sanitizeFilename(input: string): string {
+  const stripped = input.replace(CONTROL_CHARS, '').replace(UNSAFE_FILENAME_CHARS, '_');
+  // Collapse leading dots to avoid `.`, `..`, or hidden-file paths.
+  const normalized = stripped.replace(/^\.+/, '_');
+  return normalized.length > 255 ? normalized.slice(0, 255) : normalized;
+}

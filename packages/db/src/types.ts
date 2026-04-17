@@ -51,6 +51,10 @@ export interface IngestionError {
 export type IngestionErrorKind =
   | 'pdf_unparseable'
   | 'pdf_no_text_content'
+  // r2-diff council: chunk step fails loud if max_chunks (200) is exceeded
+  // instead of silently truncating. Distinct from pdf_content_too_long
+  // (which is the pre-chunk size check) so users see a useful error.
+  | 'pdf_too_many_chunks'
   | 'pdf_content_too_long'
   | 'pdf_timeout'
   | 'embed_input_too_long'

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizeUserText, sanitizeNoteTitle, NOTE_TITLE_MAX } from './sanitize';
+import { sanitizeUserText, sanitizeNoteTitle, sanitizeFilename, NOTE_TITLE_MAX } from './sanitize';
 
 describe('sanitizeUserText', () => {
   it('strips null bytes', () => {
@@ -34,5 +34,24 @@ describe('sanitizeUserText', () => {
 
   it('sanitizeNoteTitle enforces NOTE_TITLE_MAX', () => {
     expect(sanitizeNoteTitle('a'.repeat(1000))).toHaveLength(NOTE_TITLE_MAX);
+  });
+});
+
+describe('sanitizeFilename', () => {
+  it('drops path separators', () => {
+    expect(sanitizeFilename('../../../etc/passwd')).toBe('___________etc_passwd');
+  });
+
+  it('drops null bytes and control chars', () => {
+    expect(sanitizeFilename('f\0o\x07o.pdf')).toBe('f_o_o.pdf');
+  });
+
+  it('replaces leading dots so hidden files cannot be produced', () => {
+    expect(sanitizeFilename('..hidden')).toBe('_hidden');
+    expect(sanitizeFilename('.env')).toBe('_env');
+  });
+
+  it('keeps safe filenames intact', () => {
+    expect(sanitizeFilename('Lecture-01.pdf')).toBe('Lecture-01.pdf');
   });
 });
