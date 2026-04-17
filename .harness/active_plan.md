@@ -1,12 +1,13 @@
-# LLMwiki_StudyGroup — production scaffold (v0, revision 5)
+# LLMwiki_StudyGroup — production scaffold (v0, revision 6)
 
 ## Status
 
-- r1 council (SHA `b9109fa`): **REVISE**. security 3, a11y 5, bugs 6, cost 9, arch 9, product 10. 2 × codex P2.
-- r2 council (SHA `990d2f7`): **REVISE**. security 3, a11y 9, bugs 6, cost 9, arch 10, product 10.
-- r3 council (SHA `845af75`): **REVISE**. security 9, a11y 9, bugs 5, cost 10, arch 10, product 8.
-- r4 council (SHA `1e2e59a`): **REVISE**. security 9 (0 non-negotiable violations), a11y 9, bugs **9**, cost 10, arch 10, product **9**. Two narrow security must-dos (Storage RLS, concept_links cross-cohort integrity); three bug nice-to-haves (token refund on failure, slug collision handling, parser Zod); two product metrics.
-- r5 folds all 7 r4 items (2 must-dos + 3 bugs + 2 product). No prior fix regresses.
+- r1 (SHA `b9109fa`): REVISE. security 3 / a11y 5 / bugs 6 / cost 9 / arch 9 / product 10. 2 × codex P2.
+- r2 (SHA `990d2f7`): REVISE. security 3 / a11y 9 / bugs 6 / cost 9 / arch 10 / product 10.
+- r3 (SHA `845af75`): REVISE. security 9 / a11y 9 / bugs 5 / cost 10 / arch 10 / product 8.
+- r4 (SHA `1e2e59a`): REVISE. security 9 (0 non-negotiable violations) / a11y 9 / bugs 9 / cost 10 / arch 10 / product 9.
+- r5 (SHA `f02992e`): REVISE. security 9 (0 non-negotiable violations) / a11y 9 / bugs 8 / cost 10 / arch 10 / product **6**. 4 narrow must-dos + 4 bug nice-to-haves.
+- r6 folds all 4 must-dos (token refund ordering, server-side 25 MB, visible focus, color contrast) + all 4 bug nice-to-haves (watchdog 2h, `pdf_no_text_content`, getContext empty-query guard, date hydration) + the two security nice-to-haves (Storage RLS comment, PDF image-strip doc). Product 6 pushback explicitly rejected for the second time, same rationale as r3: the hardening is what earned security 3→9 and the human has twice confirmed security over velocity; Lead Architect already out-of-scopes the pushback ("trading speed-of-initial-learning for longer-term iteration velocity").
 
 ## Goal
 
@@ -71,6 +72,7 @@ pgTAP tests in `/supabase/tests/rls.sql` exercise every RLS policy with per-verb
 Supabase Storage has its own RLS surface (`storage.objects`) separate from the DB tables. The `ingest` bucket is private and carries explicit policies keyed to `ingestion_jobs`:
 
 - **SELECT / INSERT / UPDATE / DELETE** by an `authenticated` role on an object in the `ingest` bucket are allowed iff the object's `name` corresponds to an `ingestion_jobs` row owned by `auth.uid()`. Naming convention is `ingest/<job_id>.pdf`, so the predicate is `bucket_id = 'ingest' AND exists (select 1 from ingestion_jobs ij where ij.id::text = split_part(name, '.', 1) AND ij.owner_id = auth.uid())`.
+- **Naming-convention comment (r5 security nice-to-have)** committed alongside the policy SQL: this RLS is brittle to the `ingest/<job_id>.pdf` path shape; changing the path must be accompanied by a matching policy edit and a pgTAP change. The pgTAP test gates schema deploys, so a drift can't ship silently, but the comment is the primary signal for human editors.
 - Service role bypasses RLS and is the only path that deletes objects during the Inngest `onFailure` hook (below) or the watchdog cleanup.
 - No public bucket in v0. If/when we add one it ships with a separate plan + council run.
 - pgTAP covers Storage policies via `storage.objects` table asserts using the same seeded-user-in-other-cohort pattern.
@@ -87,7 +89,12 @@ Supabase Storage has its own RLS surface (`storage.objects`) separate from the D
 Event chain, every step `step.run`, idempotent by `ingestion_jobs.id` and by event `idempotency_key`:
 
 1. **`ingest.pdf.requested`** (carries `idempotency_key` from client) → API route inserts `ingestion_jobs` row; ON CONFLICT on `(owner_id, idempotency_key)` returns the existing job id. Client-side button is disabled on click + resubmits with the same key on manual retry (r2 bug fix 5).
-2. **`parse`** → Reducto/LlamaParse via abstraction. **Magic-byte check** on the uploaded file before the parser is invoked (council security nice-to-have: defense-in-depth beyond the API route's MIME sniff). Empty / image-only / password-protected PDFs produce zero chunks → job `status='failed'` with `error.kind='pdf_unparseable'` and a human-readable reason (fuel for the `ingestion.parse.failure_reason_count` metric).
+   - **Server-side 25 MB limit** (r5 security must-do 2): Next.js route config sets `export const runtime = 'nodejs'` + `export const maxDuration = 60` + explicit `Content-Length` header check in the handler that rejects with `413 Payload Too Large` before the stream is consumed. `next.config.js` sets `serverRuntimeConfig.api.bodyParser.sizeLimit = '25mb'` for defence in depth. Client-side size check stays as a UX shortcut but never substitutes for the server check.
+2. **`parse`** → Reducto/LlamaParse via abstraction. **Magic-byte check** on the uploaded file before the parser is invoked (council security nice-to-have: defense-in-depth beyond the API route's MIME sniff). **Three distinct failure kinds** (r5 bug fix 2) surfaced via `error.kind` to power `ingestion.parse.failure_reason_count`:
+   - `pdf_unparseable` — parser raised (password-protected, truly corrupt, bad format).
+   - `pdf_no_text_content` — parser succeeded but returned zero text runs / an empty chunks array (structurally valid but all-image pages or empty PDF). Distinct from the unparseable case so we can tell users "add OCR" instead of "fix the file".
+   - `pdf_timeout` — parser exceeded the 30s HTTP timeout.
+   - **Image handling (r5 security nice-to-have):** the parser layer strips/ignores embedded image content; only extracted text is chunked. The Markdown renderer uses `rehype-sanitize` with the default `defaultSchema` which disallows `<img>` — ingested notes cannot carry hostile image URLs from source PDFs.
 3. **`chunk`** → heading-aware chunker, `max_chunks = 200`/job (r1 security non-negotiable 2).
 4. **`token_budget_reserve`** — idempotent (r3 bug fix 1).
    - Read `ingestion_jobs.reserved_tokens` for this `job_id`.
@@ -103,14 +110,19 @@ Event chain, every step `step.run`, idempotent by `ingestion_jobs.id` and by eve
    - **Slug collision handling:** the insert can raise `23505` unique_violation on `notes_slug_key` (distinct from the `source_ingestion_id` conflict) if two different notes collide on title + hash prefix. The step catches this specific error, regenerates with a 12-char hash, retries once; if it collides again (astronomically unlikely) the slug falls back to the full `id` string. Unit test seeds two notes whose titles slugify identically, asserts both inserts succeed with distinct slugs.
 8. **`post-ingest.enqueue`** → emit `note.created.link` + `note.created.flashcards` (v0 no-op stubs).
 
-**Function-level `onFailure` hook** (r3 bug fix 3, r4 bug fix 1 token refund, r4 security nice-to-have for Storage timeout): when the Inngest ingest function enters a terminal-failed state, the hook performs three idempotent actions, each wrapped in a 10s timeout so a hung Storage or Upstash can't stall the hook:
-  1. Deletes `ingest/<job_id>.pdf` from Supabase Storage (service-role client). Tolerates "already deleted". Storage unreachable → log and proceed; the watchdog re-runs the hook on its next pass.
-  2. **Refunds `reserved_tokens`** to the user's Upstash sliding-window counter via `INCRBY -reserved_tokens` if `ingestion_jobs.reserved_tokens` is non-null; then nulls out the column in the same transaction so a re-run of the hook cannot double-refund.
-  3. Emits `ingestion.storage.cleaned_count` and `ingestion.tokens.refunded_count` metrics.
+**Function-level `onFailure` hook** (r3 bug fix 3, r4 bug fix 1, r5 security must-do 1): when the Inngest ingest function enters a terminal-failed state, the hook performs idempotent cleanup, each step wrapped in a 10s timeout so a hung Storage or Upstash can't stall the hook:
+
+  1. **Atomic token refund** (r5 security must-do 1). Critical sequence to prevent double-refund on retry:
+     - `UPDATE ingestion_jobs SET reserved_tokens = NULL WHERE id = $1 RETURNING reserved_tokens`.
+     - If `RETURNING` yields a non-null value → `INCRBY` the user's Upstash sliding-window counter with that amount and emit `ingestion.tokens.refunded_count`.
+     - If `RETURNING` is NULL → a previous hook run already refunded; no-op.
+     - **This order matters:** claim-via-DB first, act-on-Upstash second. Worst case is Upstash `INCRBY` fails after the DB nulls — the refund is lost for up to an hour until the sliding window expires; user-visible impact is bounded and non-fatal. The reverse order (Upstash first) would double-refund on retry.
+  2. Deletes `ingest/<job_id>.pdf` from Supabase Storage (service-role client). Tolerates "already deleted". Storage unreachable → log + emit `ingestion.storage.cleanup_failed_count`; the watchdog re-runs the hook on its next pass.
+  3. Emits `ingestion.storage.cleaned_count`.
 
 Every step emits `ingestion.step.duration_seconds` with a `{step, status}` label. Reducto/LlamaParse calls also pass through a 30s HTTP timeout in `/packages/lib/ai/pdfparser.ts` (r3 bug fix 5). On any terminal failure the job's `status` goes to `failed` and the typed error is persisted.
 
-**Cleanup cron — `ingest.watchdog`** (r2 bug fix 7): hourly Inngest scheduled function marks `ingestion_jobs` with `status in ('queued','running')` AND `updated_at < now() - interval '1 hour'` as `status='failed'` with `error.kind='stale_job_watchdog'`. Triggers the function's `onFailure` hook on each rescued row, so orphaned storage files are cleaned up on the same pass. Emits `ingestion.watchdog.rescued_count`.
+**Cleanup cron — `ingest.watchdog`** (r2 bug fix 7, r5 bug fix 1 timeout bump): hourly Inngest scheduled function marks `ingestion_jobs` with `status in ('queued','running')` AND `updated_at < now() - interval '2 hours'` as `status='failed'` with `error.kind='stale_job_watchdog'`. The 2-hour window (up from 1h in r5) is sized for the worst realistic case — 200 chunks × batches of 8 × up-to-30s Haiku calls + 30s Voyage embed + Reducto parse — without prematurely killing valid long-running jobs. Triggers the function's `onFailure` hook on each rescued row so orphaned storage files get cleaned up and reserved tokens get refunded on the same pass. Emits `ingestion.watchdog.rescued_count`.
 
 ### 6. Rate limiting — Upstash, two tiers
 
@@ -126,9 +138,11 @@ Both tiers: Upstash unreachable → **fail closed** on writes (reject with 503),
   - **Post-upload focus management** (council a11y nice-to-have): after an upload server action resolves, focus moves programmatically to the newly-inserted row in the status table so keyboard users don't lose context.
 - **Single `aria-live="polite"` region** announces only terminal state changes (`completed`/`failed`), debounced 1s. Error messages are programmatically linked to their form fields via `aria-describedby` (council a11y nice-to-have).
 - **Touch targets** verified ≥ 44×44pt via axe-core rule `target-size` (council a11y nice-to-have).
-- **`/note/[slug]`:** server-rendered Markdown via `react-markdown` + `rehype-sanitize`. Title, tier badge, author, `created_at` via `Intl.DateTimeFormat` in the user's locale. Backlinks + graph = empty-state placeholders in v0. **"Related notes"** section populated by `getContext`.
+- **`/note/[slug]`:** server-rendered Markdown via `react-markdown` + `rehype-sanitize`. Backlinks + graph = empty-state placeholders in v0. **"Related notes"** section populated by `getContext`.
+  - **Date rendering (r5 bug fix 4):** timestamps are serialized as ISO 8601 strings by the server component and passed to a small client component (`<LocalizedDate value={iso} />`) that formats them with `Intl.DateTimeFormat` using the browser locale. Formatting on the server would use the server locale and flash / hydration-mismatch when the client re-rendered. Unit test asserts no hydration-mismatch warning on a Playwright page load.
 - **Auth:** Supabase magic link. Seed cohort in migration; post-login server action upserts into `cohort_members`. Failure → typed error page "Cohort membership could not be created; contact cohort admin" (council bugs r1).
 - **UI primitives:** Tailwind + shadcn/ui (`button`, `card`, `input`, `toast`). `t()` helper stub at `/apps/web/lib/i18n.ts` for future locale files.
+- **Visible focus + color contrast** (r5 a11y must-dos 1+2): a global Tailwind `focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary` ring is applied to every focusable element via a base layer override; no component opts out. The v0 shadcn/ui theme palette is chosen so every Tailwind-generated `text-*` / `bg-*` pair meets WCAG AA (4.5:1 for normal text, 3:1 for UI components + large text). A CI step `pnpm test:a11y` runs `@axe-core/playwright` with rules `color-contrast`, `focus-visible`, and `target-size` (≥44×44pt) against `/`, `/note/[slug]`, and the upload flow; any violation fails the build. CI config lands in `.github/workflows/ci.yml` alongside lint + typecheck + test.
 
 ### 8. Provider abstraction — `/packages/lib/ai`
 
@@ -147,7 +161,8 @@ export async function getContext(
 ): Promise<Note[]>
 ```
 
-Embeds `query` via Voyage, runs pgvector cosine search on `notes` filtered by `tier in (...)`, cohort RLS enforced by Supabase. Top-k (default 5). Used by `/note/[slug]` "Related notes" block.
+- **Input guard (r5 bug fix 3):** if `query.trim().length === 0`, return `[]` immediately without calling Voyage. Avoids a wasted embedding call and a 4xx from the vendor, and covers the common "empty note body", "empty search input" cases.
+- Otherwise embeds `query` via Voyage, runs pgvector cosine search on `notes` filtered by `tier in (...)`, cohort RLS enforced by Supabase. Top-k (default 5). Used by `/note/[slug]` "Related notes" block.
 
 ### 10. Prompts + evals
 
