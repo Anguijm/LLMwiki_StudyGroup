@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "active_plan": null,
-  "focus_area": "framework scaffolding (pre-kickoff)",
-  "approval_state": "idle",
-  "last_council": null,
+  "active_plan": ".harness/active_plan.md",
+  "focus_area": "v0 vertical slice execution (PR #5, SHA c1d4a5f approved)",
+  "approval_state": "approved",
+  "last_council": "2026-04-17T16:11:13+00:00 (PROCEED)",
   "last_commit": null,
-  "notes": "Initialized by harness scaffolding. Agent updates active_plan / focus_area / approval_state; post-commit hook updates last_commit; council.py updates last_council."
+  "notes": "Human approved v0 plan r8 after 8 revisions (council scores: a11y 10, arch 10, bugs 9, cost 10, product 7, security 10). Option A: 3 small adjustments (Realtime channel unsubscribe, max_chunks-exceeded fails loud, slugify try/catch) accepted as implementation acceptance criteria, not a plan revision. Executing 9-commit rollout."
 }

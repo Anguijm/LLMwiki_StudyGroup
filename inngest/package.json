@@ -1,0 +1,29 @@
+{
+  "name": "@llmwiki/inngest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./functions": "./src/functions/index.ts",
+    "./events": "./src/events.ts"
+  },
+  "scripts": {
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@llmwiki/db": "workspace:*",
+    "@llmwiki/lib-ai": "workspace:*",
+    "@llmwiki/lib-metrics": "workspace:*",
+    "@llmwiki/lib-ratelimit": "workspace:*",
+    "@llmwiki/prompts": "workspace:*",
+    "inngest": "^3.22.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  }
+}

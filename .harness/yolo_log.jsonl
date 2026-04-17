@@ -1,1 +1,2 @@
 {"ts": "2026-04-16T00:00:00+00:00", "event": "harness_init", "note": "Initial harness scaffolding landed. See .harness/README.md."}
+{"ts": "2026-04-17T16:15:00+00:00", "event": "plan_approved", "plan_sha": "c1d4a5f", "council_verdict": "PROCEED", "rounds": 8, "note": "v0 vertical slice execution starts"}
