@@ -1,4 +1,4 @@
-# LLMwiki_StudyGroup — production scaffold (v0, revision 7)
+# LLMwiki_StudyGroup — production scaffold (v0, revision 8)
 
 ## Status
 
@@ -7,8 +7,9 @@
 - r3 (`845af75`): REVISE. security 9 / a11y 9 / bugs 5 / cost 10 / arch 10 / product 8.
 - r4 (`1e2e59a`): REVISE. security 9 (0 violations) / a11y 9 / bugs 9 / cost 10 / arch 10 / product 9.
 - r5 (`f02992e`): REVISE. security 9 / a11y 9 / bugs 8 / cost 10 / arch 10 / product 6.
-- r6 (`82ed7f3`): REVISE. security 9 / a11y **10** / bugs 9 / cost 10 / arch 10 / product 7. Lead Architect: "Non-negotiables: None." 2 narrow blockers (scrub unused secrets, double-refund unit test), 3 bug nice-to-haves, 1 fail-closed clarification, 2 security nice-to-haves.
-- r7 folds everything r6 surfaced. Product pushback now appears in the Lead Architect's own out-of-scope block ("deliberate trade-off, prioritizing long-term iteration velocity and security over validating the core value proposition with a minimal scaffold") — the council has internalized the verdict, so r7 carries the line forward without re-relitigating.
+- r6 (`82ed7f3`): REVISE. security 9 / a11y 10 / bugs 9 / cost 10 / arch 10 / product 7. Non-negotiables: None.
+- r7 (`54c15b1`): REVISE. security **10** / a11y 10 / bugs 9 / cost 10 / arch 9 / product 7. Non-negotiables: None. No new plan gaps; "blockers" are restatements of tests already committed. Lead Architect gated approval on three UX/policy questions.
+- r8 answers the three questions (token-budget display, user-text sanitization, error taxonomy) + folds the four small nice-to-haves (end-to-end latency metric, ingest funnel metric, trigger-fire error log, publication-table lockfile test). No prior fix regresses.
 
 ## Goal
 
@@ -131,7 +132,8 @@ Every step emits `ingestion.step.duration_seconds` with a `{step, status}` label
 
 **Tier A (coarse, per event):** sliding-window `INCR` — 5 `ingest.pdf.requested` / user / hour. On limit: API route returns 429.
 
-**Tier B (usage-based token budget):** per-user sliding-window counter, 100 000 tokens/hour (r2 security non-negotiable 2). Decremented by `token_budget_reserve` step before external LLM/embedding calls. On exhaustion: job fails with typed reason; user sees `"token budget exhausted; resets at <time>"`.
+**Tier B (usage-based token budget):** per-user sliding-window counter, 100 000 tokens/hour (r2 security non-negotiable 2). Decremented by `token_budget_reserve` step before external LLM/embedding calls. On exhaustion: job fails with typed reason.
+- **Reset-time UX (r7 approval-gate Q1):** the error payload carries an ISO 8601 `resets_at` timestamp; the `<LocalizedDate>` client component renders it as **relative text** (`"in 45 minutes"`, updates every 15s) with an accessible tooltip showing the localized absolute time (`"16:42 EST"`). Relative reads fastest on mobile; tooltip handles the "I want to know the exact time" case. Server never formats the date.
 
 **Failure behavior (r6 bugs clarification):**
 - Tier A — event limiter, ingest writes: Upstash unreachable → **fail closed** (reject with 503). Cost-bearing.
@@ -155,10 +157,26 @@ All Next.js API routes and server actions pipe through a single `/apps/web/lib/a
 
 Unit tests cover every mapping. No raw Postgres errors reach the client.
 
+### 6b. User-text sanitization (r7 approval-gate Q2)
+
+Every user-provided text field (note title, `getContext` query, any future text input) passes through `/apps/web/lib/sanitize.ts` before it touches Postgres or an external API. The sanitizer:
+
+1. Strips null byte `\0` (Postgres rejects it; some drivers silently truncate — both are bad).
+2. Strips C0 controls **except** `\t`, `\n`, `\r` (preserves whitespace semantics; drops `\b`, `\f`, `\v`, etc.).
+3. Strips C1 controls (`\x80`–`\x9f`).
+4. Normalizes to Unicode NFC (so visually identical strings collate identically for slug collision detection).
+5. Enforces a hard max length (`NOTE_TITLE_MAX = 512`, `GETCONTEXT_QUERY_MAX = 2000`) after stripping.
+
+Applied at the API route boundary, not in the UI, so the control is server-authoritative. Rust-style: we don't trust our own frontend. Unit test covers every stripped/preserved codepoint class and the NFC normalization case.
+
 ### 7. Frontend (v0)
 
 - **`/` dashboard:** "Your notes" list (server component) with explicit loading + error states; "Upload PDF" button (client component) generates `idempotency_key` on first interaction, disables until response resolves, re-uses the key if the user manually retries. "Recent ingestion jobs" status table backed by a Realtime channel on `ingestion_jobs`; reconnect handling (r3 bug fix 3): while the initial re-fetch is in flight, incoming deltas are buffered in an in-memory queue keyed by job `id`; when the fetch resolves, the queued deltas are applied on top of the fetched snapshot, and any fetched row with a `updated_at` older than a queued delta for the same `id` is overridden by the delta. No stale-fetch-overwrites-fresh-delta race. Implemented in `/apps/web/components/IngestionStatusTable.tsx` with a unit test that triggers the race deterministically.
-  - **Post-upload focus management** (council a11y nice-to-have): after an upload server action resolves, focus moves programmatically to the newly-inserted row in the status table so keyboard users don't lose context.
+- **Error taxonomy in the status table (r7 approval-gate Q3):** `ingestion_jobs.error.kind` maps to one of two display categories, distinguished by pill color, icon, and CTA:
+  - **user_correctable** (amber pill, ⚠️) — `pdf_unparseable`, `pdf_no_text_content`, `embed_input_too_long`, `pdf_timeout` (likely large file). CTA: "Replace file" opens the upload dialog pre-loaded with the same `idempotency_key`-free flow so a different file gets a new job.
+  - **system_transient** (slate pill, ↻) — `token_budget_exhausted`, `ratelimit_unavailable`, `AiResponseShapeError`, `AiRequestTimeoutError`, `stale_job_watchdog`. CTA: "Retry" re-submits the original file (new idempotency key, because the previous attempt is terminally failed). Also shown: `resets_at` countdown for `token_budget_exhausted`.
+  - Maps live in `/apps/web/lib/error-kind-classifier.ts` so a new `error.kind` being added anywhere in the pipeline fails typecheck until classified. Unit test verifies exhaustiveness.
+- **Post-upload focus management** (council a11y nice-to-have): after an upload server action resolves, focus moves programmatically to the newly-inserted row in the status table so keyboard users don't lose context.
 - **Single `aria-live="polite"` region** announces only terminal state changes (`completed`/`failed`), debounced 1s. Error messages are programmatically linked to their form fields via `aria-describedby` (council a11y nice-to-have).
 - **Touch targets** verified ≥ 44×44pt via axe-core rule `target-size` (council a11y nice-to-have).
 - **`/note/[slug]`:** server-rendered Markdown via `react-markdown` + `rehype-sanitize`. Backlinks + graph = empty-state placeholders in v0. **"Related notes"** section populated by `getContext`.
@@ -204,12 +222,16 @@ Structured log emitters consumable by Vercel + Supabase log drain.
 v0 metrics:
 - `ingestion.jobs.success_rate` (from `status` column).
 - `ingestion.step.duration_seconds` histogram — labels `{step, status}`.
+- **`ingestion.pipeline.end_to_end_latency_p90`** (r7 product nice-to-have): from API route's `ingest.pdf.requested` dispatch to `persist` completion. Per-step duration doesn't capture queue time + retry waits; the user feels the wall-clock.
+- **`ingestion.funnel`** (r7 product nice-to-have): count with `{stage in ('upload','parse','chunk','simplify','embed','persist')}` label incremented on entry; a drop-off heat map reveals where users lose their jobs.
 - `ingestion.parse.failure_reason_count` — labels `{reason}`.
-- `ingestion.upload.file_size_bytes` histogram (r4 product nice-to-have) — surfaces user-behavior distribution so we can size parser + storage limits empirically.
+- `ingestion.upload.file_size_bytes` histogram — surfaces user-behavior distribution.
 - `ingestion.watchdog.rescued_count`.
 - `ingestion.storage.cleaned_count`, `ingestion.tokens.refunded_count`.
+- `getcontext.query_truncated_count` (r6 bug fix 2).
 - `notes.created.count` — per-user, per-day.
-- `notes.view.count` — per-note, per-user, per-day (r4 product nice-to-have) — powers the user-centric kill criterion below.
+- `notes.view.count` — per-note, per-user, per-day — powers the user-centric kill criterion below.
+- **`security.concept_links_cohort_mismatch` error log** (r7 security nice-to-have): when the integrity trigger fires, emit a structured `level='error'` log with `{source_note_id, target_note_id, attempted_cohort_id, caller_role}`. High-signal alert for a bug or attack; surfaces in the log drain with `severity=error` so it pages if monitoring is wired up.
 
 ### 12. `.env.example` (r6 security must-do 1: v0-only; no unused secrets)
 
@@ -241,6 +263,8 @@ A dedicated section in the README documents exactly which tables publish change 
 | `auth.*`, `storage.*` | no | Supabase defaults |
 
 Adding a table to a publication is a security-review event; pgTAP must include a fresh isolation case before the publication is enabled.
+
+**Lockfile test (r7 security nice-to-have):** a pgTAP case queries `pg_publication_tables` and asserts the published set equals the committed allowlist exactly — `{ingestion_jobs}` in v0. A developer accidentally publishing a PII table (`notes`, `cohort_members`, etc.) fails CI before the migration can land. Changing the allowlist requires editing the test, making the change visible in diff review.
 
 ### 13. README deploy runbook + rollback
 
