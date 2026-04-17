@@ -51,3 +51,22 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 
 ### COUNCIL
 - No council run for this change — explicit `override council: bootstrapping the council automation` from the human. Future Council action runs will retroactively review subsequent PRs that touch this workflow.
+
+## 2026-04-17 — Council-driven demotion of PR watcher
+
+### KEEP
+- Ran the PR-time Gemini council action against its own PR. It worked: Product scored 1/10 for the watcher and flagged maintenance overhead as a kill concern; Security (5/10) flagged `contents: write` + unpinned action as unacceptable prompt-injection + supply-chain surface; Bugs (3/10) caught a race condition in `log_pr_watch.sh` and a wrong-branch checkout on `issue_comment`. That's exactly the value proposition — catching decisions the human alone would have shipped.
+- Codex review on the same PR independently flagged the `issue_comment` checkout bug (P1) and the missing `check_suite` trigger (P2). Two independent reviewers agreeing on a bug is strong signal.
+- Using `AskUserQuestion` to surface the "scope pivot" decision to the human, rather than picking one autonomously, was the right move.
+
+### IMPROVE
+- The first council run cost $0 because the key was missing and the action bailed early with a PR comment. That fail-loud-early path saved money, worth keeping.
+- `log_pr_watch.sh` existed only because the watcher had `contents: write` and needed a durable log. When the permission went away, the script went away. Lesson: audit scripts for orphaned dependencies after any scope change.
+
+### INSIGHT
+- For a solo developer on a phone, "autonomous agent commits fixes directly to the PR branch" sounds appealing but buys very little over "agent suggests a commit you tap to accept." The tap cost is tiny; the security surface is not. Defer automation until the cost of *not* automating is real.
+- The Product persona being willing to score a 1/10 is the whole reason to have it. A council where every persona scores 7+ on every plan is a rubber stamp.
+- Pinning third-party actions to commit SHAs is a free-ish win (one-time lookup via `git ls-remote refs/tags/<v>`). Do this as a default for any new workflow, not only after a security review complains.
+
+### COUNCIL
+- Ran on PR #3 diff (2026-04-17). Scores: accessibility 10, architecture 10, cost 9, security 5, bugs 3, product 1. Verdict: REVISE. Seven ordered steps in the synthesis; six implemented this round (unit-test refactor of `council.py` deferred). Full report in the PR #3 comment thread.

@@ -82,20 +82,35 @@ jobs:
         if: steps.halt.outputs.halted != 'true'
         run: pip install -r .harness/scripts/requirements.txt
 
-      - name: Run council
+      - name: Monthly budget check
         if: steps.halt.outputs.halted != 'true'
+        id: budget
+        env:
+          MONTHLY_CAP: 60
+        run: python3 .harness/scripts/council_budget.py
+
+      - name: Comment when over budget
+        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "${PR:-}" ]; then
+            gh pr comment "$PR" --body "Council skipped — monthly run cap reached (${{ steps.budget.outputs.used }}/${{ steps.budget.outputs.cap }}). Raise \`MONTHLY_CAP\` in \`.github/workflows/council.yml\` or wait until next month."
+          fi
+
+      - name: Run council
+        if: steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BASE_REF: origin/${{ github.event.pull_request.base.ref }}
-        run: |
-          # In CI, last_council.md and yolo_log.jsonl live in the runner workspace
-          # only — we never push them back to the branch (read-only permissions).
-          python3 .harness/scripts/council.py --diff --base "$BASE_REF" || {
-            echo "::warning::council.py exited non-zero; will still try to post whatever it produced."
-          }
+        # No || fallbacks. If council.py fails, the job fails — loud and
+        # visible in the Actions UI. The post-comment step still runs in
+        # the always() block below so the human sees what happened.
+        run: python3 .harness/scripts/council.py --diff --base "$BASE_REF"
 
       - name: Post or update council comment
-        if: steps.halt.outputs.halted != 'true' && always()
+        if: always() && steps.halt.outputs.halted != 'true' && steps.budget.outputs.over_budget != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -122,8 +137,10 @@ jobs:
             exit 0
           fi
 
+          # Find an existing council comment. `gh api` failures here are real
+          # auth / API problems and should fail the step; do not swallow with `|| true`.
           EXISTING_ID="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1 || true)"
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)"
 
           if [ -n "$EXISTING_ID" ]; then
             jq -Rs '{body: .}' < "$BODY_FILE" \
