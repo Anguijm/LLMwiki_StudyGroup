@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Secrets-scrub grep gate (r6 security must-do 1).
+  # .env.example must not contain v1+ secret names until the feature PR that
+  # wires them in lands with its own security review.
+  # ==========================================================================
+  env-example-scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if v1+ secrets leaked into .env.example
+        run: |
+          if grep -qE 'ASSEMBLYAI|DISCORD|VAPID' .env.example; then
+            echo "::error::.env.example contains v1+ secrets (ASSEMBLYAI/DISCORD/VAPID). Remove them and re-add in the PR that implements the feature."
+            exit 1
+          fi
+
+  # ==========================================================================
+  # Lint + typecheck + unit tests (vitest) across every workspace package.
+  # Fails fast on any new high/critical npm audit advisory.
+  # ==========================================================================
+  validate:
+    runs-on: ubuntu-latest
+    needs: [env-example-scrub]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: npm audit (prod deps only)
+        run: pnpm audit --prod --audit-level=high
+        continue-on-error: false
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests (vitest)
+        run: pnpm test
+
+      - name: Prompt evals
+        run: pnpm eval
+
+  # ==========================================================================
+  # Database tests (pgTAP) against a fresh local Supabase instance.
+  # Covers every RLS policy, the concept_links integrity trigger, Storage
+  # path-convention drift, and the Realtime publication lockfile.
+  # ==========================================================================
+  db-tests:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Supabase CLI
+        run: |
+          curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.deb -o supabase.deb
+          sudo dpkg -i supabase.deb
+      - name: Start Supabase
+        run: supabase start
+      - name: Apply migrations
+        run: supabase db reset --no-seed
+      - name: Run pgTAP
+        run: supabase test db
+
+  # ==========================================================================
+  # A11y regression (r5 a11y must-dos: color-contrast + focus-visible +
+  # target-size). Runs only if the web app builds.
+  # ==========================================================================
+  a11y:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter web exec playwright install --with-deps chromium
+      - name: Build web app
+        run: pnpm --filter web build
+        env:
+          # Minimal placeholder env — the a11y tests never call real APIs.
+          NEXT_PUBLIC_SUPABASE_URL: 'https://ci.placeholder'
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: 'placeholder'
+      - name: Run axe-core a11y spec
+        run: pnpm test:a11y
