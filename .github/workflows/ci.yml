@@ -25,8 +25,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Fail if v1+ secrets leaked into .env.example
         run: |
-          if grep -qE 'ASSEMBLYAI|DISCORD|VAPID' .env.example; then
-            echo "::error::.env.example contains v1+ secrets (ASSEMBLYAI/DISCORD/VAPID). Remove them and re-add in the PR that implements the feature."
+          # Match actual env-var assignments (KEY= or KEY at start of line),
+          # not prose in comments. Keeps the scrub precise so explanatory
+          # text can still reference the v1+ names.
+          if grep -qE '^\s*(ASSEMBLYAI[A-Z_]*|DISCORD[A-Z_]*|VAPID[A-Z_]*)\s*=' .env.example; then
+            echo "::error::.env.example contains v1+ secret ASSIGNMENTS (ASSEMBLYAI_.../DISCORD_.../VAPID_...). Remove them and re-add in the PR that implements the feature."
+            grep -nE '^\s*(ASSEMBLYAI[A-Z_]*|DISCORD[A-Z_]*|VAPID[A-Z_]*)\s*=' .env.example || true
             exit 1
           fi
 
