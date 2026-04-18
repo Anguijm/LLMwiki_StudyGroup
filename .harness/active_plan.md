@@ -2,7 +2,12 @@
 
 ## Status
 
-r1 (initial). No prior council rounds.
+- r1: REVISE. a11y 10 / arch 10 / bugs 9 / cost 10 / product 10 / security 10. One blocker (empty-string env passes the guard); two security must-dos (regression test + factory throw asserts must actually land, not just be proposed).
+- r2 folds all three:
+  - `requireEnv` rejects empty + whitespace-only, not just nullish.
+  - DB factory tests assert throws in three cases: missing, empty (`''`), whitespace (`' '`).
+  - `route-module-load.test.ts` is built and exercised against both scrubbed and empty-string env.
+- Nice-to-have `pnpm setup:env` interactive script: deferred to v1 (out of scope here).
 
 ## Symptom (concrete)
 
@@ -59,11 +64,16 @@ until Vercel's env-var store is populated. Both problems must be solved.
 **File: `packages/db/src/server.ts`**
 
 - Remove top-level reads at lines 16-21.
-- Add a module-local helper:
+- Add a module-local helper that fails on missing AND empty AND whitespace-only
+  values. An env var pasted as `""` (a common Vercel UI mistake) is
+  functionally equivalent to missing — surfacing it cleanly at the factory
+  call beats failing opaquely deep inside the Supabase SDK three frames later.
   ```ts
   function requireEnv(name: string): string {
     const v = process.env[name];
-    if (!v) throw new Error(`${name} missing`);
+    if (!v || v.trim().length === 0) {
+      throw new Error(`${name} missing or empty`);
+    }
     return v;
   }
   ```
@@ -80,26 +90,41 @@ until Vercel's env-var store is populated. Both problems must be solved.
 
 **Test: `packages/db/src/server.test.ts` (new)**
 
-Uses `vi.stubEnv()` to scrub `NEXT_PUBLIC_SUPABASE_URL`,
+Uses `vi.stubEnv()` to control `NEXT_PUBLIC_SUPABASE_URL`,
 `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` before
 `import('./server')`. Asserts:
-- Importing the module does NOT throw.
-- Calling `supabaseServer('cookie=x')` DOES throw
-  `"NEXT_PUBLIC_SUPABASE_URL missing"`.
-- Calling `supabaseService()` DOES throw
-  `"SUPABASE_SERVICE_ROLE_KEY missing — required for service-role operations"`.
+
+- `import('./server')` does NOT throw with all three env vars unset.
+- `import('./server')` does NOT throw with all three env vars set to `''`.
+- `import('./server')` does NOT throw with all three env vars set to `'   '`.
+- Three rows of `it.each([['unset', undefined], ['empty', ''], ['whitespace', '   ']])`:
+  - With `NEXT_PUBLIC_SUPABASE_URL` in that state, `supabaseServer('cookie=x')`
+    throws an `Error` whose message contains `NEXT_PUBLIC_SUPABASE_URL`.
+  - With `SUPABASE_SERVICE_ROLE_KEY` in that state, `supabaseService()` throws
+    an `Error` whose message contains `SUPABASE_SERVICE_ROLE_KEY`.
+- All required env vars set to valid values: `supabaseServer()` returns a
+  client object (smoke).
 
 **Test: `packages/db/src/browser.test.ts` (new)**
 
-Symmetric: scrubbed env → `import` succeeds; `supabaseBrowser()` throws.
+Symmetric: same `it.each` matrix. `import('./browser')` never throws.
+`supabaseBrowser()` throws on any of {missing, empty, whitespace}.
 
 **Regression test: `apps/web/tests/unit/route-module-load.test.ts` (new)**
 
-For every route file in `apps/web/app/**/route.{ts,tsx}` and every `page.tsx`:
-dynamic-import the module with env vars scrubbed. Assert none throws.
+Discovers every `apps/web/app/**/route.{ts,tsx}` and every
+`apps/web/app/**/page.{ts,tsx}` via a glob. For each file, runs the
+import in a `describe.each` block under two env conditions:
+- All app env vars **unset** (`vi.stubEnv(name, undefined)`).
+- All app env vars **set to empty string** (`vi.stubEnv(name, '')`).
+
+Asserts the dynamic `import()` resolves without throwing in both states.
+Implementation note: must use `vi.resetModules()` between iterations so
+each import re-runs module-top-level code; otherwise the first import's
+result is cached and subsequent stub changes don't take effect.
 
 This catches the class of bug this PR fixes at CI time, not just Vercel
-build time.
+build time, AND catches the council-flagged empty-string variant.
 
 ### 2. Code: audit other top-level env reads
 
