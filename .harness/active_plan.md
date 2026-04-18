@@ -3,10 +3,10 @@
 ## Status
 
 - r1: REVISE. a11y 10 / arch 10 / bugs 9 / cost 10 / product 10 / security 10. One blocker (empty-string env passes the guard); two security must-dos (regression test + factory throw asserts must actually land, not just be proposed).
-- r2 folds all three:
-  - `requireEnv` rejects empty + whitespace-only, not just nullish.
-  - DB factory tests assert throws in three cases: missing, empty (`''`), whitespace (`' '`).
-  - `route-module-load.test.ts` is built and exercised against both scrubbed and empty-string env.
+- r2: PROCEED. Same scores, 0 non-negotiables. Lead Architect's synthesis added two improvements:
+  - Extract `requireEnv` to a shared `packages/lib/utils/env.ts` utility (was module-local duplicate).
+  - PDF parser factory must validate the *specific* key matching `PDF_PARSER`, not just "any one of the two."
+- r3 folds both into the written plan so plan-on-disk matches what gets executed. No other changes.
 - Nice-to-have `pnpm setup:env` interactive script: deferred to v1 (out of scope here).
 
 ## Symptom (concrete)
@@ -59,34 +59,54 @@ until Vercel's env-var store is populated. Both problems must be solved.
 
 ## Scope of this PR
 
-### 1. Code: lazy env-var guards (`packages/db`)
+### 1. Shared `requireEnv` utility
+
+**File: `packages/lib/utils/env.ts` (new)**
+
+Single shared helper consumed by every package that lazy-reads env vars.
+Rejects nullish, empty, and whitespace-only values. An env var pasted as
+`""` (a common Vercel UI mistake) is functionally equivalent to missing —
+surfacing it cleanly at the factory call beats failing opaquely deep inside
+the Supabase SDK three frames later.
+
+```ts
+export function requireEnv(name: string): string {
+  const v = process.env[name];
+  if (!v || v.trim().length === 0) {
+    throw new Error(`${name} missing or empty`);
+  }
+  return v;
+}
+```
+
+**File: `packages/lib/utils/env.test.ts` (new)**
+
+`it.each`-style matrix: `undefined` → throw, `''` → throw, `'   '` → throw,
+`'  value  '` → returns `'  value  '` unchanged (no trim of valid values;
+trim is only used to detect all-whitespace). Error message includes the
+variable name.
+
+**Package wiring**: `packages/lib/utils` becomes a thin workspace package
+(`@llmwiki/lib-utils`) so `@llmwiki/db`, `@llmwiki/lib-ai`, `@llmwiki/lib-ratelimit`, and `inngest/src` can import it. Added to `transpilePackages` in
+`apps/web/next.config.js`.
+
+### 1a. Code: lazy env-var guards (`packages/db`)
 
 **File: `packages/db/src/server.ts`**
 
 - Remove top-level reads at lines 16-21.
-- Add a module-local helper that fails on missing AND empty AND whitespace-only
-  values. An env var pasted as `""` (a common Vercel UI mistake) is
-  functionally equivalent to missing — surfacing it cleanly at the factory
-  call beats failing opaquely deep inside the Supabase SDK three frames later.
-  ```ts
-  function requireEnv(name: string): string {
-    const v = process.env[name];
-    if (!v || v.trim().length === 0) {
-      throw new Error(`${name} missing or empty`);
-    }
-    return v;
-  }
-  ```
+- Import `requireEnv` from `@llmwiki/lib-utils`.
 - `supabaseServer(cookieHeader)`: read `NEXT_PUBLIC_SUPABASE_URL` and
-  `NEXT_PUBLIC_SUPABASE_ANON_KEY` inside the function body.
-- `supabaseService()`: read `NEXT_PUBLIC_SUPABASE_URL` inside (already lazy for
-  `SUPABASE_SERVICE_ROLE_KEY`).
+  `NEXT_PUBLIC_SUPABASE_ANON_KEY` inside the function body via `requireEnv`.
+- `supabaseService()`: read `NEXT_PUBLIC_SUPABASE_URL` and
+  `SUPABASE_SERVICE_ROLE_KEY` inside via `requireEnv`.
 - No change to fail-closed semantics at call sites — an invocation still
   throws loudly if the var is missing. Only the import-time throw is removed.
 
 **File: `packages/db/src/browser.ts`**
 
-- Same transformation. Factory `supabaseBrowser()` reads env vars lazily.
+- Same transformation: import `requireEnv` from `@llmwiki/lib-utils`, factory
+  `supabaseBrowser()` reads env vars lazily at invocation.
 
 **Test: `packages/db/src/server.test.ts` (new)**
 
@@ -130,20 +150,65 @@ build time, AND catches the council-flagged empty-string variant.
 
 `rg -n "process\\.env\\." packages/ inngest/ apps/web/lib/ apps/web/app/` and
 inspect every match. For any that live at module top-level AND throw/error on
-missing values, apply the same move-guard-into-function transform. Scope is
-limited to load-time throws; in-function validation stays as-is. Expected
-surface (from plan-time audit, to be verified at implementation time):
+missing values, apply the same move-guard-into-function transform using the
+shared `requireEnv`. Scope is limited to load-time throws; in-function
+validation stays as-is. Expected surface (from plan-time audit, to be verified
+at implementation time):
 
-- `packages/lib/ai/anthropic.ts` — `ANTHROPIC_API_KEY`
-- `packages/lib/ai/voyage.ts` — `VOYAGE_API_KEY`
-- `packages/lib/ai/pdfparser.ts` — `REDUCTO_API_KEY` / `LLAMAPARSE_API_KEY` / `PDF_PARSER`
-- `packages/lib/ratelimit/*.ts` — `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`
-- `inngest/src/client.ts` — `INNGEST_EVENT_KEY`
+- `packages/lib/ai/anthropic.ts` — `ANTHROPIC_API_KEY` (lazy via `requireEnv`)
+- `packages/lib/ai/voyage.ts` — `VOYAGE_API_KEY` (lazy via `requireEnv`)
+- `packages/lib/ai/pdfparser.ts` — see §2a below (config-aware, not a plain `requireEnv`)
+- `packages/lib/ratelimit/*.ts` — `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (lazy)
+- `inngest/src/client.ts` — `INNGEST_EVENT_KEY` (lazy)
 - `apps/web/app/api/inngest/route.ts` — `INNGEST_SIGNING_KEY` (read inside
   `serve({...})` invocation; this one is likely fine)
 
-If the route-module-load test from §1 passes across the whole surface, no
+If the route-module-load test from §1a passes across the whole surface, no
 further changes needed.
+
+### 2a. PDF parser factory: config-aware key validation
+
+**File: `packages/lib/ai/pdfparser.ts`**
+
+The pdfparser factory is a switch on `PDF_PARSER`. Only the key matching the
+selected parser is required — requiring both would force users to provision
+two accounts for no reason, and treating them as interchangeable hides a
+misconfigured `PDF_PARSER`.
+
+```ts
+type PdfParserKind = 'reducto' | 'llamaparse';
+
+function resolvePdfParser(): { kind: PdfParserKind; apiKey: string } {
+  const kind = requireEnv('PDF_PARSER').toLowerCase();
+  if (kind !== 'reducto' && kind !== 'llamaparse') {
+    throw new Error(
+      `PDF_PARSER must be 'reducto' or 'llamaparse' (got '${kind}')`,
+    );
+  }
+  const keyName = kind === 'reducto' ? 'REDUCTO_API_KEY' : 'LLAMAPARSE_API_KEY';
+  const apiKey = process.env[keyName];
+  if (!apiKey || apiKey.trim().length === 0) {
+    throw new Error(
+      `PDF_PARSER is '${kind}' but ${keyName} is missing or empty`,
+    );
+  }
+  return { kind: kind as PdfParserKind, apiKey };
+}
+```
+
+This is called lazily inside the exported `parsePdf(input)` function, not at
+module top-level. The unused key (e.g. `REDUCTO_API_KEY` when `PDF_PARSER=llamaparse`)
+is explicitly not checked — pragmatic for the "one parser at a time" v0 posture.
+
+**File: `packages/lib/ai/pdfparser.test.ts` (amend)**
+
+Add four new test cases:
+1. `PDF_PARSER='reducto'` + `REDUCTO_API_KEY` unset/empty/whitespace → throws
+   with message containing both `'reducto'` and `REDUCTO_API_KEY`.
+2. `PDF_PARSER='llamaparse'` + `LLAMAPARSE_API_KEY` unset → throws symmetrically.
+3. `PDF_PARSER='reducto'` + `LLAMAPARSE_API_KEY` set but `REDUCTO_API_KEY` unset
+   → still throws (provisioning the other key does NOT satisfy the guard).
+4. `PDF_PARSER='unknown_parser'` → throws with message listing the valid values.
 
 ### 3. Code: verify Inngest route import path
 
