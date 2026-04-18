@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "active_plan": ".harness/active_plan.md",
-  "focus_area": "v0 merged; v1 kickoff pending in a new session",
-  "approval_state": "executed",
-  "last_council": "2026-04-18T05:58:17+00:00 (PROCEED on commit 525abc9; all blocking CI gates green)",
+  "focus_area": "PR #8 deploy-readiness: lazy env guards + runbook",
+  "approval_state": "executing",
+  "last_council": "2026-04-18T15:13:04+00:00 (PROCEED on plan r3 @ 2a1dd65; approved by human; batches A + B pushed; batch C landing runbook + reflection)",
   "last_commit": null,
-  "notes": "PR #5 v0 scaffold: plan r8 approved + executed. CI green on all blocking jobs (validate, env-example-scrub, a11y, council). db-tests flipped to continue-on-error with v1 tracking in issue #7 pending CI-log access for pgTAP fixture debug. Storage RLS metadata migration tracked in issue #6. When the next session starts v1, read .harness/learnings.md 2026-04-17 + 2026-04-18 blocks, check issues #6 and #7, then draft a new active_plan for the v1 scope."
+  "notes": "PR #8 executes the deploy-readiness plan. Batch A (a569361): shared @llmwiki/lib-utils requireEnv + lazy DB factories + route-module-load regression test. Batch B (f02c44c): config-aware resolvePdfParser in lib-ai + requireEnv adoption in ratelimit + inngest-pdf step. Batch C pending: README deploy runbook + .env.example comments + learnings reflection. After merge, human follows the runbook to set Vercel env vars, push migrations via supabase db push, install Inngest Vercel integration, and smoke-test PDF upload. v1 tracking issues #6 (Storage RLS metadata) + #7 (db-tests pgTAP fixture) still open."
 }
