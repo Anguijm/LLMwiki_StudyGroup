@@ -8,9 +8,12 @@ begin;
 select plan(24);
 
 -- Fixtures: two cohorts, two users, one ingestion job in cohort A --------
-insert into auth.users (id, email) values
-  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'alice@test'),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'bob@test')
+-- auth.users has many required columns (aud, role, instance_id) enforced
+-- by Supabase's auth schema; populate the minimum set so our FKs land.
+insert into auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at)
+values
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'alice@test.local', '', now(), now()),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'bob@test.local', '', now(), now())
 on conflict (id) do nothing;
 
 insert into public.cohorts (id, name) values
