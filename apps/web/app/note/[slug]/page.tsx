@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
-import { supabaseServer, supabaseService } from '@llmwiki/db/server';
+import { supabaseForRequest, supabaseService } from '../../../lib/supabase';
 import { LocalizedDate } from '../../../components/LocalizedDate';
 
 interface Props {
@@ -10,7 +10,7 @@ interface Props {
 
 export default async function NotePage({ params }: Props) {
   const { slug } = await params;
-  const rls = await supabaseServer();
+  const rls = await supabaseForRequest();
 
   const { data: note } = await rls
     .from('notes')

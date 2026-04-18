@@ -7,7 +7,8 @@ export class AiResponseShapeError extends Error {
   constructor(
     public readonly vendor: 'anthropic' | 'voyage' | 'pdfparser',
     message: string,
-    public readonly cause?: unknown,
+    // `cause` is a field on Error in modern runtimes — override is required.
+    public override readonly cause?: unknown,
   ) {
     super(`${vendor}: ${message}`);
   }

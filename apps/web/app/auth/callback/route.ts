@@ -2,13 +2,13 @@
 // /auth/callback?code=...; we exchange the code for a session cookie and
 // redirect to the dashboard.
 import { NextResponse, type NextRequest } from 'next/server';
-import { supabaseServer } from '@llmwiki/db/server';
+import { supabaseForRequest } from '../../../lib/supabase';
 
 export async function GET(req: NextRequest) {
   const code = new URL(req.url).searchParams.get('code');
   if (!code) return NextResponse.redirect(new URL('/auth', req.url));
 
-  const supabase = await supabaseServer();
+  const supabase = await supabaseForRequest();
   const { error } = await supabase.auth.exchangeCodeForSession(code);
   if (error) {
     const url = new URL('/auth', req.url);

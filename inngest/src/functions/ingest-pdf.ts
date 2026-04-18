@@ -29,7 +29,6 @@ import {
   AiRequestTimeoutError,
 } from '@llmwiki/lib-ai';
 import {
-  makeIngestEventLimiter,
   makeTokenBudgetLimiter,
   RateLimitExceededError,
   RatelimitUnavailableError,

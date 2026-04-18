@@ -8,7 +8,12 @@
 // - Enforce a hard max length per field.
 
 export const NOTE_TITLE_MAX = 512;
-export const GETCONTEXT_QUERY_MAX = 2000;
+// Kept comfortably above VOYAGE_MAX_INPUT_CHARS (30k) so the sanitizer
+// doesn't pre-trim before getContext's truncation layer can flag
+// wasTruncated. The two layers handle different concerns: sanitize is a
+// hard safety ceiling; getContext truncation is the embedding-model's
+// token budget.
+export const GETCONTEXT_QUERY_MAX = 32_000;
 
 // Keep: \t (0x09), \n (0x0a), \r (0x0d). Drop the rest of C0 + all C1.
 // eslint-disable-next-line no-control-regex
@@ -42,8 +47,13 @@ export function sanitizeContextQuery(input: string): string {
  */
 const UNSAFE_FILENAME_CHARS = /[^A-Za-z0-9._-]/g;
 export function sanitizeFilename(input: string): string {
-  const stripped = input.replace(CONTROL_CHARS, '').replace(UNSAFE_FILENAME_CHARS, '_');
-  // Collapse leading dots to avoid `.`, `..`, or hidden-file paths.
-  const normalized = stripped.replace(/^\.+/, '_');
+  // Controls + unsafe chars both become `_` (not dropped) so length can't
+  // drop under the byte count a caller expected and so obvious attacks
+  // (f\0o => foo) leave a visible sanitation trace.
+  const stripped = input.replace(CONTROL_CHARS, '_').replace(UNSAFE_FILENAME_CHARS, '_');
+  // Collapse any run of two-or-more dots (`..` path traversal) to a
+  // single `_`, and replace leading dots so hidden-file paths (`.env`)
+  // can't be synthesized.
+  const normalized = stripped.replace(/\.{2,}/g, '_').replace(/^\.+/, '_');
   return normalized.length > 255 ? normalized.slice(0, 255) : normalized;
 }

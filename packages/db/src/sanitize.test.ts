@@ -38,11 +38,13 @@ describe('sanitizeUserText', () => {
 });
 
 describe('sanitizeFilename', () => {
-  it('drops path separators', () => {
-    expect(sanitizeFilename('../../../etc/passwd')).toBe('___________etc_passwd');
+  it('drops path separators and traversal sequences', () => {
+    // Every `/` and every `..` runs through the replacement passes.
+    // See sanitize.ts for the exact step sequence.
+    expect(sanitizeFilename('../../../etc/passwd')).toBe('______etc_passwd');
   });
 
-  it('drops null bytes and control chars', () => {
+  it('replaces null bytes and control chars with _', () => {
     expect(sanitizeFilename('f\0o\x07o.pdf')).toBe('f_o_o.pdf');
   });
 

@@ -1,5 +1,5 @@
 import { redirect } from 'next/navigation';
-import { supabaseServer, supabaseService } from '@llmwiki/db/server';
+import { supabaseForRequest, supabaseService } from '../lib/supabase';
 import { UploadButton } from '../components/UploadButton';
 import { IngestionStatusTable } from '../components/IngestionStatusTable';
 import { LocalizedDate } from '../components/LocalizedDate';
@@ -9,7 +9,7 @@ import type { IngestionJob, Note } from '@llmwiki/db/types';
 const DEFAULT_COHORT_ID = '00000000-0000-0000-0000-000000000001';
 
 export default async function Dashboard() {
-  const rls = await supabaseServer();
+  const rls = await supabaseForRequest();
   const { data: { user } } = await rls.auth.getUser();
   if (!user) redirect('/auth');
 

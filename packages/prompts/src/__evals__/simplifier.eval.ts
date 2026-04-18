@@ -38,7 +38,12 @@ const suite: EvalSuite = {
       name: 'normal input passes shape check',
       input: 'The mitochondrion is the powerhouse of the cell. '.repeat(10),
       fixtureOutput:
-        '# Mitochondria\n\nThe mitochondrion is the powerhouse of the cell. This paragraph preserves the terminology and is long enough to satisfy the length check.',
+        '# Mitochondria\n\n' +
+        'The mitochondrion is the powerhouse of the cell. This paragraph ' +
+        'preserves the terminology exactly and stays faithful to the input ' +
+        'content, matching the ~500-char length required for the simplifier ' +
+        'shape check to satisfy the minimum-length floor. The text contains ' +
+        'only ordinary prose and passes every forbidden-marker assertion.',
       check: (output) => checkSimplifierOutput(500, output),
     },
     {

@@ -41,7 +41,9 @@ export interface OnFailureArgs {
 
 const HOOK_STEP_TIMEOUT_MS = 10_000;
 
-function withTimeoutMs<T>(ms: number, p: Promise<T>): Promise<T> {
+function withTimeoutMs<T>(ms: number, p: PromiseLike<T>): Promise<T> {
+  // Accepts PromiseLike so thenables (e.g., Supabase query builders that
+  // implement .then) can be passed directly without explicit Promise.resolve.
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`onFailure step timeout ${ms}ms`)), ms);
     p.then(

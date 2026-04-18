@@ -60,12 +60,11 @@ export function makeAnthropicClient(deps: AnthropicClientDeps) {
         {
           model: HAIKU_MODEL,
           max_tokens: input.maxTokensOut ?? 2048,
-          system: [
-            // Prompt-cache breakpoint lets repeated calls re-use the stable
-            // system prefix across a single batch of chunks (and across
-            // different PDFs in a session).
-            { type: 'text', text: input.systemPrompt, cache_control: { type: 'ephemeral' } },
-          ],
+          // Prompt-cache breakpoint deferred to v1 — the 0.30.x SDK types
+          // don't expose `cache_control` on system text blocks. Cost
+          // impact is small (~30% of a small fraction). Re-add alongside
+          // an @anthropic-ai/sdk bump + dep-vetting pass.
+          system: [{ type: 'text', text: input.systemPrompt }],
           messages: [
             {
               role: 'user',

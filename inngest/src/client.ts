@@ -9,12 +9,13 @@ type EventDataOnly<T extends z.ZodObject<{ name: z.ZodLiteral<string>; data: z.Z
   data: z.infer<T>['data'];
 };
 
-// Inngest EventSchemas shape: map event name -> { data: ... }.
-interface EventMap {
+// Inngest EventSchemas shape: map event name -> { data: ... }. Must have a
+// string index signature, hence `type` + index-compatible shape.
+type EventMap = {
   'ingest.pdf.requested': EventDataOnly<typeof IngestPdfRequested>;
   'note.created.link': EventDataOnly<typeof NoteCreatedLink>;
   'note.created.flashcards': EventDataOnly<typeof NoteCreatedFlashcards>;
-}
+};
 
 export const inngest = new Inngest({
   id: 'llmwiki-studygroup',

@@ -7,6 +7,12 @@ import {
   TOKEN_BUDGET_PER_HOUR,
 } from './index';
 
+interface PipelineLike {
+  incrby: (k: string, n: number) => PipelineLike;
+  pexpire: (k: string, ms: number) => PipelineLike;
+  exec: () => Promise<number[]>;
+}
+
 function fakeRedis(store: Map<string, number>) {
   return {
     incrby: vi.fn(async (k: string, n: number) => {
@@ -19,17 +25,20 @@ function fakeRedis(store: Map<string, number>) {
       store.set(k, v);
       return v;
     }),
-    pexpire: vi.fn(async () => 1),
-    pipeline() {
+    pexpire: vi.fn(async (_k: string, _ms: number) => 1),
+    pipeline(): PipelineLike {
       const ops: Array<() => Promise<number>> = [];
-      const self = this;
-      const pipe = {
+      const pipe: PipelineLike = {
         incrby: (k: string, n: number) => {
-          ops.push(() => self.incrby(k, n));
+          const v = (store.get(k) ?? 0) + n;
+          ops.push(async () => {
+            store.set(k, v);
+            return v;
+          });
           return pipe;
         },
-        pexpire: (k: string, ms: number) => {
-          ops.push(() => self.pexpire(k, ms));
+        pexpire: (_k: string, _ms: number) => {
+          ops.push(async () => 1);
           return pipe;
         },
         exec: async () => Promise.all(ops.map((op) => op())),

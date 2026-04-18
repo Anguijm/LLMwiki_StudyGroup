@@ -16,7 +16,7 @@
 
 import type { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
-import { supabaseService, supabaseServer } from '@llmwiki/db/server';
+import { supabaseForRequest, supabaseService } from '../../../lib/supabase';
 import { sanitizeNoteTitle } from '@llmwiki/db/sanitize';
 import { makeIngestEventLimiter } from '@llmwiki/lib-ratelimit';
 import { inngest } from '../../../../../inngest/src/client';
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   const correlationId = crypto.randomUUID().slice(0, 8);
   try {
     // --- auth ---------------------------------------------------------
-    const rlsClient = await supabaseServer();
+    const rlsClient = await supabaseForRequest();
     const { data: userRes } = await rlsClient.auth.getUser();
     const user = userRes?.user;
     if (!user) {
