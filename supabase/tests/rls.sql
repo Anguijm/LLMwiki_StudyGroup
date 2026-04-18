@@ -5,7 +5,7 @@
 -- dependency.
 
 begin;
-select plan(22);
+select plan(24);
 
 -- Fixtures: two cohorts, two users, one ingestion job in cohort A --------
 insert into auth.users (id, email) values
@@ -242,6 +242,42 @@ select is(
   1,
   'Alice CAN SELECT her own cohort membership row'
 );
+-- 23–24) getContext (notes_by_similarity RPC) respects cohort RLS -------
+-- Seed an embedding on Bob's cohort-B note so the RPC would match it on
+-- similarity if RLS weren't applied. Alice (cohort A) calling the RPC
+-- must see zero results for that exact vector.
+reset role;
+update public.notes
+  set embedding = (select array_agg(0.1::real) from generate_series(1, 1024))::vector
+  where id in ('44444444-4444-4444-4444-444444444444', '66666666-6666-6666-6666-666666666666');
+
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}';
+select is(
+  (select count(*)::int
+     from public.notes_by_similarity(
+       (select embedding from public.notes where id = '66666666-6666-6666-6666-666666666666'),
+       array['bedrock','active','cold']::tier_enum[],
+       5
+     )
+   where id = '66666666-6666-6666-6666-666666666666'),
+  0,
+  'getContext: Alice (cohort A) cannot retrieve Bob''s cohort-B note via notes_by_similarity RPC'
+);
+
+set local request.jwt.claims = '{"sub":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}';
+select is(
+  (select count(*)::int
+     from public.notes_by_similarity(
+       (select embedding from public.notes where id = '66666666-6666-6666-6666-666666666666'),
+       array['bedrock','active','cold']::tier_enum[],
+       5
+     )
+   where id = '66666666-6666-6666-6666-666666666666'),
+  1,
+  'getContext: Bob (cohort B) CAN retrieve his own note via notes_by_similarity RPC'
+);
+
 -- note_views: user-scoped
 set local request.jwt.claims = '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}';
 select lives_ok(

@@ -30,22 +30,31 @@ export interface GetContextDeps {
   onTruncate?: (info: { from: number; to: number }) => void;
 }
 
+export interface GetContextResult {
+  notes: Note[];
+  /** True if the input query exceeded VOYAGE_MAX_INPUT_CHARS and was
+   * truncated before embedding. The UI can surface a small notice so users
+   * know "Related notes" are computed against a shortened query. */
+  wasTruncated: boolean;
+}
+
 export async function getContext(
   query: string,
   opts: GetContextOptions,
   deps: GetContextDeps,
-): Promise<Note[]> {
+): Promise<GetContextResult> {
   const sanitized = sanitizeContextQuery(query);
   if (sanitized.trim().length === 0) {
     // Return-empty guard (r5 bug fix 3): avoid wasted Voyage call + vendor 4xx.
-    return [];
+    return { notes: [], wasTruncated: false };
   }
 
   const truncated =
     sanitized.length > VOYAGE_MAX_INPUT_CHARS
       ? sanitized.slice(0, VOYAGE_MAX_INPUT_CHARS)
       : sanitized;
-  if (truncated.length < sanitized.length) {
+  const wasTruncated = truncated.length < sanitized.length;
+  if (wasTruncated) {
     deps.onTruncate?.({ from: sanitized.length, to: truncated.length });
   }
 
@@ -58,10 +67,9 @@ export async function getContext(
 
   const k = opts.k ?? 5;
 
-  // pgvector cosine via RPC. An RPC lets us keep the similarity expression
-  // in SQL (faster, index-friendly) rather than round-tripping via the REST
-  // API. The RPC itself is defined in a follow-up migration; until then the
-  // call will fail loud and callers see the error cleanly.
+  // pgvector cosine via RPC. Keeps the similarity expression in SQL
+  // (faster, HNSW-index-friendly) and inherits the caller's RLS context
+  // because the function is `security invoker`.
   const { data, error } = await deps.supabase.rpc('notes_by_similarity', {
     query_embedding: embedding,
     tier_scope: scope,
@@ -69,5 +77,5 @@ export async function getContext(
   });
 
   if (error) throw new Error(`getContext RPC failed: ${error.message}`);
-  return (data ?? []) as Note[];
+  return { notes: (data ?? []) as Note[], wasTruncated };
 }

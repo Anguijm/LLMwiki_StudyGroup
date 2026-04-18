@@ -47,9 +47,12 @@ async function markFailed(
   step: string,
 ): Promise<void> {
   const error: IngestionError = { kind, message, step };
+  // No updated_at here — the set_updated_at trigger owns that column so the
+  // watchdog's `updated_at < now() - interval '2 hours'` predicate isn't
+  // susceptible to Inngest worker clock skew. (council batch-9+ bugs fix).
   await supabase
     .from('ingestion_jobs')
-    .update({ status: 'failed', error, updated_at: new Date().toISOString() })
+    .update({ status: 'failed', error })
     .eq('id', jobId);
   errorMetric('ingestion.jobs.failed', 1, { kind, step });
 }
@@ -242,9 +245,19 @@ export const ingestPdf = inngest.createFunction(
         if (text.includes('[[NO_TEXT_CONTENT]]')) {
           throw new Error('[[NO_TEXT_CONTENT]]');
         }
+        // A 200-OK with a Zod-valid shape but empty/whitespace content is
+        // still a no-text outcome — treat it as pdf_no_text_content instead
+        // of passing '' through to embed (council batch-9+ bugs fix).
+        if (text.trim().length === 0) {
+          throw new Error('[[NO_TEXT_CONTENT]]');
+        }
         parts.push(text);
       }
-      return parts.join('\n\n');
+      const joined = parts.join('\n\n');
+      if (joined.trim().length === 0) {
+        throw new Error('[[NO_TEXT_CONTENT]]');
+      }
+      return joined;
     }).catch(async (e) => {
       const msg = String(e);
       if (msg.includes('[[NO_TEXT_CONTENT]]')) {

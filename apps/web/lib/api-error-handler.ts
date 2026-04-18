@@ -14,6 +14,7 @@ import {
   RatelimitUnavailableError,
 } from '@llmwiki/lib-ratelimit';
 import { AiResponseShapeError, AiRequestTimeoutError } from '@llmwiki/lib-ai';
+import { redact } from '@llmwiki/db/logging';
 
 // Shape of PostgrestError / Postgres pg-node errors — both expose `code` as
 // a string (Postgres SQLSTATE). We probe for the common codes.
@@ -123,13 +124,19 @@ export function apiError(
   // Unknown fallback -------------------------------------------------------
   // Log the full error server-side with the correlation id; client gets a
   // generic message. The client can quote the correlation id to the user.
+  //
+  // error_summary is passed through redact() as a belt-and-suspenders guard
+  // against a vendor error message ever carrying a leaked token or API key
+  // in its text. redact() scrubs Bearer/JWT/known-vendor-prefix/long-hex
+  // patterns inside string values (council batch-9+ security nice-to-have).
+  const rawSummary = err instanceof Error ? err.message : String(err);
+  const safeSummary = redact(rawSummary) as string;
   console.error(
     JSON.stringify({
       level: 'error',
       event: 'api.error.unhandled',
       correlation_id: correlationId,
-      // Never stringify the raw err (may contain secrets). toString() is safe.
-      error_summary: err instanceof Error ? err.message : String(err),
+      error_summary: safeSummary,
     }),
   );
   return NextResponse.json<ApiErrorPayload>(

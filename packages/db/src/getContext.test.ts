@@ -14,26 +14,33 @@ function makeDeps(overrides: Partial<Parameters<typeof getContext>[2]> = {}) {
 }
 
 describe('getContext', () => {
-  it('returns [] for an empty query without calling Voyage', async () => {
+  it('returns {notes:[], wasTruncated:false} for an empty query without calling Voyage', async () => {
     const deps = makeDeps();
     const out = await getContext('', { tierScope: 'bedrock+active' }, deps);
-    expect(out).toEqual([]);
+    expect(out).toEqual({ notes: [], wasTruncated: false });
     expect(deps.embed).not.toHaveBeenCalled();
   });
 
-  it('returns [] for whitespace-only query', async () => {
+  it('returns {notes:[], wasTruncated:false} for whitespace-only query', async () => {
     const deps = makeDeps();
     const out = await getContext('   \n\t ', { tierScope: 'bedrock+active' }, deps);
-    expect(out).toEqual([]);
+    expect(out).toEqual({ notes: [], wasTruncated: false });
     expect(deps.embed).not.toHaveBeenCalled();
   });
 
-  it('truncates over-long input and emits onTruncate', async () => {
+  it('truncates over-long input, emits onTruncate, and flags wasTruncated', async () => {
     const onTruncate = vi.fn();
     const deps = makeDeps({ onTruncate });
-    await getContext('x'.repeat(31_000), { tierScope: 'bedrock+active' }, deps);
+    const out = await getContext('x'.repeat(31_000), { tierScope: 'bedrock+active' }, deps);
     expect(onTruncate).toHaveBeenCalledOnce();
+    expect(out.wasTruncated).toBe(true);
     expect(deps.embed).toHaveBeenCalledWith(expect.stringMatching(/^x{30000}$/));
+  });
+
+  it('returns wasTruncated:false when the query fits', async () => {
+    const deps = makeDeps();
+    const out = await getContext('hello', { tierScope: 'bedrock+active' }, deps);
+    expect(out.wasTruncated).toBe(false);
   });
 
   it('passes the correct scope to the RPC', async () => {

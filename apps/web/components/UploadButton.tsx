@@ -48,8 +48,20 @@ export function UploadButton({ cohortId }: UploadButtonProps) {
 
       const res = await fetch('/api/ingest', { method: 'POST', body: form });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        setError(body?.error?.message ?? t('error.generic'));
+        // Read as text first (cheap, always works) so a non-JSON error
+        // (e.g., proxy/gateway HTML, Cloudflare challenge, Vercel 502)
+        // still surfaces something useful instead of being swallowed by
+        // a generic message. (council batch-9+ bugs fix).
+        const raw = await res.text().catch(() => '');
+        try {
+          const body = raw ? JSON.parse(raw) : {};
+          setError(body?.error?.message ?? t('error.generic'));
+        } catch {
+          // Trim and truncate HTML responses so the user's error toast
+          // stays readable; full text goes to the server log.
+          const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 200);
+          setError(snippet || t('error.generic'));
+        }
         return;
       }
     } catch {
