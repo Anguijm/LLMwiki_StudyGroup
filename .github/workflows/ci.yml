@@ -49,22 +49,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          # cache: pnpm  # re-enable once pnpm-lock.yaml is committed;
-          # setup-node's pnpm cache requires a lockfile to compute its key.
+          cache: pnpm
 
       - name: Install dependencies
-        # NOTE: v0 ships without a committed pnpm-lock.yaml — the repo has
-        # never had `pnpm install` run. First contributor runs `pnpm
-        # install` locally and commits the lockfile; once pnpm-lock.yaml
-        # exists we tighten this step to `--frozen-lockfile` so CI matches
-        # local exactly. Until then, a fresh resolve is acceptable because
-        # this repo has zero production users.
-        run: |
-          if [ -f pnpm-lock.yaml ]; then
-            pnpm install --frozen-lockfile
-          else
-            pnpm install --no-frozen-lockfile
-          fi
+        run: pnpm install --frozen-lockfile
 
       - name: npm audit (prod deps only)
         run: pnpm audit --prod --audit-level=high
@@ -119,14 +107,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          # cache: pnpm  # re-enable once pnpm-lock.yaml is committed;
-          # setup-node's pnpm cache requires a lockfile to compute its key.
-      - run: |
-          if [ -f pnpm-lock.yaml ]; then
-            pnpm install --frozen-lockfile
-          else
-            pnpm install --no-frozen-lockfile
-          fi
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web exec playwright install --with-deps chromium
       - name: Build web app
         run: pnpm --filter web build
