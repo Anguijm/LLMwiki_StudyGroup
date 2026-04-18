@@ -1,0 +1,46 @@
+# Supabase project config. Secrets come from `supabase link`'s project ref
+# and the env vars in .env.example — nothing sensitive here.
+
+project_id = "llmwiki-studygroup"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = true
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[realtime]
+enabled = true
+# Publication allow-list lives in migrations + pgTAP lockfile test.
+
+[storage]
+enabled = true
+file_size_limit = "25MiB"
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/auth/callback"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+
+# Magic link only in v0; OAuth added in v1 with its own plan + council round.
+[auth.external.google]
+enabled = false

@@ -3,3 +3,30 @@
 
 # active_plan.md is intentionally tracked: it's the artifact reviewed before
 # execution and approved by the human, so it must travel to CI/Codespace/origin.
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+*.log
+
+# Next.js
+.next/
+out/
+.vercel/
+
+# TypeScript
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Test
+coverage/
+playwright-report/
+test-results/
+
+# OS
+.DS_Store
+Thumbs.db

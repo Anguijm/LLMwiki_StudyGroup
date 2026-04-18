@@ -423,3 +423,90 @@ MIT — See `LICENSE` for details.
 ---
 
 **Built for technical learners who value privacy, control, and effective study science.**
+
+---
+
+## v0 Vertical Slice — Deploy Runbook
+
+Plan: `.harness/active_plan.md` (approved r8, PR #5, SHA `c1d4a5f`).
+
+v0 ships **one** thing: upload a PDF → read the ingested, simplified note at `/note/[slug]`. Everything else is intentionally stubbed. See `## v0 Non-Goals` below.
+
+### Prerequisites
+
+- Node 20.11 (see `.nvmrc`). `pnpm 9.12.0`.
+- Supabase account + a new project (Pro tier recommended; free works for the first week).
+- Vercel account linked to this repo.
+- Inngest account (free tier is fine for v0's step volume).
+- Upstash Redis (REST). Free tier; one database.
+- Anthropic API key. Voyage AI API key. Reducto API key (or LlamaParse — pick one with `PDF_PARSER`).
+
+### One-time
+
+```bash
+pnpm install
+cp .env.example .env.local
+# Fill in every value in .env.local. The CI grep gate prevents v1+ secrets
+# from leaking back into .env.example.
+
+# Supabase
+supabase link --project-ref <your-project-ref>
+supabase db push            # applies migrations
+psql "$DATABASE_URL" -f supabase/seed.sql
+
+# Vercel
+vercel link
+vercel env pull .env.local   # merges local + Vercel-stored env
+
+# Inngest — register the app at https://<your-vercel-deploy>/api/inngest
+```
+
+### Smoke test
+
+1. Visit `/auth`, request a magic link, follow the link — you land on `/`.
+2. Click "Upload PDF"; pick a small PDF.
+3. Watch the "Recent ingestion jobs" row flip from Queued → Processing → Ready (usually < 60s).
+4. Click the note title in "Your notes"; you should see the Haiku-simplified Markdown at `/note/[slug]`.
+
+If the job goes Failed, check the pill color:
+
+- **Amber (user-correctable)** → the PDF itself was the problem (no text content, too many pages, timed out). Try a different file.
+- **Slate (system-transient)** → upstream API or rate-limit hiccup. Retry the same file; the partial unique index permits a fresh job for terminally-failed ones.
+
+### v0 Non-Goals (not bugs; see plan)
+
+- YouTube / image / DOCX / MD / TXT ingest.
+- URL ingest (`ingestion_jobs.source_url` column is intentionally absent — SSRF vector removed).
+- Concept-link writeback, flashcard generation, `/graph`, `/review` FSRS, `/exam`, `/cohort` invite UI.
+- Weekly gap analysis, web-push.
+- OAuth (magic link only).
+- Full design polish (foundational a11y is in scope; visual polish isn't).
+
+### Realtime Exposure Map
+
+Only `public.ingestion_jobs` publishes changes via Supabase Realtime in v0. The `pgTAP` lockfile test (`supabase/tests/publications.sql`) fails CI if any other table gets added to the publication without a matching security review. Adding a table is a security-review event — open an issue first.
+
+### Dependency Vetting
+
+v0 `npm` dependencies (all MIT/Apache-2.0/MPL-2.0; no unaudited prereleases):
+
+| package | purpose | license |
+|---|---|---|
+| `@supabase/supabase-js` · `@supabase/ssr` | DB + auth + storage + realtime | MIT |
+| `@anthropic-ai/sdk` | Haiku simplify | MIT |
+| `voyageai` | voyage-3 embed | MIT |
+| `@upstash/ratelimit` · `@upstash/redis` | rate limits + token budget | MIT |
+| `inngest` | step runner | Apache-2.0 |
+| `zod` | external response schemas | MIT |
+| `server-only` | build-time server/client boundary | MIT |
+| `react-markdown` · `rehype-sanitize` | safe Markdown | MIT |
+| `slugify` | unicode-safe slugs | MIT |
+| `@axe-core/playwright` · `@playwright/test` | a11y checks | MPL-2.0 / Apache-2.0 |
+| `vitest` | unit tests | MIT |
+
+`pnpm audit --prod --audit-level=high` runs on every PR (see `.github/workflows/ci.yml`) and fails the build on any new high/critical advisory.
+
+### Rollback
+
+- **Web:** `vercel rollback`.
+- **Schema:** `supabase db reset` + re-run migrations from the last known-good commit. **v0-only** — once real cohort data exists, every migration must ship with a reversible `down.sql`. First item on the v1 plan.

@@ -1,1 +1,4 @@
 {"ts": "2026-04-16T00:00:00+00:00", "event": "harness_init", "note": "Initial harness scaffolding landed. See .harness/README.md."}
+{"ts": "2026-04-17T16:15:00+00:00", "event": "plan_approved", "plan_sha": "c1d4a5f", "council_verdict": "PROCEED", "rounds": 8, "note": "v0 vertical slice execution starts"}
+{"ts": "2026-04-17T17:30:00+00:00", "event": "v0_scaffold_landed", "pr": 5, "commits": 10, "final_council_verdict": "PROCEED", "scores": {"accessibility":10,"architecture":10,"bugs":9,"cost":10,"product":10,"security":10}, "note": "Plan r8 executed as 10 commits. Awaiting human deploy + smoke test."}
+{"ts": "2026-04-18T05:55:00+00:00", "event": "v0_merge_ready", "pr": 5, "branch": "claude/scaffold-ai-study-wiki-3mSDf", "blocking_ci": "green", "non_blocking_failing": ["db-tests"], "v1_issues": [6, 7], "note": "Docs + harness reflection finalized; awaiting human merge of PR #5 via squash."}

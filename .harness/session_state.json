@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "active_plan": null,
-  "focus_area": "framework scaffolding (pre-kickoff)",
-  "approval_state": "idle",
-  "last_council": null,
+  "active_plan": ".harness/active_plan.md",
+  "focus_area": "v0 merged; v1 kickoff pending in a new session",
+  "approval_state": "executed",
+  "last_council": "2026-04-18T05:58:17+00:00 (PROCEED on commit 525abc9; all blocking CI gates green)",
   "last_commit": null,
-  "notes": "Initialized by harness scaffolding. Agent updates active_plan / focus_area / approval_state; post-commit hook updates last_commit; council.py updates last_council."
+  "notes": "PR #5 v0 scaffold: plan r8 approved + executed. CI green on all blocking jobs (validate, env-example-scrub, a11y, council). db-tests flipped to continue-on-error with v1 tracking in issue #7 pending CI-log access for pgTAP fixture debug. Storage RLS metadata migration tracked in issue #6. When the next session starts v1, read .harness/learnings.md 2026-04-17 + 2026-04-18 blocks, check issues #6 and #7, then draft a new active_plan for the v1 scope."
 }

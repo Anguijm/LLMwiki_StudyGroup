@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* r5 a11y must-do: global visible focus indicator meeting WCAG 2.4.7.
+   No component opts out. 2px ring + 2px offset gives strong contrast on
+   every palette surface we ship. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid theme('colors.brand.900');
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  /* Respect reduced-motion preferences for any transition we add later. */
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+  body {
+    @apply bg-white text-brand-900 antialiased;
+  }
+}
