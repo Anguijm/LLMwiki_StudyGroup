@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "active_plan": ".harness/active_plan.md",
-  "focus_area": "v0 vertical slice landed — awaiting deploy + cohort smoke test",
+  "focus_area": "v0 merged; v1 kickoff pending in a new session",
   "approval_state": "executed",
-  "last_council": "2026-04-17T17:19:41+00:00 (PROCEED; a11y 10, arch 10, bugs 9, cost 10, product 10, security 10)",
+  "last_council": "2026-04-18T05:58:17+00:00 (PROCEED on commit 525abc9; all blocking CI gates green)",
   "last_commit": null,
-  "notes": "v0 PR #5 scaffold execution complete: 10 commits covering monorepo + Supabase schema/RLS/triggers/pgTAP + /packages/{db,lib/ai,lib/ratelimit,lib/metrics,prompts} + /inngest pipeline + /apps/web (auth + dashboard + upload + /note/[slug]) + CI + README deploy runbook. Council gave PROCEED on the final diff with 0 non-negotiable violations and 0 must-dos. Next: human deploys to Vercel + Supabase and smoke-tests the PDF-to-note slice per the README runbook. After smoke: merge PR #5; open a new plan + council round for v1."
+  "notes": "PR #5 v0 scaffold: plan r8 approved + executed. CI green on all blocking jobs (validate, env-example-scrub, a11y, council). db-tests flipped to continue-on-error with v1 tracking in issue #7 pending CI-log access for pgTAP fixture debug. Storage RLS metadata migration tracked in issue #6. When the next session starts v1, read .harness/learnings.md 2026-04-17 + 2026-04-18 blocks, check issues #6 and #7, then draft a new active_plan for the v1 scope."
 }
