@@ -49,7 +49,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: pnpm
+          # cache: pnpm  # re-enable once pnpm-lock.yaml is committed;
+          # setup-node's pnpm cache requires a lockfile to compute its key.
 
       - name: Install dependencies
         # NOTE: v0 ships without a committed pnpm-lock.yaml — the repo has
@@ -118,7 +119,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: pnpm
+          # cache: pnpm  # re-enable once pnpm-lock.yaml is committed;
+          # setup-node's pnpm cache requires a lockfile to compute its key.
       - run: |
           if [ -f pnpm-lock.yaml ]; then
             pnpm install --frozen-lockfile
