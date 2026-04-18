@@ -24,7 +24,12 @@ test.describe('a11y smoke', () => {
         <main><h1>Hello</h1><button style="min-height:44px;min-width:44px">OK</button></main>
       </body></html>`);
     const results = await new AxeBuilder({ page })
-      .withRules(['color-contrast', 'focus-visible', 'target-size'])
+      // color-contrast + target-size are real axe-core rule ids.
+      // focus-visible / WCAG 2.4.7 has no single axe rule — the
+      // base-layer outline in globals.css is verified by manual review
+      // and by Playwright interaction tests we can add once the spec
+      // goes page.goto('/').
+      .withRules(['color-contrast', 'target-size'])
       .analyze();
     expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
   });
