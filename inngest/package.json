@@ -18,6 +18,7 @@
     "@llmwiki/lib-ai": "workspace:*",
     "@llmwiki/lib-metrics": "workspace:*",
     "@llmwiki/lib-ratelimit": "workspace:*",
+    "@llmwiki/lib-utils": "workspace:*",
     "@llmwiki/prompts": "workspace:*",
     "@supabase/supabase-js": "^2.45.0",
     "inngest": "^3.22.0",

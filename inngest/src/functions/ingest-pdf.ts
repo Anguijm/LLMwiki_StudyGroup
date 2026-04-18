@@ -25,9 +25,11 @@ import {
   makeAnthropicClient,
   makeVoyageClient,
   makePdfParserClient,
+  resolvePdfParser,
   AiResponseShapeError,
   AiRequestTimeoutError,
 } from '@llmwiki/lib-ai';
+import { requireEnv } from '@llmwiki/lib-utils/env';
 import {
   makeTokenBudgetLimiter,
   RateLimitExceededError,
@@ -114,10 +116,7 @@ export const ingestPdf = inngest.createFunction(
     // ----- parse ---------------------------------------------------------
     const parsed = await step.run('parse', async () => {
       counter('ingestion.funnel', { job_id, stage: 'parse' });
-      const parserKind = (process.env.PDF_PARSER ?? 'reducto') as 'reducto' | 'llamaparse';
-      const apiKey =
-        parserKind === 'reducto' ? process.env.REDUCTO_API_KEY : process.env.LLAMAPARSE_API_KEY;
-      if (!apiKey) throw new Error(`missing API key for parser ${parserKind}`);
+      const { kind: parserKind, apiKey } = resolvePdfParser();
 
       const { data: signedUrl } = await supabase.storage
         .from('ingest')
@@ -221,9 +220,7 @@ export const ingestPdf = inngest.createFunction(
     // ----- simplify ------------------------------------------------------
     const simplified = await step.run('simplify', async () => {
       counter('ingestion.funnel', { job_id, stage: 'simplify' });
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      if (!anthropicKey) throw new Error('ANTHROPIC_API_KEY missing');
-      const anthropic = makeAnthropicClient({ apiKey: anthropicKey });
+      const anthropic = makeAnthropicClient({ apiKey: requireEnv('ANTHROPIC_API_KEY') });
 
       const batches: string[][] = [];
       for (let i = 0; i < chunks.length; i += SIMPLIFY_BATCH_SIZE) {
@@ -282,9 +279,7 @@ export const ingestPdf = inngest.createFunction(
     }
     const embedding = await step.run('embed', async () => {
       counter('ingestion.funnel', { job_id, stage: 'embed' });
-      const voyageKey = process.env.VOYAGE_API_KEY;
-      if (!voyageKey) throw new Error('VOYAGE_API_KEY missing');
-      const voyage = makeVoyageClient({ apiKey: voyageKey });
+      const voyage = makeVoyageClient({ apiKey: requireEnv('VOYAGE_API_KEY') });
       return withDuration(
         'ingestion.step.duration_seconds',
         { job_id, step: 'embed' },

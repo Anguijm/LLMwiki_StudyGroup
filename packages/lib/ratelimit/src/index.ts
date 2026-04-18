@@ -12,6 +12,7 @@
 // Cost: Upstash free tier (10k cmds/day) fits v0 easily.
 import { Ratelimit } from '@upstash/ratelimit';
 import { Redis } from '@upstash/redis';
+import { requireEnv } from '@llmwiki/lib-utils/env';
 
 export class RateLimitExceededError extends Error {
   override readonly name = 'RateLimitExceededError';
@@ -38,11 +39,8 @@ export interface RateLimitDeps {
 
 function makeRedis(deps: RateLimitDeps): Redis {
   if (deps.redis) return deps.redis;
-  const url = deps.url ?? process.env.UPSTASH_REDIS_REST_URL;
-  const token = deps.token ?? process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) {
-    throw new Error('UPSTASH_REDIS_REST_URL / _TOKEN missing');
-  }
+  const url = deps.url ?? requireEnv('UPSTASH_REDIS_REST_URL');
+  const token = deps.token ?? requireEnv('UPSTASH_REDIS_REST_TOKEN');
   return new Redis({ url, token });
 }
 

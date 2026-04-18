@@ -10,15 +10,13 @@
 //
 // packages/db is framework-agnostic: the caller passes the Cookie string in.
 // apps/web wraps supabaseServer() with next/headers's cookies().toString().
+//
+// Env reads are LAZY — they happen inside each factory on invocation, never
+// at module top level. Module-top-level throws break Next.js's "Collecting
+// page data" build phase for any route that transitively imports this file.
 import 'server-only';
 import { createClient } from '@supabase/supabase-js';
-
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!supabaseUrl) throw new Error('NEXT_PUBLIC_SUPABASE_URL missing');
-if (!anonKey) throw new Error('NEXT_PUBLIC_SUPABASE_ANON_KEY missing');
+import { requireEnv } from '@llmwiki/lib-utils/env';
 
 /**
  * Server-component / server-action Supabase client. Caller passes the raw
@@ -27,7 +25,9 @@ if (!anonKey) throw new Error('NEXT_PUBLIC_SUPABASE_ANON_KEY missing');
  * (construction only).
  */
 export function supabaseServer(cookieHeader: string) {
-  return createClient(supabaseUrl!, anonKey!, {
+  const supabaseUrl = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
+  const anonKey = requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
+  return createClient(supabaseUrl, anonKey, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
     global: { headers: { cookie: cookieHeader } },
   });
@@ -42,12 +42,9 @@ export function supabaseServer(cookieHeader: string) {
  * per-request. Cost is zero (local construction).
  */
 export function supabaseService() {
-  if (!serviceRoleKey) {
-    throw new Error(
-      'SUPABASE_SERVICE_ROLE_KEY missing — required for service-role operations',
-    );
-  }
-  return createClient(supabaseUrl!, serviceRoleKey, {
+  const supabaseUrl = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
+  const serviceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
+  return createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
 }

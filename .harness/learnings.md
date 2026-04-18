@@ -185,3 +185,27 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 ### COUNCIL
 - 4 planning-round reviews this execution arc (on the polish + CI-fix diffs). All PROCEED with perfect scores or near-perfect; "must-do before merge: none" on the final batch.
 - Issue #6 (Storage RLS metadata) and issue #7 (db-tests blocking) opened as v1 tracking items. Both reference this PR + a plan section so the v1 agent can pick them up with full context.
+
+## 2026-04-18 15:30 UTC — deploy-readiness: lazy env guards + runbook (PR #8)
+
+### KEEP
+- **Next.js `"Collecting page data"` executes every route module's top-level code.** Any import-time throw kills the build. Class of bug worth naming: `module-top-level-process-env-throw`. The regression test we shipped (`route-module-load.test.ts`) imports every `route.{ts,tsx}` / `page.tsx` / `layout.tsx` with scrubbed + empty env and asserts no throw — catches the bug in unit-test CI before it reaches Vercel. Pattern is reusable for any new framework boundary where "a deploy target evaluates modules eagerly."
+- **Shared `requireEnv` utility as a single import for every lazy env read.** Council r2 caught `if (!v)` allowing empty strings through. r3 promoted the helper to `@llmwiki/lib-utils/env`; using it everywhere means a single future tightening (e.g. URL-format validation) lands in one place. Small package now, but the audit trail of "every env read routes through one function" pays back on any future env-handling tweak.
+- **Running `next build` locally with a fully-scrubbed env** (via `env -i PATH="$PATH" HOME="$HOME" npx next build`) reproduces Vercel's build exactly. If it compiles + collects pages cleanly locally, it will on Vercel. Saved one CI round this session.
+- **Config-aware error messages** (`PDF_PARSER is 'reducto' but REDUCTO_API_KEY is missing or empty`) are dramatically better than plain `API_KEY missing`. User immediately knows (a) which parser they selected, (b) which specific key they need to set. Cost: one extra line per factory. Apply this pattern everywhere config and keys interact.
+
+### IMPROVE
+- **`server-only` package requires a vitest alias.** Spent three test iterations realising this. The `server-only` package throws when imported outside a Next.js Server Component context, which includes vitest. Alias it to a no-op mock in `vitest.config.ts` `resolve.alias` — add to the "new package uses server-only? add the alias" checklist. First-time cost: ~5 min. Repeated cost without the pattern: wasted iterations.
+- **vitest.config.ts location matters.** I initially put `packages/db/src/vitest.config.ts` (the existing location). vitest looks at package root by default, so the config was silently ignored — alias never applied. The FIRST signal is "alias didn't work"; the diagnostic is "check the config path." Moving to `packages/db/vitest.config.ts` fixed it. Worth a line in the contributor guide.
+- **Lint/typecheck/test locally in a batch loop when making workspace-wide changes.** I ran them once at the end of Batch A, caught two issues (`server-only` alias path + vitest config location), fixed, and re-ran. A single local CI pass caught everything; no CI round was burned on this. Codifies the 2026-04-18 "when CI is red twice with different root causes, run locally" — but a better rule is "run locally on ANY workspace-wide change, not just after CI fails."
+
+### INSIGHT
+- **`vi.stubEnv(key, undefined)` in vitest 2.x DELETES the env var** (calls `delete process.env[key]`). If it didn't, my matrix tests would silently test the string `"undefined"` instead of the actual unset state. Don't trust this implicitly — if a test relies on "var is unset," explicitly assert `process.env.KEY === undefined` after the stub.
+- **`.toLocaleLowerCase('en-US')` vs `.toLowerCase()`** matters for user-entered config values because of Turkish-I edge cases. Council bugs reviewer caught this on r3; the fix costs nothing and removes a class of internationalization bug. Worth adopting as the default for any case-folding operation on user or env input.
+- **`vercel env pull`** is the developer-ergonomics fix for the "works locally, breaks on Vercel" drift problem. Recommending it in the runbook means developers sync Vercel → `.env.local` before dev, not the other way around — so Vercel is the single source of truth and dev never drifts.
+- **Secrets do not propagate across platforms** (Vercel ≠ GitHub Actions ≠ Codespaces ≠ `.env.local`). Obvious in retrospect; confusing in practice because GitHub's "Secrets" UI looks central. The README table spelling this out explicitly is a small thing that prevents a real class of confusion.
+
+### COUNCIL
+- 3 rounds on the plan (r1 REVISE → r2 PROCEED + synthesis adjustments → r3 PROCEED + tiny refinements). Scores: `a11y/arch/cost/product/security=10`; `bugs=9→9→9` with each round catching a new class (empty-string validation → locale-aware lowercasing). Net: the bugs reviewer consistently surfaces small-but-real improvements; the 9 is a feature not a bug.
+- Execution planned in 3 batches (shared util + DB refactor + regression test / audit + other packages / runbook). Pushed batches A and B; batch C lands the runbook and this reflection.
+- Council workflow PROCEEDed on r3 with zero non-negotiables. Lead Architect synthesis was adopted as the source of truth; r3 of the plan folded the synthesis changes into written form so plan-on-disk matches what gets executed.

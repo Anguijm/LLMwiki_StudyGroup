@@ -61,74 +61,55 @@ An AI-augmented wiki for collaborative learning. Designed for small technical st
 ## Quick Start
 
 ### Prerequisites
-- Node.js ≥ 18
-- Git
-- Accounts (free tier eligible): Supabase, Vercel, Inngest, AssemblyAI or Deepgram, Anthropic API
 
-### 1. Clone & Install
+- **Node.js 20.11+** (engines pins `>=20.11.0 <21` in `package.json`).
+- **pnpm 9.12+** (monorepo uses pnpm workspaces; `npm install` will not work).
+- **Git**.
+- **Accounts (all free-tier eligible for v0):**
+  Supabase, Vercel, Inngest, Upstash, Anthropic, Voyage, and **one** of
+  LlamaParse or Reducto. LlamaParse has the lightest signup (~2 min at
+  llamaindex.ai).
+
+### 1. Clone & install
+
 ```bash
-git clone https://github.com/yourusername/LLMwiki_StudyGroup.git
+git clone https://github.com/Anguijm/LLMwiki_StudyGroup.git
 cd LLMwiki_StudyGroup
-npm install
+pnpm install
 ```
 
-### 2. Environment Setup
-Create a `.env.local` file in the project root:
+### 2. Local env setup
 
 ```bash
-# Supabase
-NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
-SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
-
-# Claude API
-ANTHROPIC_API_KEY=<your-key>
-ANTHROPIC_MODEL_OPUS=claude-opus-4-6
-ANTHROPIC_MODEL_HAIKU=claude-haiku-4-5-20251001
-
-# Video/Audio
-ASSEMBLYAI_API_KEY=<your-key>
-# OR DEEPGRAM_API_KEY=<your-key>
-
-# Embeddings
-VOYAGE_API_KEY=<your-key>
-# OR OPENAI_API_KEY=<your-key> (for text-embedding-3-large)
-
-# Inngest
-INNGEST_EVENT_KEY=<your-key>
-INNGEST_SIGNING_KEY=<your-key>
-
-# Integrations
-DISCORD_WEBHOOK_URL=<your-study-group-channel>
-# SLACK_WEBHOOK_URL=<optional>
-
-# Optional: PDF Parsing
-REDUCTO_API_KEY=<your-key>
-# OR LLAMAPARSE_API_KEY=<your-key>
+cp .env.example .env.local
+# Fill in the keys per the "Deploy runbook" section below.
 ```
 
-### 3. Database Setup
+`.env.local` is git-ignored. Only v0 keys live in `.env.example`; v1+
+keys (AssemblyAI, Discord webhook, web-push VAPID) get added in the PR
+that wires each feature up, alongside its rate-limit + safety controls.
+
+### 3. Local dev
+
 ```bash
-# Run Supabase migrations
-npx supabase migration up
-# Or use the dashboard: https://supabase.com/dashboard
+pnpm dev                    # Next.js at http://localhost:3000
+pnpm --filter @llmwiki/inngest exec inngest-cli dev   # (optional) local Inngest dev server
 ```
 
-### 4. Local Development
+### 4. Verify locally before pushing
+
 ```bash
-npm run dev
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm --filter web test:a11y   # Playwright a11y suite
 ```
 
-Visit `http://localhost:3000`.
+All four must pass. CI re-runs them on every push.
 
 ### 5. Deploy
-```bash
-# Frontend → Vercel
-vercel deploy
 
-# Inngest → via dashboard (auto-syncs from repo)
-# Supabase → managed via dashboard or CLI
-```
+See the **Deploy runbook** section — every step is explicit, account-by-account.
 
 ---
 
@@ -231,41 +212,147 @@ Weekly Inngest job:
 
 ---
 
-## Environment & Deployment
+## Deploy runbook
 
-### Local Development
-```bash
-npm run dev
-# Also run Supabase locally (optional but recommended):
-supabase start
-```
+Everything below is a literal checklist for getting v0 from zero to a live
+deploy. Work through top-to-bottom once; subsequent deploys are just
+`git push`.
 
-### Production Deployment
+### A. Account + key checklist
 
-**Frontend & API Routes:**
-```bash
-vercel deploy --prod
-```
+| service | required for v0? | keys you'll collect | where |
+|---|---|---|---|
+| Supabase | yes | project URL, anon key, service-role key, project ref | dashboard → Project Settings → API |
+| Vercel | yes | (no keys; just the project) | vercel.com/new |
+| Anthropic | yes | `ANTHROPIC_API_KEY` | console.anthropic.com |
+| Voyage | yes | `VOYAGE_API_KEY` | voyageai.com |
+| **One** of LlamaParse or Reducto | yes | `LLAMAPARSE_API_KEY` *or* `REDUCTO_API_KEY`, plus set `PDF_PARSER` accordingly | llamaindex.ai (recommended) or reducto.ai |
+| Upstash | yes | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | upstash.com → create Redis DB |
+| Inngest | yes | `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` | **auto-populated by the Inngest Vercel marketplace integration — no CLI needed** |
 
-**Database & Auth:**
-- Managed entirely via Supabase dashboard or CLI
-- Migrations tracked in `/supabase/migrations`
+### B. Supabase: project → live
 
-**Async Jobs (Inngest):**
-- Connect your GitHub repo to Inngest dashboard
-- Inngest auto-deploys on push to `main`
-- No additional infrastructure needed
+1. Create a new Supabase project; pick a region near your users.
+2. Dashboard → **Project Settings → API**: copy the project URL, anon key,
+   and service-role key. Also note the project ref (the `<xyz>` in
+   `<xyz>.supabase.co`).
+3. Locally, link + push the schema:
+   ```bash
+   supabase link --project-ref <xyz>
+   supabase db push
+   ```
+   *(Replaces the incorrect `npx supabase migration up` from earlier docs.)*
+4. Dashboard → **Storage**: confirm the `ingest` bucket exists. It's created
+   by migration `20260417000002_rls_policies.sql`. If missing, the migration
+   failed — re-run `supabase db push` or check migration logs.
+5. Dashboard → **Authentication → URL Configuration**:
+   - **Site URL** → your production URL (e.g. `https://<app>.vercel.app`).
+   - **Redirect URLs** → add both of:
+     - `https://<app>.vercel.app/auth/callback`
+     - `https://<app>-*.vercel.app/auth/callback` (Vercel preview deploys)
 
-**Cost Estimate (4 users, 1 semester):**
-| Service | Cost | Notes |
-|---------|------|-------|
-| Vercel | $0–20/mo | Free tier + overages |
-| Supabase Pro | $25/mo | 2GB DB, good for a cohort |
-| Inngest | Free tier | Sufficient for <1k monthly runs |
-| Claude API | $20–50/mo | Haiku is cheap; Opus used sparingly |
-| AssemblyAI | $10/mo | ~10 videos/semester per user |
-| Voyage-3 Embeddings | $0–5/mo | ~1M tokens for small corpus |
-| **Total** | **$75–110/mo** | No servers, no GPU cluster |
+### C. Vercel: project + env vars
+
+1. Import the GitHub repo at vercel.com/new. Accept the defaults
+   (monorepo auto-detected; Vercel runs `pnpm install` + `pnpm run build`
+   at the repo root).
+2. **Settings → Environment Variables**: add every key below, with values
+   from step A. Select **Production, Preview, and Development** for each.
+
+   | key | needed at build time? | notes |
+   |---|---|---|
+   | `NEXT_PUBLIC_SUPABASE_URL` | **yes** (NEXT_PUBLIC_) | default |
+   | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **yes** (NEXT_PUBLIC_) | default |
+   | `SUPABASE_SERVICE_ROLE_KEY` | runtime only | server-only; never expose to client |
+   | `SUPABASE_PROJECT_REF` | runtime only | |
+   | `ANTHROPIC_API_KEY` | runtime only | |
+   | `VOYAGE_API_KEY` | runtime only | |
+   | `PDF_PARSER` | runtime only | `llamaparse` or `reducto` |
+   | `LLAMAPARSE_API_KEY` *(if chosen)* | runtime only | set exactly one parser key |
+   | `REDUCTO_API_KEY` *(if chosen)* | runtime only | set exactly one parser key |
+   | `UPSTASH_REDIS_REST_URL` | runtime only | |
+   | `UPSTASH_REDIS_REST_TOKEN` | runtime only | |
+   | `INNGEST_EVENT_KEY` | runtime only | auto-populated by step D |
+   | `INNGEST_SIGNING_KEY` | runtime only | auto-populated by step D |
+   | `APP_BASE_URL` | runtime only | your production URL |
+
+   `NEXT_PUBLIC_*` keys are build-time by convention (Vercel inlines them
+   into client bundles); nothing to toggle explicitly.
+
+3. **Recommended developer workflow:** after provisioning Vercel env vars,
+   sync them locally with `vercel env pull .env.local` before running
+   `pnpm dev`. Prevents "works on my machine but breaks in preview" drift.
+
+### D. Inngest: via Vercel marketplace integration (no CLI required)
+
+The Inngest CLI (`inngest-cli dev`) is **local-dev only**. Production runs
+don't need it — the Vercel integration handles app registration end-to-end.
+
+1. Go to [vercel.com/integrations/inngest](https://vercel.com/integrations/inngest) → Install → pick your project.
+2. The integration auto-populates `INNGEST_EVENT_KEY` and
+   `INNGEST_SIGNING_KEY` in Vercel's env-var store across all three environments.
+3. On the next Vercel deploy, Vercel notifies Inngest; Inngest polls the
+   `/api/inngest` endpoint and auto-registers the app.
+4. **Verify**: Inngest dashboard → **Apps** → `llmwiki-studygroup` should
+   appear (the `id` from `inngest/src/client.ts`), with four registered
+   functions: `ingestPdf`, `ingestWatchdog`, `noteCreatedLink`, `noteCreatedFlashcards`.
+
+### E. Upstash
+
+1. upstash.com → **Create Database** → Regional → pick a region close to
+   your Vercel deploy region.
+2. Copy the REST URL + REST token into Vercel env vars.
+
+### F. First deploy + smoke test
+
+1. Merge a PR to `main`. Vercel auto-deploys.
+2. Watch the Vercel build log. Expected: **"✓ Generating static pages (8/8)"**
+   and a green "Ready" status.
+3. Visit `https://<app>.vercel.app/auth` → enter email → check inbox for
+   the Supabase magic link → click → should land on `/` (dashboard).
+4. Upload a small (<5 MB) test PDF via the "Upload PDF" button.
+5. Watch the **Recent ingestion jobs** table. Expected transitions:
+   `queued` → `running` → `completed` (seconds to a minute for a 1-page PDF).
+6. Click the resulting note; confirm the simplified body renders.
+7. If stuck in `queued` > 30s: Inngest dashboard → **Apps → Functions** →
+   look for the failing run. Most common root cause: the Inngest Vercel
+   integration didn't auto-register. Trigger a redeploy on Vercel and it
+   registers.
+
+### G. Secret placement reference
+
+Each platform has its own env-var store. **Secrets do NOT propagate across
+platforms** — setting `ANTHROPIC_API_KEY` in GitHub Actions does not put it
+in Vercel.
+
+| store | holds | used by |
+|---|---|---|
+| Vercel env vars | every v0 runtime key + `NEXT_PUBLIC_*` build keys | Vercel builds + serverless runtime |
+| GitHub Actions secrets | `GEMINI_API_KEY` for council, others as needed by CI | `.github/workflows/*.yml` |
+| GitHub Codespaces secrets | developer's local mirror of `.env.example` | Codespaces dev containers |
+| `.env.local` | same as Codespaces but on a developer laptop | `pnpm dev` |
+
+### Cost posture (v0)
+
+| service | monthly cost (4-user cohort) |
+|---|---|
+| Supabase (free → Pro at launch) | $0 → $25 |
+| Vercel Hobby (Pro if previews needed) | $0 → $20 |
+| Upstash free tier (10k cmds/day) | $0 |
+| Inngest free tier (50k steps/mo) | $0 |
+| Claude Haiku + Opus (rare) | $2–5 |
+| Voyage-3 embeddings | <$1 |
+| LlamaParse / Reducto free tiers | $0 |
+| **Total v0** | **$2–50/mo**, scaling to $75–110/mo at v1 with AssemblyAI + Pro tiers |
+
+### Rollback
+
+- **Web**: `vercel rollback` in the Vercel dashboard.
+- **Schema**: `supabase db reset` + re-run migrations from the last
+  known-good commit.
+- **Caveat**: the `db reset` flow is v0-only. Once real cohort data lives
+  in the DB, every migration must ship with a reversible `down.sql` — v1
+  tracks this as the first plan-item.
 
 ---
 

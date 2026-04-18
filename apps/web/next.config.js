@@ -32,6 +32,7 @@ const nextConfig = {
     '@llmwiki/lib-ai',
     '@llmwiki/lib-ratelimit',
     '@llmwiki/lib-metrics',
+    '@llmwiki/lib-utils',
     '@llmwiki/prompts',
   ],
   async headers() {
