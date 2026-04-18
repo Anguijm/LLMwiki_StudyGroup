@@ -80,10 +80,12 @@ jobs:
     needs: [validate]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Supabase CLI
-        run: |
-          curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.deb -o supabase.deb
-          sudo dpkg -i supabase.deb
+      # Official Supabase CLI installer — handles release-asset naming
+      # (the .deb filename embeds the version, so downloading via the
+      # generic /latest/download/... path yields a 404).
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
       - name: Start Supabase
         run: supabase start
       - name: Apply migrations
@@ -110,11 +112,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web exec playwright install --with-deps chromium
-      - name: Build web app
-        run: pnpm --filter web build
-        env:
-          # Minimal placeholder env — the a11y tests never call real APIs.
-          NEXT_PUBLIC_SUPABASE_URL: 'https://ci.placeholder'
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: 'placeholder'
+      # v0 a11y smoke spec uses page.setContent() with inline HTML and
+      # does not require the Next.js dev server. When the smoke spec is
+      # upgraded to page.goto('/'), re-add a build + start-server step
+      # with real env or mocked bindings. Skipping the build keeps the
+      # v0 CI fast and deterministic.
       - name: Run axe-core a11y spec
         run: pnpm test:a11y
