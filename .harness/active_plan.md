@@ -1,185 +1,205 @@
-# Plan: `force-dynamic` on root layout so CSP nonces stamp on rendered HTML
+# Plan: inline NEXT_PUBLIC_* env reads in client-bundled supabaseBrowser
 
 ## Status
 
-PR #13 shipped per-request CSP nonce middleware. Prod verification via
-`curl -sI` shows:
+PRs #13 + #16 shipped: per-request CSP nonce middleware + force-dynamic
+root layout. Verified end-to-end in prod:
 
-- `/diag` CSP header: `script-src 'self' 'nonce-fmsWsovI2Yc95ZLEsJiFBQ==' 'strict-dynamic'`
-- `/auth` CSP header: `script-src 'self' 'nonce-Y9CKrXcfBxyCewIUGwlqLw==' 'strict-dynamic'`
+- CSP header carries per-request nonce
+- Script tags carry matching `nonce="<value>"` attributes
 - `cache-control: private, no-store, max-age=0` ✅
-- `connect-src` wildcard `*.vercel.app` gone ✅
+- `/auth` page renders and stays interactive
 
-User-facing after PR #13:
+User-tested the magic-link button: **still unresponsive**. No visible
+error, no "Check your email" message, no error message.
 
-- `/diag` renders and stays — **visually looks fixed**. But: no inline
-  script tags carry a `nonce=` attribute, so client JS (if any) is
-  CSP-blocked. `/diag` is a pure server component with no hydration
-  requirements, so this is latent but not visible.
-- `/auth` renders and stays — the form is visible. **But: the "Send
-  magic link" button does nothing.** React never hydrates because
-  CSP + `'strict-dynamic'` blocks every script tag (none have nonces).
+## Root cause (verified this session)
 
-## Why the nonce isn't on scripts
+`packages/db/src/browser.ts:14-17`:
 
-Build output from `next build`:
-
-```
-├ ○ /auth     912 B    165 kB
-├ ○ /diag     133 B    103 kB
+```ts
+export function supabaseBrowser() {
+  const supabaseUrl = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
+  const anonKey = requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
+  return createBrowserClient(supabaseUrl, anonKey);
+}
 ```
 
-`○` = **static**. Both pages are **prerendered at build time** into
-frozen HTML. Middleware runs at request time and sets `x-nonce` on
-the request — but the HTML was already serialized during `next build`
-when no `x-nonce` existed. There is no request-time render pass that
-could stamp the nonce onto Next.js's emitted script tags.
+`requireEnv` (in `packages/lib/utils/src/env.ts:11`) reads:
 
-For per-request nonces to land on per-page scripts, the page has to
-be rendered per request. In Next.js 15 App Router, that means the
-route segment config `dynamic = 'force-dynamic'`.
+```ts
+const v = process.env[name];
+```
+
+**Dynamic key.** Next.js's compile-time `process.env.NEXT_PUBLIC_*`
+inliner only replaces literal property accesses (`process.env.NEXT_PUBLIC_FOO`),
+not dynamic ones (`process.env[name]`). Server-side this is fine —
+real Node.js `process.env` is populated. **Client-side it's not** —
+Next.js ships only an empty-ish shim with `NODE_ENV` set, so
+`process.env['NEXT_PUBLIC_SUPABASE_URL']` returns `undefined`.
+
+Confirmed by curling the deployed auth chunk:
+
+```
+$ curl -s …/_next/static/chunks/app/auth/page-32aa280cf1604825.js \
+    | grep -oE 'lhxokbbcojqtwvibbqfj'
+(empty — Supabase URL is NOT inlined)
+
+$ … | grep -oE 'missing or empty'
+missing or empty   ← requireEnv error string IS shipped
+```
+
+So clicking "Send magic link" runs:
+
+1. `onSubmit` async handler.
+2. `supabaseBrowser()` → `requireEnv('NEXT_PUBLIC_SUPABASE_URL')` →
+   throws `"NEXT_PUBLIC_SUPABASE_URL missing or empty"`.
+3. Throw propagates out of the async handler, becomes a swallowed
+   promise rejection. `setErr` never runs (the throw is before any
+   try/catch). `setSent` never runs.
+4. Button looks dead. No error visible to user.
+
+This was flagged in the previous session's handoff plan as
+"roadmap step 4" but deferred because it wasn't believed to be the
+root of the blank-page bug. Now confirmed: it IS the root of the
+post-CSP-fix dead-button bug.
 
 ## Fix
 
-Add a single line to `apps/web/app/layout.tsx`:
+Replace the two `requireEnv` calls in `packages/db/src/browser.ts`
+with direct, statically-analyzable reads:
 
-```tsx
-export const dynamic = 'force-dynamic';
+```ts
+import { createBrowserClient } from '@supabase/ssr';
+
+export function supabaseBrowser() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !anonKey) {
+    throw new Error(
+      'Supabase env vars missing in client bundle. ' +
+        'NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY ' +
+        'must be set at build time, not just runtime.',
+    );
+  }
+  return createBrowserClient(supabaseUrl, anonKey);
+}
 ```
 
-Layout-level route segment config propagates to children. Every page
-now renders per request, Next.js sees `x-nonce` on the request, and
-stamps `nonce="<value>"` on every script tag it emits. CSP
-`'nonce-<value>' 'strict-dynamic'` then permits those scripts and
-their transitively-loaded chunks.
+Direct property access (`process.env.NEXT_PUBLIC_SUPABASE_URL`)
+gets inlined by Next.js at build time → the actual URL string is
+in the client bundle → `supabaseBrowser()` works.
 
-`/diag` overrides with its own `dynamic = 'force-static'`, so it stays
-prerendered. That's fine — `/diag` is diagnostic-only, no client JS
-needed; CSP-blocked scripts on it are a non-issue.
+Defensive runtime guard kept (the values are `string | undefined`
+in TS strict mode, and we want a clear error if someone deploys
+without the env vars set at build time).
 
-## Why this is the minimal correct fix
+`requireEnv` stays in use for all SERVER-side callers (server.ts,
+inngest, ratelimit, ai/pdfparser). Those run in real Node.js
+contexts where dynamic `process.env[name]` works fine.
 
-**Not** "convert `/auth` to a server component wrapper + client child."
-That would touch auth code surface, require import shuffling, and still
-leave any future client page broken by default. Layout-level
-`force-dynamic` is future-proof: any new client component under `/app`
-automatically gets the nonce treatment.
+## Why not "make `requireEnv` smarter"?
 
-**Not** "remove `'strict-dynamic'` and rely on `'self'`." Under plain
-`'self'`, Next.js's inline Flight-payload `<script>` tags (no `src`,
-inline content like `self.__next_f.push(...)`) are still blocked
-because `'self'` only permits same-origin *external* scripts. Inline
-scripts need `'unsafe-inline'`, a nonce, or a hash.
+Tempting: detect at runtime if we're in a Next.js client bundle
+and pull from `__NEXT_DATA__` or some inlined map. Council will
+(rightly) reject:
 
-**Not** "add `'unsafe-inline'` to script-src." Defeats the whole point
-of the PR #13 fix and opens XSS defense-in-depth on an auth-adjacent
-surface.
+- Next.js doesn't expose `NEXT_PUBLIC_*` values via any documented
+  client API. The only contract is "literal `process.env.X` gets
+  inlined at build time."
+- Adding a runtime detect-and-fallback path masks the real fix:
+  "client-bundle code must read env vars literally, not by name."
+- Server-side `requireEnv` is correct as-is. Two distinct constraints
+  → two distinct call patterns. Don't bloat the helper.
 
-## Cost trade-off (explicit)
+## Why not "fix it in `requireEnv` with a build-time codemod"?
 
-PR #13 already set `Cache-Control: private, no-store, max-age=0` in
-middleware, which disables Vercel Edge HTML caching for every
-middleware-matched route. That means we've already paid the "no HTML
-cache" cost. Forcing dynamic rendering adds no further cost at the
-CDN layer — it just changes the origin render path from "serve
-prebuilt HTML" to "render on demand." Per-request render is still
-fast (React 19 streaming, `/auth` is tiny), and we have no traffic
-volume that makes this a concern.
+Even more tempting if we had multiple client-side callers. We don't —
+only `browser.ts` is client-bundled. Two-line surgical fix beats
+codemod plumbing.
 
-Cohort-scale math: worst case 100 users × 20 page loads/day = 2000
-origin renders/day = ~60k/month. Vercel Hobby SSR invocation limit
-is 100k/day. Well within budget.
+## Files changed
+
+1. **`packages/db/src/browser.ts`** *(modified)*
+   - Drop `requireEnv` import.
+   - Read both env vars via direct property access.
+   - Inline guard with a clear error message.
+
+2. **`packages/db/src/browser.test.ts`** *(if it exists; new otherwise)*
+   - Stub `process.env` with both vars set → `supabaseBrowser()`
+     returns a client without throwing.
+   - Stub `process.env` with `NEXT_PUBLIC_SUPABASE_URL` unset → throws
+     with the documented error message.
+   - Same with anon key unset.
 
 ## Verification plan
 
 Local (pre-push):
 
-1. `pnpm --filter web run typecheck` — adding a const export shouldn't
-   introduce TS errors; confirms nothing broke.
-2. `pnpm --filter web run test` — existing tests still pass; no new
-   test needed (the change's observable behavior is a CDN/render-mode
-   switch, not testable in vitest).
-3. `env -i PATH="$PATH" HOME="$HOME" NODE_ENV=production npx next build`
-   in `apps/web/`. The build output should now show:
-   - `ƒ /auth` (dynamic)
-   - `○ /diag` (static; overrides layout)
-   - `ƒ /` (still dynamic; was already dynamic)
-   - `ƒ /note/[slug]` (still dynamic)
+1. `pnpm --filter @llmwiki/db run typecheck` clean.
+2. `pnpm --filter @llmwiki/db run test` passes (new browser tests).
+3. `pnpm --filter web run typecheck` clean.
+4. `pnpm --filter web run test` still 58/58.
+5. `env -i PATH="$PATH" HOME="$HOME" NEXT_PUBLIC_SUPABASE_URL='https://x.supabase.co' NEXT_PUBLIC_SUPABASE_ANON_KEY='anon' NODE_ENV=production npx next build` in `apps/web/` succeeds.
+6. After build, `grep -r 'x.supabase.co' apps/web/.next/static/chunks/app/auth/` finds the URL string in the auth chunk — confirms inlining happened.
 
 Post-deploy (prod):
 
-4. `curl -sL https://llmwiki-study-group.vercel.app/auth | grep -oE 'nonce="[^"]+"' | head -5` shows at least one `nonce="..."` attribute on a `<script>` tag.
-5. Human visits `/auth`, types an email, clicks "Send magic link" →
-   either receives the email or sees a "Check your email" confirmation
-   message. No silent button.
-6. Human completes the full sign-in round-trip: email arrives,
-   clicking the link lands on the dashboard (`/`), the cohort
-   upsert runs, the notes list renders.
+7. `curl -s …/_next/static/chunks/app/auth/page-*.js | grep lhxokbbcojqtwvibbqfj` returns matches (currently zero).
+8. **Human clicks "Send magic link"** → either receives email or
+   sees a "Check your email" message. **Real test of the fix.**
+9. Human completes full sign-in round-trip and lands on dashboard.
 
 ## Non-goals
 
-- Changing anything on `/diag`. It stays static intentionally.
-- Changing `/note/[slug]`. Already dynamic.
-- Adding `nonce={nonce}` to any explicit `<Script>` components. We
-  don't use any; Next.js auto-stamps inline scripts when the page
-  is dynamic and `x-nonce` is set.
-- Refactoring `/auth/page.tsx` into a server-component wrapper.
-  Unnecessary complication; layout-level `force-dynamic` handles it.
-- Adding Vercel ISR or page-level revalidate config. Not needed for
-  the cohort scale.
-- Re-enabling HTML edge caching. PR #13 deliberately disabled it for
-  CSP coherence; that constraint stands.
+- Refactoring all `requireEnv` callers. Only browser.ts is broken.
+- Adding a lint rule to forbid client-side `requireEnv`. Worth a
+  follow-up issue but not blocking.
+- Removing `/diag` (issue #12).
+- Hardening `style-src` (issue #15).
+- CSP `report-uri` (issue #14).
+- Playwright nonce smoke test (queued from PR #16's council r2).
 
-## Non-negotiables (carry-over from PR #13)
+## Non-negotiables
 
-- `connect-src` stays scoped (no `*.vercel.app` wildcard).
-- `script-src` keeps `'strict-dynamic'` + nonce.
-- Middleware matcher still excludes `/api/inngest` and `/auth/callback`.
-- No `[skip council]` — this directly affects the auth flow's
-  hydration behavior, which is an auth-surface change.
+- **Auth surface change.** Council required. No `[skip council]`.
+- Service-role key stays server-only (this fix touches only
+  the browser client; service-role is in server.ts, untouched).
+- Direct `process.env.NEXT_PUBLIC_*` access in client bundle is the
+  ONLY supported pattern. Future client-bundled env reads must
+  follow the same pattern; lint enforcement is a follow-up.
 
 ## Rollback
 
-If making all pages dynamic surfaces an unexpected regression:
+Revert the single commit on `main`. Browser auth returns to the
+current dead-button state — no worse, no better. The CSP nonce
+infrastructure (PRs #13, #16) is not affected.
 
-- Revert the single commit on `main` → layout returns to implicit
-  static-by-default.
-- User is back to PR #13's post-state: `/diag` renders, `/auth`
-  renders but button dead. Known regression boundary; no worse than
-  right now.
+## Cost posture
 
-## Open questions for council
+Zero new API calls. Zero new dependencies. The code path that runs
+when the user clicks "Send magic link" is unchanged in shape — only
+the env-read mechanism changes. Pure correctness fix.
 
-1. **Should `/note/[slug]` be forced static via `force-static`?**
-   Individual notes don't need per-user personalization (RLS handles
-   that). Prerendering them would save origin compute. But they
-   contain dashboardy interactivity (future: edits, comments) that
-   may need JS. Defer — not in scope for this fix.
+## Open question for council
 
-2. **Should we add a Playwright / smoke test that asserts `/auth`
-   has `nonce="..."` on at least one script tag post-deploy?**
-   The current regression suite is unit-level; an end-to-end check
-   would catch a future `dynamic = 'force-static'` regression. Worth
-   a follow-up issue, not in this PR's scope.
-
-## Why not bundle the /diag cleanup (issue #12) here?
-
-CLAUDE.md directive: "Don't add features, refactor, or introduce
-abstractions beyond what the task requires. A bug fix doesn't need
-surrounding cleanup." `/diag` removal is a separate, already-tracked
-concern (issue #12). Folding it in would expand the security surface
-being council-reviewed in this plan. Strictly out of scope.
+1. **Should we add a build-time assertion that `NEXT_PUBLIC_*`
+   vars resolve to non-empty strings, failing the build if not?**
+   Today, missing build-time vars surface only as a runtime click
+   failure. A failing build would be a stronger guard. Out of scope
+   here (would need a custom Next.js plugin or build script), but
+   worth a follow-up issue if the cohort grows.
 
 ## Execution order
 
-Single commit. The change is one line in one file plus a reflection
-block in `learnings.md` (appended, not in scope of the code change
-but per CLAUDE.md session protocol).
+Single small commit:
 
-1. Edit `apps/web/app/layout.tsx` — add `export const dynamic = 'force-dynamic';`.
-2. Run local verification (steps 1-3 above).
-3. Commit with `fix(web): force-dynamic on root layout so CSP nonces stamp`.
-4. Push, council r2 on diff.
-5. On PROCEED → human approval → merge.
-6. Post-merge: steps 4-6 of §Verification plan.
-7. Reflect in `.harness/learnings.md`.
+1. Edit `packages/db/src/browser.ts` (the two-line replacement).
+2. Add `packages/db/src/browser.test.ts` (success + missing-url +
+   missing-key cases).
+3. Local verification (steps 1-6 above).
+4. Commit `fix(db): inline NEXT_PUBLIC_* env reads in client bundle`.
+5. Push → council r2.
+6. On PROCEED → human approval → merge.
+7. Post-merge prod verification (steps 7-9).
+8. Reflect in `.harness/learnings.md`.
