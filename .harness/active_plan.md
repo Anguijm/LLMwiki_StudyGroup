@@ -77,9 +77,11 @@ Pin `@supabase/ssr` in `packages/db/package.json`; regenerate
 
 `supabaseForRequest()` calls `createSupabaseClientForRequest` with the
 `next/headers` `cookies()` adapter. Wrap `setAll` in try/catch —
-Server Components can't set cookies (Next throws), so swallow that
-throw at the Server-Component call site; route handlers and server
-actions write normally.
+Server Components can't set cookies (Next throws), so the catch runs
+there; route handlers and server actions write normally. On catch,
+log at `debug` level with no cookie values (council bugs r1) so the
+swallow isn't silent and a future maintainer misusing the adapter in
+a Server Component can find it.
 
 ### D. Harden `apps/web/app/auth/callback/route.ts`
 
@@ -89,6 +91,9 @@ error shapes to kinds:
 - consumed code → `token_used`
 - expired code → `token_expired`
 - 5xx / network → `server_error`
+- 200 OK with `data.session: null` → `server_error` (council bugs r1)
+- any other thrown `Error` → `server_error` via a final catch-all so
+  the route can never return a 500 (council bugs r1)
 
 **Logging rules (non-negotiable):** never log `code`, `access_token`,
 or `refresh_token` under any branch. Log only the error kind + a
@@ -98,12 +103,22 @@ every failure branch.
 ### E. Surface the error on `/auth/page.tsx`
 
 Read `?error=` via `useSearchParams`; render an `aria-live="assertive"`
-message with kind-specific copy:
+message with kind-specific copy selected by an **allowlist** (switch /
+object map) on the parameter value. The raw query-param value is
+NEVER rendered into the DOM — any unknown kind falls through to a
+generic "Sign-in failed. Request a new link." message. This closes
+the XSS vector the security persona flagged at r1.
+
+Copy:
 
 - `token_used` → "This sign-in link has already been used. Request a new one."
 - `token_expired` → "This sign-in link has expired. Request a new one."
 - `server_error` → "Could not sign you in right now. Please try again."
 - `invalid_request` → "Sign-in link was invalid. Request a new one."
+- any other value → "Sign-in failed. Request a new link."
+
+Message text must meet **WCAG AA 4.5:1** contrast against its
+background (a11y r1).
 
 Form stays visible below the message so the user can request a fresh
 link without extra clicks.
@@ -130,16 +145,22 @@ the checklist for any future environment.
 
 | Branch | Expected |
 |---|---|
-| valid `code`, stub returns session | 302 `/`, `Set-Cookie` HttpOnly+Secure+SameSite=Lax |
+| valid `code`, stub returns session | 302 `/`, `Set-Cookie` HttpOnly+Secure+SameSite=Lax, `Path=/` |
 | stub throws `token_used` | 302 `/auth?error=token_used`, no Set-Cookie |
 | stub throws `token_expired` | 302 `/auth?error=token_expired`, no Set-Cookie |
 | stub throws 5xx / network | 302 `/auth?error=server_error`, no Set-Cookie |
+| stub returns 200 with `data.session: null` | 302 `/auth?error=server_error`, no Set-Cookie (council r1) |
+| stub throws generic `Error` | 302 `/auth?error=server_error`, no Set-Cookie, no 500 (council r1) |
 | missing `code` param | 302 `/auth?error=invalid_request`, stub NOT called |
 | empty `code` | same as missing |
 | whitespace-only `code` | same as missing |
-| any failure branch | no `code` / `access_token` / `refresh_token` in `console.error` |
+| `code` >4KB | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
+| `code` contains null byte / non-URL-safe chars | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
+| any failure branch | `console.error` spy sees no call whose args contain `code` / `access_token` / `refresh_token` (council r1) |
 
-## Non-negotiables (inherited)
+## Non-negotiables (inherited + council r1)
+
+Pre-existing (PR #21 handoff):
 
 - **No logging** of `code` or session tokens in any branch.
 - **Pin** `@supabase/ssr`; lockfile updated.
@@ -148,6 +169,22 @@ the checklist for any future environment.
 - **Error surfacing** on `/auth` — no silent redirect.
 - **Council required** on this surface. No `[skip council]`.
 - **RLS unchanged.** Anon key only; no service-role exposure.
+
+Added by council r1:
+
+- **[security]** Integration test MUST `vi.spyOn(console, 'error')`
+  and assert no call's arguments contain `code`, `access_token`, or
+  `refresh_token` substrings under any failure branch. Single most
+  important safeguard per the security persona.
+- **[security]** `/auth/page.tsx` error rendering MUST use an
+  allowlist (switch / object map) on the `error` query-param value.
+  The raw param value is never rendered; unknown kinds fall through
+  to a generic message. Closes the XSS vector.
+- **[security]** Supabase dashboard screenshots (Redirect URLs
+  allowlist AND both email templates on the PKCE redirect form) must
+  be in the implementation PR body before merge.
+- **[a11y]** Error message MUST meet WCAG AA 4.5:1 contrast against
+  background. Verify at implementation.
 
 ## Rollback
 
@@ -163,7 +200,30 @@ or change RLS.
 - Playwright nonce smoke test (#20).
 - `/diag` removal (#12), CSP `report-uri` (#14), `style-src`
   hardening (#15).
+- **i18n of the new error strings.** Hard-coded English copy is
+  acceptable for the P0 fix; externalization is a follow-up
+  (council a11y r1 noted this as a nice-to-have, not a blocker).
+- `pnpm audit` in CI. Council security r1 nice-to-have; separate
+  issue if we want it.
 - Any v1 feature work.
+
+## Success + kill criteria (council product r1)
+
+- **Success metric:** count of 302s from `/auth/callback` to `/` per
+  day (successful sign-ins). Track via existing server logs — no new
+  telemetry infra.
+- **Failure metric:** count of 302s from `/auth/callback` to
+  `/auth?error=<kind>` bucketed by kind.
+- **Kill criteria:** if total failure rate > 1% of sign-in attempts
+  24h after merge, revert the PR.
+- **Cost:** $0 marginal. Supabase Auth is MAU-billed, not per-call.
+
+## Council r1 synthesis
+
+Verdict **PROCEED** with the four additions above folded in. Scores
+a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. No
+non-negotiable violations. Full report:
+[PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
 
 ## Approval checklist (CLAUDE.md gate)
 
