@@ -69,6 +69,32 @@ describe('middleware (CSP nonce)', () => {
       spy.mockRestore();
     }
   });
+
+  it("production CSP does not contain 'unsafe-eval' (dev-only allowance)", () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    try {
+      const res = middleware(req('/diag'));
+      const csp = res.headers.get('content-security-policy') ?? '';
+      expect(csp).toContain("script-src 'self'");
+      expect(csp).not.toContain("'unsafe-eval'");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('falls back to restrictive CSP if NEXT_PUBLIC_SUPABASE_URL is malformed', () => {
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'not a real url');
+    try {
+      const res = middleware(req('/diag'));
+      expect(res.headers.get('cache-control')).toBe('private, no-store, max-age=0');
+      const csp = res.headers.get('content-security-policy') ?? '';
+      expect(csp).not.toContain("'nonce-");
+      expect(csp).toContain("script-src 'self'");
+      expect(csp).not.toContain('not a real url');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe('middleware matcher', () => {
@@ -101,6 +127,15 @@ describe('middleware matcher', () => {
     // This test documents the expected contract; the regex itself is pathname-only.
     const [pathOnly] = '/auth/callback?code=xyz'.split('?') as [string];
     expect(MATCHER_RE.test(pathOnly)).toBe(false);
+  });
+
+  it('resolves path-prefix ambiguity: /api/ingest processed, /api/inngest/* skipped', () => {
+    // `/api/ingest` is our own upload route → should be processed by middleware.
+    expect(MATCHER_RE.test('/api/ingest')).toBe(true);
+    expect(MATCHER_RE.test('/api/ingest-other-hypothetical')).toBe(true);
+    // `/api/inngest` and any subpath → skipped (webhook signature surface).
+    expect(MATCHER_RE.test('/api/inngest')).toBe(false);
+    expect(MATCHER_RE.test('/api/inngest/anything')).toBe(false);
   });
 
   it('exports the expected matcher config', () => {

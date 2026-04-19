@@ -23,9 +23,14 @@ const STATIC_CSP_FALLBACK =
   "form-action 'self'";
 
 function buildCsp(nonce: string): string {
-  const supabaseUrlRaw =
-    process.env.NEXT_PUBLIC_SUPABASE_URL ?? 'https://placeholder.supabase.co';
-  const supabaseUrl = supabaseUrlRaw.replace(/\/$/, '');
+  const supabaseUrlRaw = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  if (!supabaseUrlRaw) {
+    console.warn('[middleware] NEXT_PUBLIC_SUPABASE_URL not set; CSP uses placeholder.');
+  }
+  const supabaseUrl = (supabaseUrlRaw ?? 'https://placeholder.supabase.co').replace(/\/$/, '');
+  // `new URL()` throws on malformed input — allowed to propagate so the outer
+  // try/catch falls back to the restrictive static CSP rather than shipping
+  // a broken `connect-src`.
   const wsHost = new URL(supabaseUrl).host;
   const devEval = process.env.NODE_ENV === 'production' ? '' : " 'unsafe-eval'";
 
@@ -35,7 +40,10 @@ function buildCsp(nonce: string): string {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",
-    `connect-src 'self' ${supabaseUrl} wss://${wsHost} https://api.inngest.com https://*.vercel.app`,
+    // MAINTENANCE: when adding a new client-reachable service (analytics,
+    // new API host, WebSocket endpoint), extend this list. A missing entry
+    // surfaces as a silent browser-console CSP violation, not a server error.
+    `connect-src 'self' ${supabaseUrl} wss://${wsHost} https://api.inngest.com`,
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",
@@ -77,9 +85,15 @@ export function middleware(req: NextRequest): NextResponse {
 }
 
 export const config = {
-  // Exclude: immutable static chunks, image optimizer, favicon, Inngest
-  // webhook (signature-sensitive body; middleware must not mutate it), and
-  // Supabase's /auth/callback (pure redirect handler, no HTML, no nonce
-  // needed — confirmed at app/auth/callback/route.ts).
+  // MAINTENANCE: when adding a server-only API route (webhook, signed
+  // redirect handler, anything with signature or body-integrity requirements),
+  // extend the negative-lookahead list below. Including such a route causes
+  // the middleware to mutate request headers, which can break signature
+  // verification or silently redirect unexpected traffic.
+  //
+  // Current exclusions: immutable static chunks, image optimizer, favicon,
+  // Inngest webhook (signature-sensitive body), and Supabase's /auth/callback
+  // (pure redirect handler, no HTML rendered — confirmed at
+  // apps/web/app/auth/callback/route.ts).
   matcher: ['/((?!_next/static|_next/image|favicon.ico|api/inngest|auth/callback).*)'],
 };
