@@ -37,6 +37,21 @@ vi.mock('../../lib/supabase', () => ({
   }),
 }));
 
+// Rate-limiter mock. The real @llmwiki/lib-ratelimit requires an Upstash
+// env + network; swap it for a per-test spy so we can exercise both the
+// allow-through and 429 branches without touching Redis. We re-export
+// the real RateLimitExceededError class so the route's `instanceof`
+// check still matches.
+const reserveSpy = vi.fn(async () => undefined);
+
+vi.mock('@llmwiki/lib-ratelimit', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@llmwiki/lib-ratelimit')>();
+  return {
+    ...actual,
+    makeAuthCallbackLimiter: () => ({ reserve: reserveSpy }),
+  };
+});
+
 /** URL-safe base64 code of plausible length (32 chars). */
 const VALID_CODE = 'abcdefghijklmnopqrstuvwxyz012345';
 
@@ -75,6 +90,8 @@ let errorSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   exchangeCodeForSession.mockReset();
+  reserveSpy.mockReset();
+  reserveSpy.mockResolvedValue(undefined); // default: allow through
   errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 
@@ -328,6 +345,71 @@ describe('GET /auth/callback — Supabase error branches', () => {
     expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
       'server_error',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting: per-IP 20/min. Over-limit returns 429 with Retry-After.
+// Upstash outage is fail-open (handled inside the limiter itself; tested
+// separately in the ratelimit package's unit suite).
+// ---------------------------------------------------------------------------
+describe('GET /auth/callback — rate limiting (council r4 blocker)', () => {
+  it('returns 429 with Retry-After when the limiter rejects', async () => {
+    const { RateLimitExceededError } = await import('@llmwiki/lib-ratelimit');
+    const resetsAt = new Date(Date.now() + 30_000);
+    reserveSpy.mockRejectedValueOnce(
+      new RateLimitExceededError('auth_callback_ip', resetsAt),
+    );
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(Number(res.headers.get('retry-after'))).toBeLessThanOrEqual(31);
+    // The 429 short-circuits before the Supabase call.
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+    // No tokens in logs (even though we never got to a code branch).
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+
+  it('gates the rate limit on each request (bucket is request-scoped)', async () => {
+    // The route must CALL the limiter. Regression guard: if a future
+    // refactor moves the limiter behind a broken conditional, this test
+    // fails before the 429 test does.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(reserveSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('buckets by X-Forwarded-For first entry, trimmed', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const req = new NextRequest(
+      new URL(`https://example.test/auth/callback?code=${VALID_CODE}`),
+      { headers: { 'x-forwarded-for': ' 203.0.113.9 , 10.0.0.1' } },
+    );
+    await GET(req);
+    expect(reserveSpy).toHaveBeenCalledWith('203.0.113.9');
+  });
+
+  it('falls back to a shared "no-xff" bucket when XFF is missing', async () => {
+    // Fail-closed on missing IP (a la /api/auth/magic-link) would bounce
+    // any user behind an odd proxy chain. Shared bucket is worse for
+    // the attacker (they compete with everyone else) but strictly safer
+    // for legit users.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(reserveSpy).toHaveBeenCalledWith('no-xff');
   });
 });
 

@@ -3,9 +3,11 @@ import {
   makeTokenBudgetLimiter,
   makeIngestEventLimiter,
   makeMagicLinkLimiter,
+  makeAuthCallbackLimiter,
   RateLimitExceededError,
   RatelimitUnavailableError,
   TOKEN_BUDGET_PER_HOUR,
+  AUTH_CALLBACK_PER_IP_PER_MINUTE,
 } from './index';
 
 interface PipelineLike {
@@ -116,5 +118,31 @@ describe('magic link limiter', () => {
     await expect(lim.reserve('1.2.3.4', 'x@y.z')).rejects.toBeInstanceOf(
       RatelimitUnavailableError,
     );
+  });
+});
+
+describe('auth callback limiter (tier D)', () => {
+  it('AUTH_CALLBACK_PER_IP_PER_MINUTE is 20', () => {
+    expect(AUTH_CALLBACK_PER_IP_PER_MINUTE).toBe(20);
+  });
+
+  it('fails OPEN on upstash failure (transient outage must not deny legit sign-ins)', async () => {
+    // Contrast with every other tier (which fails closed). The callback
+    // is a click-through from a time-boxed magic-link email; a 503 on
+    // Redis outage is a worse UX than dropping the rate-limit briefly,
+    // and Supabase's own project-level rate limits provide the backstop.
+    const redis = { eval: async () => { throw new Error('down'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await expect(lim.reserve('1.2.3.4')).resolves.toBeUndefined();
+  });
+
+  it('accepts auth_callback_ip as a RateLimitExceededError kind', () => {
+    // Type + runtime check: the route handler's instanceof guard
+    // depends on this kind being in the union. If a future refactor
+    // drops the kind from the constructor, this test fails.
+    const err = new RateLimitExceededError('auth_callback_ip', new Date());
+    expect(err.kind).toBe('auth_callback_ip');
+    expect(err).toBeInstanceOf(RateLimitExceededError);
   });
 });

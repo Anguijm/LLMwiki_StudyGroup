@@ -21,7 +21,8 @@ export class RateLimitExceededError extends Error {
       | 'ingest_events'
       | 'token_budget'
       | 'magic_link_ip'
-      | 'magic_link_email',
+      | 'magic_link_email'
+      | 'auth_callback_ip',
     public readonly resetsAt: Date,
   ) {
     super(`rate limit exceeded: ${kind}; resets at ${resetsAt.toISOString()}`);
@@ -136,6 +137,58 @@ export function makeTokenBudgetLimiter(deps: RateLimitDeps = {}) {
   }
 
   return { reserve, refund };
+}
+
+// ----- Tier D: auth callback limiter (anonymous, per-IP, minute window) ---
+//
+// /auth/callback is the click-through landing URL for the magic-link email.
+// It receives a short-lived PKCE code in a query param and calls Supabase
+// Auth's exchangeCodeForSession. A public endpoint + fan-out to an external
+// API = a small but real DOS vector: an attacker can spam bad codes,
+// consuming our server cycles and Supabase's per-project rate budget even
+// though the codes will be rejected.
+//
+// Defensive posture: 20 req / minute / IP — generous enough that a
+// legitimate user's link-click (or a handful of retries) never gets
+// blocked, strict enough that a single-source spam wave hits the ceiling
+// in seconds. FAIL-OPEN on Upstash outage: bouncing a legit sign-in
+// because Redis is down is worse than losing the DOS guard briefly,
+// especially given Supabase's own project-level rate limits as a deeper
+// backstop.
+
+export const AUTH_CALLBACK_PER_IP_PER_MINUTE = 20;
+
+export function makeAuthCallbackLimiter(deps: RateLimitDeps = {}) {
+  const redis = makeRedis(deps);
+  const limiter = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(AUTH_CALLBACK_PER_IP_PER_MINUTE, '1 m'),
+    analytics: false,
+    prefix: 'rl:authcb:ip',
+  });
+
+  /**
+   * Check-and-decrement the per-IP callback counter.
+   *
+   *   - Throws RateLimitExceededError('auth_callback_ip') if over the limit.
+   *   - FAIL-OPEN on Upstash unreachable: resolves without reserving.
+   *     Intentional: a transient Redis outage must not deny a legit
+   *     user's link-click. Supabase's own project rate limits provide
+   *     the deeper backstop against sustained abuse.
+   */
+  async function reserve(ip: string): Promise<void> {
+    let result: Awaited<ReturnType<typeof limiter.limit>>;
+    try {
+      result = await limiter.limit(ip);
+    } catch {
+      return; // fail-OPEN; see docstring for rationale
+    }
+    if (!result.success) {
+      throw new RateLimitExceededError('auth_callback_ip', new Date(result.reset));
+    }
+  }
+
+  return { reserve };
 }
 
 // ----- Tier C: magic-link auth limiter (anonymous endpoint) ---------------

@@ -33,23 +33,30 @@ export async function supabaseForRequest() {
       for (const { name, value, options } of cookiesToSet) {
         try {
           store.set(name, value, options);
-        } catch {
-          // Cookie mutation is only supported in Route Handlers and
-          // Server Actions. When this client is used from a Server
-          // Component render, Next.js throws here — that case is
-          // EXPECTED and correct (an RSC should not be rewriting the
-          // user's session cookie). Drop the write so the read path
-          // still returns fresh user data. Any other failure mode
-          // (e.g. a Route Handler where writes should work) will
-          // surface in dev via this log without exposing the cookie.
-          if (process.env.NODE_ENV !== 'production') {
-            // eslint-disable-next-line no-console
-            console.debug(
-              'supabase: setAll failed in a context where cookie writing ' +
-                'is not supported (e.g., Server Component). This is expected ' +
-                'when reading session state from an RSC; ignoring.',
-            );
-          }
+        } catch (err) {
+          // Discriminate two failure modes (council bugs r4):
+          //
+          //   1. Server Component context — Next.js forbids cookie
+          //      mutation from render. The thrown error's message
+          //      contains "Cookies can only be modified in a Server
+          //      Action or Route Handler" (or minor variants across
+          //      Next versions). This is EXPECTED when an RSC reads
+          //      session state via this client; swallow silently.
+          //
+          //   2. Anything else — a Route Handler or Server Action
+          //      where the write SHOULD have succeeded but didn't.
+          //      That's a bug we need to surface in production too;
+          //      log at error level with no cookie values.
+          const msg = err instanceof Error ? err.message : String(err);
+          const isExpectedRscContext =
+            /cookies.*modif|server\s*action|route\s*handler/i.test(msg);
+          if (isExpectedRscContext) continue;
+          // eslint-disable-next-line no-console
+          console.error(
+            'supabase: setAll failed in a write-capable context. ' +
+              'Investigate — cookie name and value omitted to avoid leakage.',
+            { errorName: err instanceof Error ? err.name : typeof err },
+          );
         }
       }
     },

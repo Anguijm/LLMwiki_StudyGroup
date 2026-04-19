@@ -5,13 +5,21 @@
 // the @supabase/ssr setAll adapter in apps/web/lib/supabase.ts) and
 // redirects to the dashboard.
 //
-// Security posture (plan PR #22, council rounds r1 / r2 / r3):
+// Security posture (plan PR #22, council rounds r1 / r2 / r3 / r4):
 //
-//   - Input validation runs BEFORE any Supabase call. Missing / empty /
-//     whitespace / too-short / too-long / non-URL-safe `code` values
-//     redirect to /auth?error=invalid_request immediately. Defense in
-//     depth: Supabase also validates, but a malformed code should never
-//     touch the network.
+//   - Per-IP rate limit (20 req / min, fail-open on Upstash outage).
+//     /auth/callback is a public endpoint that fans out to Supabase
+//     Auth; without a limiter an attacker can spam bad codes and
+//     consume our server + Supabase's per-project rate budget (council
+//     security r4 blocker: non-negotiable on public endpoints with
+//     external API fan-out). Fail-open intentional: a Redis outage
+//     must not 503 a legit magic-link click.
+//
+//   - Input validation runs BEFORE the Supabase call. Missing /
+//     empty / whitespace / too-short / too-long / non-URL-safe `code`
+//     values redirect to /auth?error=invalid_request immediately.
+//     Defense in depth: Supabase also validates, but a malformed code
+//     should never touch the network.
 //
 //   - Every failure branch — Supabase-shaped errors, a 200 OK with
 //     `data.session: null`, unparseable JSON responses, and generic
@@ -35,6 +43,10 @@
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { supabaseForRequest } from '../../../lib/supabase';
+import {
+  makeAuthCallbackLimiter,
+  RateLimitExceededError,
+} from '@llmwiki/lib-ratelimit';
 
 export const runtime = 'nodejs';
 
@@ -58,12 +70,29 @@ function validateCode(raw: string | null): ErrorKind | null {
 }
 
 /**
+ * Extract a rate-limit bucket key from the request. Vercel guarantees
+ * X-Forwarded-For on production traffic. If the header is absent (local
+ * dev, odd proxy chains), fall back to a shared "unknown" bucket — the
+ * shared bucket means worst-case all IP-less traffic shares a 20/min
+ * ceiling, which is annoying but not a user-denial.
+ */
+function rateLimitBucket(req: NextRequest): string {
+  const xff = req.headers.get('x-forwarded-for');
+  const first = xff?.split(',')[0]?.trim();
+  if (first && first.length > 0) return first;
+  const xri = req.headers.get('x-real-ip')?.trim();
+  if (xri && xri.length > 0) return xri;
+  return 'no-xff';
+}
+
+/**
  * Map a Supabase auth error to one of our user-facing kinds. Supabase
  * doesn't expose stable error codes for PKCE exchange failures, so we
  * match on message substrings with explicit fall-through to
  * `server_error`. If Supabase changes its error copy in a future
  * release, the result is more "server_error" toasts rather than a
- * crash — acceptable graceful degradation.
+ * crash — acceptable graceful degradation (council security r4
+ * nice-to-have: revisit if Supabase ever exposes stable codes).
  */
 function mapSupabaseError(err: { message?: string; status?: number } | null): ErrorKind {
   if (!err) return 'server_error';
@@ -82,16 +111,48 @@ function redirectToAuthError(req: NextRequest, kind: ErrorKind): NextResponse {
   return NextResponse.redirect(target);
 }
 
-export async function GET(req: NextRequest): Promise<NextResponse> {
-  const code = new URL(req.url).searchParams.get('code');
+function tooManyRequests(resetsAt: Date): NextResponse {
+  const retryAfterSec = Math.max(
+    1,
+    Math.ceil((resetsAt.getTime() - Date.now()) / 1000),
+  );
+  return new NextResponse('Too many requests. Please try again in a moment.', {
+    status: 429,
+    headers: {
+      'retry-after': String(retryAfterSec),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+  });
+}
 
+export async function GET(req: NextRequest): Promise<NextResponse> {
+  // 1. Rate limit FIRST. Validation is cheap but unbounded requests to a
+  // public endpoint still cost cycles, and a future refactor that moves
+  // validation later should never drop the rate-limit gate.
+  try {
+    await makeAuthCallbackLimiter().reserve(rateLimitBucket(req));
+  } catch (err) {
+    if (err instanceof RateLimitExceededError) {
+      return tooManyRequests(err.resetsAt);
+    }
+    // Limiter's reserve() only throws RateLimitExceededError (it
+    // fail-opens on Upstash outage). Any other throw is unexpected —
+    // let it propagate so the platform's error reporting picks it up;
+    // the route's final catch-all below won't run here because this
+    // block is outside the exchange try/catch by design (rate-limit
+    // failures are infrastructure errors, not sign-in errors).
+    throw err;
+  }
+
+  // 2. Input validation.
+  const code = new URL(req.url).searchParams.get('code');
   const validation = validateCode(code);
   if (validation !== null) {
     return redirectToAuthError(req, validation);
   }
-  // After validation, `code` is guaranteed non-null and trimmed shape.
   const trimmedCode = (code as string).trim();
 
+  // 3. Exchange the code, mapping every failure shape to a known kind.
   let failureKind: ErrorKind | null = null;
   try {
     const supabase = await supabaseForRequest();
