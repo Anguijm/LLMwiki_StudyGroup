@@ -58,34 +58,75 @@ logged out.
    right back to `/auth` via the dashboard's "no session → redirect
    to /auth" guard.
 
-**Fix (both required, one PR is cleanest):**
+**Fix (all required; TDD order; one PR):**
 
-A. In `packages/db/src/server.ts`, add a new factory
-   `supabaseServerWithCookies(adapter)` that uses `@supabase/ssr`'s
-   `createServerClient` with a full getAll/setAll cookies adapter.
-   Keep the existing `supabaseServer(cookieHeader: string)` around for
-   Inngest callers that don't have a response to write cookies to.
-   Set `flowType: 'pkce'` on the new factory.
+A. **Write the failing integration test first.** New file
+   `apps/web/app/auth/callback/route.integration.test.ts` that stubs
+   `exchangeCodeForSession` and asserts, for each branch:
+   - **Success:** response is a 302 to `/`, with a `Set-Cookie`
+     header whose attributes include `HttpOnly`, `Secure`, and
+     `SameSite=Lax`.
+   - **Already-used / expired / network error:** response is a 302
+     to `/auth?error=<kind>` (kind ∈ `token_used`, `token_expired`,
+     `server_error`), NO Set-Cookie, NO session tokens or raw `code`
+     value in any log output (assert via a vi.spy on `console.error`).
+   - **No `code` / empty / whitespace `code`:** 302 to
+     `/auth?error=invalid_request` before any Supabase call is made.
 
-B. In `apps/web/lib/supabase.ts`, have `supabaseForRequest()` use the
-   new factory, constructing the adapter from `next/headers`'s
-   `cookies()`. Wrap the `setAll` in a try/catch — Server Components
-   can't set cookies, only route handlers + server actions can, and
-   the documented pattern swallows the error in the Server Component
-   path.
+B. In `packages/db/src/server.ts`, add a new factory
+   `createSupabaseClientForRequest(adapter)` that uses `@supabase/ssr`'s
+   `createServerClient` with a full getAll/setAll cookies adapter and
+   `flowType: 'pkce'`. Rename the existing `supabaseServer` to
+   `createSupabaseClientForJobs` (read-only; used by Inngest and
+   cookie-less server contexts) so a future consumer can't silently
+   pick the read-only one for a cookie-writing surface — the council's
+   naming concern. Update all call sites (one-line import swap each).
+   Add a comment block at the top of server.ts explaining which
+   factory to pick and why. Pin the new `@supabase/ssr` dependency
+   version in `packages/db/package.json` + regenerate `pnpm-lock.yaml`.
 
-C. In the Supabase dashboard, verify the **email templates** for both
-   "Confirm signup" and "Magic Link" use the PKCE redirect URL
-   format. Default templates send the tokens in the URL fragment; for
-   PKCE they must instead point at `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`
-   or equivalent. This is a dashboard change, not code. Document in
-   `README.md` so the runbook catches it.
+C. In `apps/web/lib/supabase.ts`, have `supabaseForRequest()` use
+   `createSupabaseClientForRequest` with the `next/headers`
+   `cookies()` adapter. Wrap `setAll` in try/catch — Server Components
+   can't set cookies; swallow the throw there and let route handlers
+   + server actions write normally.
 
-D. Regression test: an integration test that stubs
-   `exchangeCodeForSession` and asserts a Set-Cookie header is
-   present on the callback's redirect response. Without this test,
-   the cookie-write regression would re-surface silently on any
-   future auth refactor.
+D. In `apps/web/app/auth/callback/route.ts`, explicitly catch
+   `exchangeCodeForSession` failures. Map known Supabase error shapes
+   to error kinds (`token_used` if the code was consumed,
+   `token_expired` if the code is past TTL, `server_error` for
+   5xx / network). DO NOT log the incoming `code` query parameter,
+   the `access_token`, or the `refresh_token` under any branch. DO
+   log the error kind + sanitized error message (Supabase error kind,
+   no tokens). Redirect to `/auth?error=<kind>` on any failure.
+
+E. In `apps/web/app/auth/page.tsx`, read the `?error=` query param
+   (via `useSearchParams`) and render an `aria-live="assertive"`
+   error message with a kind-specific copy:
+   - `token_used` → "This sign-in link has already been used. Request a new one."
+   - `token_expired` → "This sign-in link has expired. Request a new one."
+   - `server_error` → "Could not sign you in right now. Please try again."
+   - `invalid_request` → "Sign-in link was invalid. Request a new one."
+   The form remains visible below so the user can request a fresh
+   link without extra clicks.
+
+F. In the Supabase dashboard:
+   1. **Authentication → URL Configuration → Redirect URLs allowlist:**
+      confirm it contains ONLY `https://llmwiki-study-group.vercel.app/auth/callback`
+      + any preview-URL pattern. Remove any wildcards or non-project
+      origins. This is the open-redirect guard that complements the
+      server-side `APP_BASE_URL`-only policy in PR #17's magic-link
+      route.
+   2. **Authentication → Email Templates → Confirm signup + Magic
+      Link:** both must use the PKCE redirect URL format,
+      `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`. Default
+      templates send tokens in the URL fragment; PKCE requires the
+      code-query form. Verify and fix both templates.
+   3. Screenshot both dashboard sections and attach them to the PR
+      description as the pre-merge verification.
+
+G. Update `README.md` "Deploy runbook" with the §F dashboard steps so
+   the checklist catches this in future environments.
 
 **Rollback:** Revert the PR. User is back to current state (email
 delivers, but sign-in never completes). No additional regressions.
@@ -94,6 +135,21 @@ delivers, but sign-in never completes). No additional regressions.
 was broken all session (PRs #13 → #17 were fixing the send side).
 This is the FIRST successful magic-link email we've ever sent, so the
 callback flow has been untested since v0 scaffold (PR #5).
+
+## Non-negotiables for the next session's fix PR
+
+Council r1 on PR #21 spelled these out explicitly; re-stated here so
+the fix PR's plan can mark them as already-inherited constraints:
+
+- **No logging of `code` or session tokens.** Server-side logs must
+  redact both under every branch.
+- **Pin the `@supabase/ssr` version.** New dependency, lockfile must
+  reflect the pinned version.
+- **Supabase Redirect URLs allowlist** locked to `APP_BASE_URL`
+  before merge. Screenshot attached to PR description.
+- **Callback errors surface as user-facing messages**, not silent
+  redirects.
+- **Auth surface → council required.** No `[skip council]`.
 
 ## Next session's opener (priority order)
 
