@@ -251,12 +251,23 @@ deploy. Work through top-to-bottom once; subsequent deploys are just
      - `https://<app>.vercel.app/auth/callback`
      - `https://<app>-*.vercel.app/auth/callback` (Vercel preview deploys)
 
-### C. Vercel: project + env vars
+### C. Vercel: project + settings + env vars
 
-1. Import the GitHub repo at vercel.com/new. Accept the defaults
-   (monorepo auto-detected; Vercel runs `pnpm install` + `pnpm run build`
-   at the repo root).
-2. **Settings → Environment Variables**: add every key below, with values
+1. Import the GitHub repo at vercel.com/new.
+2. **Settings → General → Build and Deployment** — critical for this
+   monorepo layout. Without these, the build runs but Vercel can't find
+   the Next.js output and the deploy fails with "No Output Directory
+   named 'public' found":
+   - **Root Directory** → `apps/web`
+     (The Next.js project lives in this subdirectory, not at the repo root.)
+   - **"Include files outside of the Root Directory"** → **ON**
+     (Required so the build in `apps/web` can still see `packages/*`,
+     `inngest/`, `pnpm-workspace.yaml`, and the root `pnpm-lock.yaml`.)
+   - **Framework Preset** → **Next.js**
+     (Auto-sets Build Command, Output Directory `.next`, Install
+     Command. Must be set explicitly — monorepo auto-detection can
+     leave this as "Other", which breaks output-directory discovery.)
+3. **Settings → Environment Variables**: add every key below, with values
    from step A. Select **Production, Preview, and Development** for each.
 
    | key | needed at build time? | notes |
@@ -279,7 +290,7 @@ deploy. Work through top-to-bottom once; subsequent deploys are just
    `NEXT_PUBLIC_*` keys are build-time by convention (Vercel inlines them
    into client bundles); nothing to toggle explicitly.
 
-3. **Recommended developer workflow:** after provisioning Vercel env vars,
+4. **Recommended developer workflow:** after provisioning Vercel env vars,
    sync them locally with `vercel env pull .env.local` before running
    `pnpm dev`. Prevents "works on my machine but breaks in preview" drift.
 

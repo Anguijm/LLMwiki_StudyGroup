@@ -25,6 +25,7 @@ export default function RouteError({
   return (
     <div
       role="alert"
+      aria-live="assertive"
       style={{
         padding: '1rem',
         margin: '1rem',
