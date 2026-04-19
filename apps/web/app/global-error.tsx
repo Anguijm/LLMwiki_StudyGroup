@@ -24,6 +24,7 @@ export default function GlobalError({
       <body style={{ margin: 0, fontFamily: 'system-ui, sans-serif' }}>
         <div
           role="alert"
+          aria-live="assertive"
           style={{
             padding: '1rem',
             margin: '1rem',
