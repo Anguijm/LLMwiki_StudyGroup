@@ -1,220 +1,188 @@
-# Plan: rate-limited server-side /api/auth/magic-link + client env-read fix
+# Session handoff: CSP + auth fix arc shipped, framework persona is next session's opener
 
-## Revision history
+## What landed this session
 
-- r1 (committed dac32af): client-side `requireEnv` → direct `process.env.*`
-  in `packages/db/src/browser.ts`; UX hardening on `/auth/page.tsx`.
-  Council r2: **REVISE** 8/10/9/10/10/**3** — security blocker: re-enabling
-  `signInWithOtp` client-side without application-level rate limit exposes
-  email-flooding attack surface.
-- r2 (this revision): moves the Supabase Auth call to a new server-side
-  route `apps/web/app/api/auth/magic-link/route.ts`, rate-limited via new
-  Tier C in `@llmwiki/lib-ratelimit`. `/auth/page.tsx` now `fetch()`s the
-  route. `browser.ts` fix retained (other client code depends on it). All
-  r1 UX hardening retained.
+Three sequential PRs on `main` closing out the production blank-page →
+dead-button bug:
 
-# Plan r2: rate-limited /api/auth/magic-link + client env-read fix
+| PR | Commit | Scope |
+|---|---|---|
+| **#13** | `eb707b0` | Per-request CSP nonce via `apps/web/middleware.ts`. Replaced static `script-src 'self'` (which blocked Next.js 15's inline Flight-payload scripts) with nonce + `'strict-dynamic'`. `Cache-Control: private, no-store, max-age=0` to prevent Vercel Edge serving stale HTML with mismatched nonces. Matcher excludes `/api/inngest` and `/auth/callback`. Removed `https://*.vercel.app` wildcard from `connect-src`. Council arc r1→r4 PROCEED. |
+| **#16** | `ffec953` | `export const dynamic = 'force-dynamic'` on `apps/web/app/layout.tsx`. Per-request nonces can't stamp on prerendered HTML (baked at build time before middleware runs); layout-level `force-dynamic` forces every route to render per-request so Next.js reads `x-nonce` and stamps scripts correctly. Note: Next.js's layout-level `force-dynamic` overrides child `force-static`, so `/diag` is now dynamic too (acceptable — no DB calls, no interactivity). |
+| **#17** | `f4fc657` | New rate-limited server-side `apps/web/app/api/auth/magic-link/route.ts`; client `/auth/page.tsx` now `fetch()`es it. `packages/db/src/browser.ts` reads `process.env.NEXT_PUBLIC_*` via literal property access (Next.js can't inline dynamic `process.env[name]`). New Tier C limiter in `@llmwiki/lib-ratelimit` (per-IP 5/hr, per-email 3/hr). Open-redirect protection (required `APP_BASE_URL`, no Host-header fallback). Email alias stripping in rate-limit key. UX hardening on `/auth` (pending state, aria-live regions, "Sending…" copy swap). Council arc r1→r4, two REVISEs (security at r2, bugs at r3) both folded in. |
 
-## Status
+Verified in prod via curl:
+- CSP header carries per-request nonce.
+- All `<script>` tags carry matching `nonce="..."` attributes.
+- `/api/auth/magic-link` returns 400 on bad JSON, bad email shape,
+  missing email, whitespace-only email, oversize email, missing
+  `x-forwarded-for`.
+- `APP_BASE_URL` confirmed set in Vercel All-Environments.
+- Human tested the button: first deploy (post PR #17) response
+  unverified as of handoff — user to confirm next session.
 
-PRs #13 + #16 shipped: per-request CSP nonce middleware + force-dynamic
-root layout. Verified end-to-end in prod:
+## Live bug at handoff (verified after merge)
 
-- CSP header carries per-request nonce
-- Script tags carry matching `nonce="<value>"` attributes
-- `cache-control: private, no-store, max-age=0` ✅
-- `/auth` page renders and stays interactive
-
-User-tested the magic-link button: **still unresponsive**. No visible
-error, no "Check your email" message, no error message.
-
-## Root cause (verified this session)
-
-`packages/db/src/browser.ts:14-17`:
-
-```ts
-export function supabaseBrowser() {
-  const supabaseUrl = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
-  const anonKey = requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
-  return createBrowserClient(supabaseUrl, anonKey);
-}
-```
-
-`requireEnv` (in `packages/lib/utils/src/env.ts:11`) reads:
-
-```ts
-const v = process.env[name];
-```
-
-**Dynamic key.** Next.js's compile-time `process.env.NEXT_PUBLIC_*`
-inliner only replaces literal property accesses (`process.env.NEXT_PUBLIC_FOO`),
-not dynamic ones (`process.env[name]`). Server-side this is fine —
-real Node.js `process.env` is populated. **Client-side it's not** —
-Next.js ships only an empty-ish shim with `NODE_ENV` set, so
-`process.env['NEXT_PUBLIC_SUPABASE_URL']` returns `undefined`.
-
-Confirmed by curling the deployed auth chunk:
+**Symptom:** Magic-link email arrives and looks correct. Clicking the
+"Confirm" link in the email redirects the user back to `/auth` with
+the tokens in a URL fragment:
 
 ```
-$ curl -s …/_next/static/chunks/app/auth/page-32aa280cf1604825.js \
-    | grep -oE 'lhxokbbcojqtwvibbqfj'
-(empty — Supabase URL is NOT inlined)
-
-$ … | grep -oE 'missing or empty'
-missing or empty   ← requireEnv error string IS shipped
+https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&token_type=bearer&type=signup
 ```
 
-So clicking "Send magic link" runs:
+Session is NOT persisted — refresh `/auth` and the user is still
+logged out.
 
-1. `onSubmit` async handler.
-2. `supabaseBrowser()` → `requireEnv('NEXT_PUBLIC_SUPABASE_URL')` →
-   throws `"NEXT_PUBLIC_SUPABASE_URL missing or empty"`.
-3. Throw propagates out of the async handler, becomes a swallowed
-   promise rejection. `setErr` never runs (the throw is before any
-   try/catch). `setSent` never runs.
-4. Button looks dead. No error visible to user.
+**Root cause (two separate bugs):**
 
-This was flagged in the previous session's handoff plan as
-"roadmap step 4" but deferred because it wasn't believed to be the
-root of the blank-page bug. Now confirmed: it IS the root of the
-post-CSP-fix dead-button bug.
+1. **Flow mismatch — implicit vs PKCE.** Supabase is configured with
+   the default `flowType: 'implicit'` (tokens posted to the URL
+   fragment for client-side JS to parse). Our `/auth/callback`
+   expects `flowType: 'pkce'` (a `?code=...` query param that the
+   server exchanges via `exchangeCodeForSession`). `type=signup` in
+   the fragment also indicates Supabase treated this as a
+   first-time signup, not a returning magic-link sign-in — the
+   "Confirm signup" template runs by default, not "Magic Link". The
+   two templates can be configured separately in the Supabase
+   dashboard.
 
-## Fix
+2. **Cookie adapter is read-only.** Even once PKCE is enabled and
+   `/auth/callback?code=...` gets hit, the existing `supabaseServer`
+   factory (`packages/db/src/server.ts:27-34`) uses
+   `@supabase/supabase-js`'s `createClient` with `persistSession:
+   false` and a cookies-as-string input. It can READ the Cookie
+   header but has no way to WRITE Set-Cookie on the response. So
+   `exchangeCodeForSession` succeeds against Supabase Auth, gets a
+   valid session back, and drops it on the floor. The user bounces
+   right back to `/auth` via the dashboard's "no session → redirect
+   to /auth" guard.
 
-Replace the two `requireEnv` calls in `packages/db/src/browser.ts`
-with direct, statically-analyzable reads:
+**Fix (both required, one PR is cleanest):**
 
-```ts
-import { createBrowserClient } from '@supabase/ssr';
+A. In `packages/db/src/server.ts`, add a new factory
+   `supabaseServerWithCookies(adapter)` that uses `@supabase/ssr`'s
+   `createServerClient` with a full getAll/setAll cookies adapter.
+   Keep the existing `supabaseServer(cookieHeader: string)` around for
+   Inngest callers that don't have a response to write cookies to.
+   Set `flowType: 'pkce'` on the new factory.
 
-export function supabaseBrowser() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!supabaseUrl || !anonKey) {
-    throw new Error(
-      'Supabase env vars missing in client bundle. ' +
-        'NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY ' +
-        'must be set at build time, not just runtime.',
-    );
-  }
-  return createBrowserClient(supabaseUrl, anonKey);
-}
-```
+B. In `apps/web/lib/supabase.ts`, have `supabaseForRequest()` use the
+   new factory, constructing the adapter from `next/headers`'s
+   `cookies()`. Wrap the `setAll` in a try/catch — Server Components
+   can't set cookies, only route handlers + server actions can, and
+   the documented pattern swallows the error in the Server Component
+   path.
 
-Direct property access (`process.env.NEXT_PUBLIC_SUPABASE_URL`)
-gets inlined by Next.js at build time → the actual URL string is
-in the client bundle → `supabaseBrowser()` works.
+C. In the Supabase dashboard, verify the **email templates** for both
+   "Confirm signup" and "Magic Link" use the PKCE redirect URL
+   format. Default templates send the tokens in the URL fragment; for
+   PKCE they must instead point at `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`
+   or equivalent. This is a dashboard change, not code. Document in
+   `README.md` so the runbook catches it.
 
-Defensive runtime guard kept (the values are `string | undefined`
-in TS strict mode, and we want a clear error if someone deploys
-without the env vars set at build time).
+D. Regression test: an integration test that stubs
+   `exchangeCodeForSession` and asserts a Set-Cookie header is
+   present on the callback's redirect response. Without this test,
+   the cookie-write regression would re-surface silently on any
+   future auth refactor.
 
-`requireEnv` stays in use for all SERVER-side callers (server.ts,
-inngest, ratelimit, ai/pdfparser). Those run in real Node.js
-contexts where dynamic `process.env[name]` works fine.
+**Rollback:** Revert the PR. User is back to current state (email
+delivers, but sign-in never completes). No additional regressions.
 
-## Why not "make `requireEnv` smarter"?
+**Why this was never caught until now:** The magic-link button itself
+was broken all session (PRs #13 → #17 were fixing the send side).
+This is the FIRST successful magic-link email we've ever sent, so the
+callback flow has been untested since v0 scaffold (PR #5).
 
-Tempting: detect at runtime if we're in a Next.js client bundle
-and pull from `__NEXT_DATA__` or some inlined map. Council will
-(rightly) reject:
+## Next session's opener (priority order)
 
-- Next.js doesn't expose `NEXT_PUBLIC_*` values via any documented
-  client API. The only contract is "literal `process.env.X` gets
-  inlined at build time."
-- Adding a runtime detect-and-fallback path masks the real fix:
-  "client-bundle code must read env vars literally, not by name."
-- Server-side `requireEnv` is correct as-is. Two distinct constraints
-  → two distinct call patterns. Don't bloat the helper.
+### 1. Fix the callback flow (implicit → PKCE + cookie adapter)
 
-## Why not "fix it in `requireEnv` with a build-time codemod"?
+See §Live bug at handoff above for the full diagnosis. This is the
+P0: without it, no user can complete a sign-in. Fix is auth surface
+→ plan + council required. Scope ~30-50 LoC across two files plus a
+Supabase dashboard config change.
 
-Even more tempting if we had multiple client-side callers. We don't —
-only `browser.ts` is client-bundled. Two-line surgical fix beats
-codemod plumbing.
+### 2. Framework specialist council persona (issue #18)
 
-## Files changed
+**Why:** Three sequential PRs this session all landed on
+Next.js / Vercel framework-boundary issues (static vs dynamic rendering;
+middleware vs prerender timing; client-bundle inlining semantics). The
+existing six personas (a11y, arch, bugs, cost, product, security) reason
+about general code quality, not framework-specific footguns. Adding a
+seventh persona collapses the three-PR arc into one. Would ideally
+also catch the callback bug above before it hits production.
 
-1. **`packages/db/src/browser.ts`** *(modified)*
-   - Drop `requireEnv` import.
-   - Read both env vars via direct property access.
-   - Inline guard with a clear error message.
+Draft `.harness/council/framework.md` covering:
+- App Router static vs dynamic (`○` vs `ƒ`) and how it interacts with
+  middleware / cookies / headers / CSP.
+- Build-time vs runtime `process.env` access (literal vs dynamic).
+- Edge runtime vs Node.js runtime differences.
+- Hydration error reach (async / pre-hydration failures bypass
+  `error.tsx`).
+- RSC / Flight payload flow and inline-script nonce stamping.
+- Cache-Control × Vercel Edge interaction.
+- `NEXT_PUBLIC_` prefix semantics (the "accidental client secret"
+  class).
+- Server Component vs Client Component module-graph implications
+  (`server-only`, `'use client'`).
 
-2. **`packages/db/src/browser.test.ts`** *(if it exists; new otherwise)*
-   - Stub `process.env` with both vars set → `supabaseBrowser()`
-     returns a client without throwing.
-   - Stub `process.env` with `NEXT_PUBLIC_SUPABASE_URL` unset → throws
-     with the documented error message.
-   - Same with anon key unset.
+Include an explicit escape hatch: "if this diff does not touch
+Next.js / Vercel / React-server semantics, return `Score: 10` and
+`No framework concerns.`" — mitigates noise on DB migrations, pure
+styling changes, etc.
 
-## Verification plan
+Plan → PR → council r1 (the persona file is the thing being reviewed,
+so r1 will be self-referential but that's fine) → human approval →
+merge. `council.py` glob already scans `.harness/council/*.md` so no
+wiring change needed.
 
-Local (pre-push):
+### 3. Complete the sign-in → dashboard round trip
 
-1. `pnpm --filter @llmwiki/db run typecheck` clean.
-2. `pnpm --filter @llmwiki/db run test` passes (new browser tests).
-3. `pnpm --filter web run typecheck` clean.
-4. `pnpm --filter web run test` still 58/58.
-5. `env -i PATH="$PATH" HOME="$HOME" NEXT_PUBLIC_SUPABASE_URL='https://x.supabase.co' NEXT_PUBLIC_SUPABASE_ANON_KEY='anon' NODE_ENV=production npx next build` in `apps/web/` succeeds.
-6. After build, `grep -r 'x.supabase.co' apps/web/.next/static/chunks/app/auth/` finds the URL string in the auth chunk — confirms inlining happened.
+Once the button works:
+- Click magic link in email.
+- Land on `/auth/callback` (redirect-only route, excluded from
+  middleware).
+- Session cookie set; redirect to `/`.
+- Dashboard renders (cohort upsert, notes list, ingestion jobs).
+- Test a PDF upload end-to-end.
 
-Post-deploy (prod):
+This is the first real smoke test of the v0 vertical slice shipped
+in PR #5. If anything breaks on this path, it's the first real bug
+since the auth-flow blocker.
 
-7. `curl -s …/_next/static/chunks/app/auth/page-*.js | grep lhxokbbcojqtwvibbqfj` returns matches (currently zero).
-8. **Human clicks "Send magic link"** → either receives email or
-   sees a "Check your email" message. **Real test of the fix.**
-9. Human completes full sign-in round-trip and lands on dashboard.
+## Open issues queued by this session
 
-## Non-goals
+- **#18** — Framework persona (above; next session's #1).
+- **#19** — Five PR #17 council r4 nice-to-haves: client `AbortSignal`
+  timeout, null-byte email test, case-variant bucket test, multi-IP
+  XFF test, serial IP→email rate check.
+- **#20** — Playwright nonce smoke test. Would have prevented the
+  PR #17 dead-button bug if it had existed.
+- **#14** — CSP `report-uri` endpoint.
+- **#15** — `style-src` hardening (remove `'unsafe-inline'`).
+- **#12** — `/diag` removal + error-boundary production hardening.
+  Now that the full fix arc is green, `/diag` can be deleted.
+  Low-effort cleanup.
+- **#7** — `db-tests` pgTAP flake (still `continue-on-error`).
+- **#6** — Storage RLS metadata refactor (v0 deferral).
 
-- Refactoring all `requireEnv` callers. Only browser.ts is broken.
-- Adding a lint rule to forbid client-side `requireEnv`. Worth a
-  follow-up issue but not blocking.
-- Removing `/diag` (issue #12).
-- Hardening `style-src` (issue #15).
-- CSP `report-uri` (issue #14).
-- Playwright nonce smoke test (queued from PR #16's council r2).
+## Non-goals for next session
 
-## Non-negotiables
+- Feature work (v1 kickoff waits for confirmed end-to-end sign-in
+  + a PDF upload smoke test).
+- Merging any of the open issues above without their own plan +
+  council round.
+- Re-opening the CSP nonce design.
 
-- **Auth surface change.** Council required. No `[skip council]`.
-- Service-role key stays server-only (this fix touches only
-  the browser client; service-role is in server.ts, untouched).
-- Direct `process.env.NEXT_PUBLIC_*` access in client bundle is the
-  ONLY supported pattern. Future client-bundled env reads must
-  follow the same pattern; lint enforcement is a follow-up.
+## Opening protocol (per CLAUDE.md)
 
-## Rollback
-
-Revert the single commit on `main`. Browser auth returns to the
-current dead-button state — no worse, no better. The CSP nonce
-infrastructure (PRs #13, #16) is not affected.
-
-## Cost posture
-
-Zero new API calls. Zero new dependencies. The code path that runs
-when the user clicks "Send magic link" is unchanged in shape — only
-the env-read mechanism changes. Pure correctness fix.
-
-## Open question for council
-
-1. **Should we add a build-time assertion that `NEXT_PUBLIC_*`
-   vars resolve to non-empty strings, failing the build if not?**
-   Today, missing build-time vars surface only as a runtime click
-   failure. A failing build would be a stronger guard. Out of scope
-   here (would need a custom Next.js plugin or build script), but
-   worth a follow-up issue if the cohort grows.
-
-## Execution order
-
-Single small commit:
-
-1. Edit `packages/db/src/browser.ts` (the two-line replacement).
-2. Add `packages/db/src/browser.test.ts` (success + missing-url +
-   missing-key cases).
-3. Local verification (steps 1-6 above).
-4. Commit `fix(db): inline NEXT_PUBLIC_* env reads in client bundle`.
-5. Push → council r2.
-6. On PROCEED → human approval → merge.
-7. Post-merge prod verification (steps 7-9).
-8. Reflect in `.harness/learnings.md`.
+1. Read `.harness/session_state.json`.
+2. Read last ~20 lines of `.harness/yolo_log.jsonl`.
+3. Read the 2026-04-19 16:55 UTC block in `.harness/learnings.md`.
+4. Read this plan (§Next session's opener).
+5. Human will provide the end-to-end sign-in test result.
+6. If sign-in works → go to roadmap item #1 (framework persona).
+7. If sign-in fails → diagnose via Vercel Runtime Logs + `[magic-link]`
+   server-side error lines before spinning new council.
