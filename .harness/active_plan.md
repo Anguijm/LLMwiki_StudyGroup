@@ -83,6 +83,11 @@ log at `debug` level with no cookie values (council bugs r1) so the
 swallow isn't silent and a future maintainer misusing the adapter in
 a Server Component can find it.
 
+Debug log message must explicitly state the expected cause (council
+security r2): `"supabase: setAll failed — expected in Server Component
+context, ignoring"`. Never include cookie values or names in the log
+line.
+
 ### D. Harden `apps/web/app/auth/callback/route.ts`
 
 Catch `exchangeCodeForSession` failures explicitly. Map known Supabase
@@ -92,8 +97,23 @@ error shapes to kinds:
 - expired code → `token_expired`
 - 5xx / network → `server_error`
 - 200 OK with `data.session: null` → `server_error` (council bugs r1)
+- 200 OK with unparseable JSON body → `server_error` via the final
+  catch-all (council bugs r2)
 - any other thrown `Error` → `server_error` via a final catch-all so
   the route can never return a 500 (council bugs r1)
+
+**Redirect rules (non-negotiable, council bugs r2):** the success
+redirect destination is **hardcoded to `/`**. No query parameter
+(including `redirect_to`, `next`, `returnTo`, or any other caller-
+supplied value) may influence the destination URL. This closes the
+open-redirect vector the bugs persona flagged.
+
+**Input validation (defense-in-depth, council security r2):** before
+invoking `exchangeCodeForSession`, validate the `code` param against a
+plausible charset (URL-safe base64 alphabet: `[A-Za-z0-9_\-]`) and
+length bound (reject `<16` or `>2048` chars). Fail to `invalid_request`.
+This is belt-and-suspenders; Supabase also validates, but a malformed
+code should never reach the network.
 
 **Logging rules (non-negotiable):** never log `code`, `access_token`,
 or `refresh_token` under any branch. Log only the error kind + a
@@ -156,6 +176,9 @@ the checklist for any future environment.
 | whitespace-only `code` | same as missing |
 | `code` >4KB | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
 | `code` contains null byte / non-URL-safe chars | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
+| `code` outside URL-safe base64 alphabet (e.g. `foo'bar"baz<qux>`) | 302 `/auth?error=invalid_request`, stub NOT called (council bugs r2) |
+| `code` valid + extraneous `redirect_to=https://evil.com` | 302 to `/` (hardcoded), NOT to the supplied URL (council bugs r2 — open-redirect guard) |
+| stub returns 200 with unparseable JSON body | 302 `/auth?error=server_error` via final catch-all (council bugs r2) |
 | any failure branch | `console.error` spy sees no call whose args contain `code` / `access_token` / `refresh_token` (council r1) |
 
 ## Non-negotiables (inherited + council r1)
@@ -186,6 +209,15 @@ Added by council r1:
 - **[a11y]** Error message MUST meet WCAG AA 4.5:1 contrast against
   background. Verify at implementation.
 
+Added by council r2:
+
+- **[bugs]** Success-redirect destination is **hardcoded to `/`**.
+  No caller-supplied query param (`redirect_to`, `next`, etc.) may
+  influence the target URL. Tested by the extraneous-param row in
+  the matrix above. Open-redirect guard.
+- **[bugs]** Unparseable JSON from `exchangeCodeForSession` maps to
+  `server_error` via the final catch-all; explicit test row required.
+
 ## Rollback
 
 Revert the PR. User returns to current state: email delivers, sign-in
@@ -205,6 +237,13 @@ or change RLS.
   (council a11y r1 noted this as a nice-to-have, not a blocker).
 - `pnpm audit` in CI. Council security r1 nice-to-have; separate
   issue if we want it.
+- **`Set-Cookie` header exceeding browser max size.** Council bugs
+  r2 flagged this as a theoretical failure mode (browser silently
+  drops oversize cookies). Cookie name and size are controlled by
+  `@supabase/ssr`, which splits large sessions into chunked cookies
+  under the 4KB-per-cookie browser limit. Not mitigable in our code.
+  If sessions routinely exceed limits, that's a Supabase-library
+  issue to escalate — out of scope for this P0.
 - Any v1 feature work.
 
 ## Success + kill criteria (council product r1)
@@ -218,12 +257,17 @@ or change RLS.
   24h after merge, revert the PR.
 - **Cost:** $0 marginal. Supabase Auth is MAU-billed, not per-call.
 
-## Council r1 synthesis
+## Council history
 
-Verdict **PROCEED** with the four additions above folded in. Scores
-a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. No
-non-negotiable violations. Full report:
-[PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
+- **r1** (PR #22 @ commit `1ae040f`, 2026-04-19T18:48:54Z) — PROCEED,
+  a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Four
+  new non-negotiables folded into this plan.
+- **r2** (PR #22 @ commit `ea3fc8a`, 2026-04-19T18:56:52Z) — PROCEED,
+  a11y **9** / arch 10 / bugs 9 / cost 10 / product 10 / security 9.
+  Five additions folded: open-redirect guard, unparseable-JSON test,
+  special-char code test, debug-log wording, defense-in-depth
+  charset/length validation on `code`. Full report:
+  [PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
 
 ## Approval checklist (CLAUDE.md gate)
 
