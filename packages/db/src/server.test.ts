@@ -53,13 +53,13 @@ describe('packages/db/src/server — module import', () => {
   });
 });
 
-describe('supabaseServer()', () => {
+describe('createSupabaseClientForJobs()', () => {
   for (const [label, value] of MISSING_VALUES) {
     it(`throws when NEXT_PUBLIC_SUPABASE_URL is ${label}`, async () => {
       setValid();
       vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', value as string);
-      const { supabaseServer } = await import('./server');
-      expect(() => supabaseServer('cookie=x')).toThrowError(
+      const { createSupabaseClientForJobs } = await import('./server');
+      expect(() => createSupabaseClientForJobs('cookie=x')).toThrowError(
         /NEXT_PUBLIC_SUPABASE_URL/,
       );
     });
@@ -67,8 +67,8 @@ describe('supabaseServer()', () => {
     it(`throws when NEXT_PUBLIC_SUPABASE_ANON_KEY is ${label}`, async () => {
       setValid();
       vi.stubEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY', value as string);
-      const { supabaseServer } = await import('./server');
-      expect(() => supabaseServer('cookie=x')).toThrowError(
+      const { createSupabaseClientForJobs } = await import('./server');
+      expect(() => createSupabaseClientForJobs('cookie=x')).toThrowError(
         /NEXT_PUBLIC_SUPABASE_ANON_KEY/,
       );
     });
@@ -76,10 +76,45 @@ describe('supabaseServer()', () => {
 
   it('returns a client when both required vars are set', async () => {
     setValid();
-    const { supabaseServer } = await import('./server');
-    const client = supabaseServer('cookie=x');
+    const { createSupabaseClientForJobs } = await import('./server');
+    const client = createSupabaseClientForJobs('cookie=x');
     expect(client).toBeDefined();
     expect(typeof (client as { from?: unknown }).from).toBe('function');
+  });
+});
+
+describe('createSupabaseClientForRequest()', () => {
+  const noopCookies = {
+    getAll: () => [],
+    setAll: () => undefined,
+  };
+
+  for (const [label, value] of MISSING_VALUES) {
+    it(`throws when NEXT_PUBLIC_SUPABASE_URL is ${label}`, async () => {
+      setValid();
+      vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', value as string);
+      const { createSupabaseClientForRequest } = await import('./server');
+      expect(() => createSupabaseClientForRequest(noopCookies)).toThrowError(
+        /NEXT_PUBLIC_SUPABASE_URL/,
+      );
+    });
+
+    it(`throws when NEXT_PUBLIC_SUPABASE_ANON_KEY is ${label}`, async () => {
+      setValid();
+      vi.stubEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY', value as string);
+      const { createSupabaseClientForRequest } = await import('./server');
+      expect(() => createSupabaseClientForRequest(noopCookies)).toThrowError(
+        /NEXT_PUBLIC_SUPABASE_ANON_KEY/,
+      );
+    });
+  }
+
+  it('returns a client configured for PKCE when vars + adapter are provided', async () => {
+    setValid();
+    const { createSupabaseClientForRequest } = await import('./server');
+    const client = createSupabaseClientForRequest(noopCookies);
+    expect(client).toBeDefined();
+    expect(typeof (client as { auth?: unknown }).auth).toBe('object');
   });
 });
 
