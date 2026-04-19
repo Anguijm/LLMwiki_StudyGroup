@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   makeTokenBudgetLimiter,
   makeIngestEventLimiter,
+  makeMagicLinkLimiter,
   RateLimitExceededError,
   RatelimitUnavailableError,
   TOKEN_BUDGET_PER_HOUR,
@@ -104,5 +105,16 @@ describe('ingest event limiter', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
     const lim = makeIngestEventLimiter({ redis: redis as any });
     await expect(lim.reserve('u1')).rejects.toBeInstanceOf(RatelimitUnavailableError);
+  });
+});
+
+describe('magic link limiter', () => {
+  it('throws RatelimitUnavailable on upstash failure (fail closed)', async () => {
+    const redis = { eval: async () => { throw new Error('down'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeMagicLinkLimiter({ redis: redis as any });
+    await expect(lim.reserve('1.2.3.4', 'x@y.z')).rejects.toBeInstanceOf(
+      RatelimitUnavailableError,
+    );
   });
 });
