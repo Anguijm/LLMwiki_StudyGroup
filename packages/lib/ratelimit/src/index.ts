@@ -17,7 +17,11 @@ import { requireEnv } from '@llmwiki/lib-utils/env';
 export class RateLimitExceededError extends Error {
   override readonly name = 'RateLimitExceededError';
   constructor(
-    public readonly kind: 'ingest_events' | 'token_budget',
+    public readonly kind:
+      | 'ingest_events'
+      | 'token_budget'
+      | 'magic_link_ip'
+      | 'magic_link_email',
     public readonly resetsAt: Date,
   ) {
     super(`rate limit exceeded: ${kind}; resets at ${resetsAt.toISOString()}`);
@@ -132,4 +136,66 @@ export function makeTokenBudgetLimiter(deps: RateLimitDeps = {}) {
   }
 
   return { reserve, refund };
+}
+
+// ----- Tier C: magic-link auth limiter (anonymous endpoint) ---------------
+//
+// Magic-link requests come in unauthenticated (the point of the flow is to
+// identify the user via email), so the other two tiers' per-user key won't
+// work. This tier keys by BOTH client IP and normalized email with
+// independent counters — per-IP stops a single source from flooding the
+// email provider; per-email stops a targeted attacker from spraying a
+// single inbox.
+//
+// Limits are intentionally low. A real user hits this button a handful of
+// times per session at most. Rate-limiter resolution is per-hour.
+
+export const MAGIC_LINK_PER_IP_PER_HOUR = 5;
+export const MAGIC_LINK_PER_EMAIL_PER_HOUR = 3;
+
+export function makeMagicLinkLimiter(deps: RateLimitDeps = {}) {
+  const redis = makeRedis(deps);
+  const ipLimiter = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(MAGIC_LINK_PER_IP_PER_HOUR, '1 h'),
+    analytics: false,
+    prefix: 'rl:magiclink:ip',
+  });
+  const emailLimiter = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(MAGIC_LINK_PER_EMAIL_PER_HOUR, '1 h'),
+    analytics: false,
+    prefix: 'rl:magiclink:email',
+  });
+
+  /**
+   * Check-and-decrement both counters. Throws:
+   *   - RateLimitExceededError('magic_link_ip') if IP is over the limit.
+   *   - RateLimitExceededError('magic_link_email') if email is over the limit.
+   *   - RatelimitUnavailableError if Upstash is unreachable (fail-closed).
+   *
+   * `ip` should be the first entry of X-Forwarded-For (trimmed). `email`
+   * must be normalized (trimmed + `.toLocaleLowerCase('en-US')`) before
+   * calling so the per-email bucket is stable against casing drift.
+   */
+  async function reserve(ip: string, email: string): Promise<void> {
+    let ipRes: Awaited<ReturnType<typeof ipLimiter.limit>>;
+    let emailRes: Awaited<ReturnType<typeof emailLimiter.limit>>;
+    try {
+      [ipRes, emailRes] = await Promise.all([
+        ipLimiter.limit(ip),
+        emailLimiter.limit(email),
+      ]);
+    } catch {
+      throw new RatelimitUnavailableError();
+    }
+    if (!ipRes.success) {
+      throw new RateLimitExceededError('magic_link_ip', new Date(ipRes.reset));
+    }
+    if (!emailRes.success) {
+      throw new RateLimitExceededError('magic_link_email', new Date(emailRes.reset));
+    }
+  }
+
+  return { reserve };
 }

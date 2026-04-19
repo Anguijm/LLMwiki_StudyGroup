@@ -1,9 +1,10 @@
 'use client';
 
-// Magic-link sign-in page. Kept intentionally minimal — OAuth is a v1
-// addition with its own plan + council round.
+// Magic-link sign-in. The actual Supabase call lives server-side at
+// /api/auth/magic-link; this form POSTs to that route so rate-limiting
+// runs on the server and the email channel can't be flooded by a looping
+// client. OAuth is a v1 addition with its own plan + council round.
 import { useState } from 'react';
-import { supabaseBrowser } from '@llmwiki/db/browser';
 
 export default function AuthPage() {
   const [email, setEmail] = useState('');
@@ -17,15 +18,27 @@ export default function AuthPage() {
     setErr(null);
     setPending(true);
     try {
-      const supabase = supabaseBrowser();
-      const { error } = await supabase.auth.signInWithOtp({
-        email,
-        options: { emailRedirectTo: `${location.origin}/auth/callback` },
+      const res = await fetch('/api/auth/magic-link', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email }),
       });
-      if (error) setErr(error.message);
-      else setSent(true);
+      if (res.ok) {
+        setSent(true);
+        return;
+      }
+      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      const message =
+        data?.error && typeof data.error === 'string' && data.error.length > 0
+          ? data.error
+          : 'Unexpected error sending magic link.';
+      setErr(message);
     } catch (caught) {
-      setErr(caught instanceof Error ? caught.message : 'Unexpected error sending magic link.');
+      setErr(
+        caught instanceof Error && caught.message.length > 0
+          ? caught.message
+          : 'Unexpected error sending magic link.',
+      );
     } finally {
       setPending(false);
     }
@@ -52,7 +65,7 @@ export default function AuthPage() {
         onChange={(e) => setEmail(e.target.value)}
         aria-describedby={err ? 'auth-error' : undefined}
         disabled={pending}
-        className="mt-1 block w-full border border-brand-100 rounded-md px-3 py-2 min-h-[44px] disabled:opacity-60"
+        className="mt-1 block w-full border border-brand-100 rounded-md px-3 py-2 min-h-[44px] disabled:bg-brand-50 disabled:text-brand-700 disabled:cursor-not-allowed"
       />
       {err && (
         <p id="auth-error" role="alert" aria-live="assertive" className="mt-2 text-danger text-sm">
@@ -63,7 +76,7 @@ export default function AuthPage() {
         type="submit"
         disabled={pending}
         aria-busy={pending}
-        className="mt-4 bg-brand-900 text-white px-4 py-2 rounded-md min-h-[44px] disabled:opacity-60 disabled:cursor-not-allowed"
+        className="mt-4 bg-brand-900 text-white px-4 py-2 rounded-md min-h-[44px] disabled:bg-brand-700 disabled:cursor-not-allowed"
       >
         {pending ? 'Sending…' : 'Send magic link'}
       </button>

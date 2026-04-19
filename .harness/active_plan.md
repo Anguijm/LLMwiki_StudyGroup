@@ -1,4 +1,19 @@
-# Plan: inline NEXT_PUBLIC_* env reads in client-bundled supabaseBrowser
+# Plan: rate-limited server-side /api/auth/magic-link + client env-read fix
+
+## Revision history
+
+- r1 (committed dac32af): client-side `requireEnv` → direct `process.env.*`
+  in `packages/db/src/browser.ts`; UX hardening on `/auth/page.tsx`.
+  Council r2: **REVISE** 8/10/9/10/10/**3** — security blocker: re-enabling
+  `signInWithOtp` client-side without application-level rate limit exposes
+  email-flooding attack surface.
+- r2 (this revision): moves the Supabase Auth call to a new server-side
+  route `apps/web/app/api/auth/magic-link/route.ts`, rate-limited via new
+  Tier C in `@llmwiki/lib-ratelimit`. `/auth/page.tsx` now `fetch()`s the
+  route. `browser.ts` fix retained (other client code depends on it). All
+  r1 UX hardening retained.
+
+# Plan r2: rate-limited /api/auth/magic-link + client env-read fix
 
 ## Status
 
