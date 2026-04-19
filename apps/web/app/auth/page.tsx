@@ -27,11 +27,25 @@ export default function AuthPage() {
         setSent(true);
         return;
       }
-      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      // 4xx / 5xx: try JSON first, fall back to status-only message if
+      // the body isn't JSON (e.g. a Vercel HTML error page). Log raw
+      // status + a text snippet so devtools can see more context than
+      // the generic user-facing string.
+      let data: { error?: string } | null = null;
+      try {
+        data = (await res.json()) as { error?: string };
+      } catch {
+        const rawText = await res.text().catch(() => '');
+        console.error(
+          '[/auth] non-JSON response from /api/auth/magic-link',
+          res.status,
+          rawText.slice(0, 200),
+        );
+      }
       const message =
         data?.error && typeof data.error === 'string' && data.error.length > 0
           ? data.error
-          : 'Unexpected error sending magic link.';
+          : `Request failed (${res.status}). Please try again.`;
       setErr(message);
     } catch (caught) {
       setErr(
