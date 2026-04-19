@@ -7,6 +7,17 @@ export const metadata: Metadata = {
   description: 'Cohort study wiki',
 };
 
+// SECURITY: required for the per-request CSP nonce in apps/web/middleware.ts
+// to land on every page. Static prerendering bakes HTML at build time, before
+// middleware runs, so nonces can't be stamped on script tags. Under our
+// `script-src 'nonce-...' 'strict-dynamic'` CSP, scripts without the matching
+// nonce are blocked, which breaks React hydration and silently leaves
+// interactive pages dead (e.g. /auth's magic-link button does nothing).
+// Children that don't need hydration can opt back in to static generation
+// via their own `export const dynamic = 'force-static'` (see /diag).
+// Do not remove without first removing the CSP nonce middleware.
+export const dynamic = 'force-dynamic';
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
