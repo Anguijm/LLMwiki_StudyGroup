@@ -209,3 +209,36 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 - 3 rounds on the plan (r1 REVISE → r2 PROCEED + synthesis adjustments → r3 PROCEED + tiny refinements). Scores: `a11y/arch/cost/product/security=10`; `bugs=9→9→9` with each round catching a new class (empty-string validation → locale-aware lowercasing). Net: the bugs reviewer consistently surfaces small-but-real improvements; the 9 is a feature not a bug.
 - Execution planned in 3 batches (shared util + DB refactor + regression test / audit + other packages / runbook). Pushed batches A and B; batch C lands the runbook and this reflection.
 - Council workflow PROCEEDed on r3 with zero non-negotiables. Lead Architect synthesis was adopted as the source of truth; r3 of the plan folded the synthesis changes into written form so plan-on-disk matches what gets executed.
+
+## 2026-04-19 09:00 UTC — deploy-readiness executed + blank-page debug (session handoff)
+
+### KEEP
+
+- **Plan-first discipline paid off again.** Three council rounds on the plan (r1 REVISE → r2 PROCEED + synthesis → r3 PROCEED + refinements) plus one council round on the final executed diff (r4 PROCEED 10/10/10/10/10/10). Each round caught a real class of bug: r1 empty-string env values, r2 shared `requireEnv` utility, r3 locale-aware lowercasing. None of these were speculative nitpicks.
+- **Running `next build` locally with a fully-scrubbed env** via `env -i PATH="$PATH" HOME="$HOME" npx next build` reproduces Vercel's exact failure mode and verifies the fix before pushing. Saved at least one full CI round this session.
+- **Batched execution** (Batch A: shared util + DB refactor + regression test; Batch B: PDF parser + ratelimit + Inngest call-sites; Batch C: README runbook + .env.example + reflection) matched the plan's §ordering and let council review each batch's diff without re-reviewing the whole PR every push.
+- **Conversational handoff to the human on live-env provisioning** (Supabase dashboard walkthrough, Vercel Root Directory + Framework Preset fixes, Vercel marketplace Inngest integration) unblocked the deploy despite the human having no terminal access. Key pattern: when a CLI can't run, walk the human through the dashboard equivalent with exact URLs and literal click paths.
+
+### IMPROVE
+
+- **I ran the user through devtools steps on mobile before realizing my sandbox has network egress and can curl the page myself.** Wasted ~5 rounds of the user's time. **Rule: before asking the user to run any diagnostic that produces information I could fetch from my sandbox, curl/WebFetch first.** Applies to page content, headers, CSS assets, JS chunks, commit status, CI runs, anything web-accessible.
+- **I wrote `reproduce.mjs` as a diagnostic in `apps/web/tests/` and left it uncommitted**, which the stop-hook flagged. Throwaway diagnostic files belong in `/tmp/`, not in the repo tree. When testing a browser interaction inside a workspace package (for dep resolution), write to a gitignored or `/tmp/` location and import from absolute paths.
+- **I didn't anticipate that Vercel wouldn't auto-detect a monorepo with `apps/web` as the Next.js project.** The "No Output Directory named public" error required setting Root Directory = `apps/web` + Framework Preset = Next.js. Should have included this in the README runbook's Vercel section explicitly. **Tracked for next-session: amend README runbook step C to document these two Vercel settings.**
+- **The "process.env[dynamic_key]" gotcha**: Next.js can't inline `NEXT_PUBLIC_*` vars when the key is a runtime variable. The `requireEnv(name)` helper I wrote has this property — on the client bundle, `process.env` is an empty shim and `requireEnv('NEXT_PUBLIC_SUPABASE_URL')` returns `undefined` → throws "missing or empty". This works correctly in that it fails loudly (by design), but may contribute to the live /auth blank-page bug if a form submit triggers it in an async handler that React can't catch. **Worth investigating in the next session as one of the root-cause candidates.**
+
+### INSIGHT
+
+- **Error boundaries don't catch DOM-wiping bugs that aren't React render errors.** Added `error.tsx` + `global-error.tsx` expecting to surface the blank-page crash, but they didn't trigger. Either React didn't throw (so the DOM is being wiped by something external to React's reconciler) or the error happens in an async event handler that React's error boundaries don't see. **Reminder: error boundaries cover render-time + effect-time throws ONLY. Async errors in event handlers go to `window.onerror` / `unhandledrejection`, not to `error.tsx`.**
+- **Pure server-component diagnostic pages** (`export const dynamic = 'force-static'`, zero imports from workspace packages) are a clean way to isolate "is it the page code or the environment?" bugs. Kept in the repo at `/app/diag/page.tsx` for next session; cheap to add, cheap to remove after root-cause.
+- **Vercel's `x-vercel-cache: HIT` with `age: 7673`** doesn't mean the content is stale — the immutable chunk URLs make stale HTML self-healing as long as the referenced chunks are still deployed. The user's blank-page problem is NOT a Vercel edge cache issue (I confirmed by `curl -sL` returning the fresh post-merge HTML).
+- **Sandbox egress proxies can return 503 "DNS cache overflow"** intermittently. When my curls stopped working mid-session, it was a sandbox-side networking glitch, not the target site. Retry-with-backoff is the right response, not assuming the site is down.
+- **GitHub MCP tool surface has no direct "combined commit status" call** — only per-PR check runs. For post-merge deploys, Vercel posts status back to the original PR comment (same `vercel[bot]` issue comment gets updated) rather than creating a new one. Knowing which tool-call returns what avoids wasted round-trips.
+
+### COUNCIL
+
+- **r1 REVISE** (bugs 9, others 10): empty-string env values must fail the guard. Council-discovered blocker.
+- **r2 PROCEED** (bugs 9, others 10): synthesis added shared `@llmwiki/lib-utils` utility + PDF-parser config-aware key validation. Both folded into r3 plan without push-back.
+- **r3 PROCEED** (bugs 9, others 10): synthesis added `.toLocaleLowerCase('en-US')` for Turkish-I locale safety + expanded whitespace test matrix to include `\n` and `\t`.
+- **r4 PROCEED on executed diff** (10/10/10/10/10/10 for the first time this PR): all prior must-dos implemented. Zero non-negotiables, zero must-dos, zero edge cases flagged. Clean merge.
+- **PR #9 and PR #10** (diagnostics) merged `[skip council]` as live-incident scaffolding. Both tracked for cleanup in next session's plan.
+- **Key council credit**: the bugs reviewer's 9/10 across all three rounds was not noise. Every round surfaced a real new improvement. The "bugs 9" pattern is a feature of this council surface — it reliably finds one more thing every round.

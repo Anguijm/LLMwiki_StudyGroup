@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "active_plan": ".harness/active_plan.md",
-  "focus_area": "PR #8 deploy-readiness: lazy env guards + runbook",
-  "approval_state": "executing",
-  "last_council": "2026-04-18T15:13:04+00:00 (PROCEED on plan r3 @ 2a1dd65; approved by human; batches A + B pushed; batch C landing runbook + reflection)",
+  "focus_area": "Session handoff — deploy-readiness landed, /auth blank-page bug pending /diag test",
+  "approval_state": "handoff",
+  "last_council": "2026-04-18T15:32:22+00:00 (PROCEED 10/10/10/10/10/10 on PR #8 executed diff; PRs #9 and #10 merged [skip council] as live-incident diagnostics)",
   "last_commit": null,
-  "notes": "PR #8 executes the deploy-readiness plan. Batch A (a569361): shared @llmwiki/lib-utils requireEnv + lazy DB factories + route-module-load regression test. Batch B (f02c44c): config-aware resolvePdfParser in lib-ai + requireEnv adoption in ratelimit + inngest-pdf step. Batch C pending: README deploy runbook + .env.example comments + learnings reflection. After merge, human follows the runbook to set Vercel env vars, push migrations via supabase db push, install Inngest Vercel integration, and smoke-test PDF upload. v1 tracking issues #6 (Storage RLS metadata) + #7 (db-tests pgTAP fixture) still open."
+  "notes": "PR #8 (06ae4da) merged: lazy env guards via @llmwiki/lib-utils, config-aware resolvePdfParser, route-module-load regression test, README deploy runbook. PR #9 (951299d): error boundaries. PR #10 (db31445): /diag static diagnostic page. LIVE BUG: /auth renders form briefly then goes blank; URL stays /auth; same in incognito; error boundaries did not trigger (so not a React crash). Supabase fully provisioned (8 tables, ingest bucket, default cohort, auth redirects). Vercel has 9 of 13 env vars set; missing VOYAGE_API_KEY, APP_BASE_URL, and the Inngest integration (which auto-populates INNGEST_EVENT_KEY + INNGEST_SIGNING_KEY). Vercel project settings fixed: Root Directory=apps/web, Framework Preset=Next.js. Next session opens with the /diag test result — if /diag renders, bug is in /auth client code (supabaseBrowser chain); if /diag also blank, bug is in layout/env. See .harness/active_plan.md for the full handoff plan."
 }
