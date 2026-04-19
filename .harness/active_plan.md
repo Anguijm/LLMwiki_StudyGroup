@@ -21,16 +21,98 @@ Verified in prod via curl:
 - Human tested the button: first deploy (post PR #17) response
   unverified as of handoff — user to confirm next session.
 
+## Live bug at handoff (verified after merge)
+
+**Symptom:** Magic-link email arrives and looks correct. Clicking the
+"Confirm" link in the email redirects the user back to `/auth` with
+the tokens in a URL fragment:
+
+```
+https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&token_type=bearer&type=signup
+```
+
+Session is NOT persisted — refresh `/auth` and the user is still
+logged out.
+
+**Root cause (two separate bugs):**
+
+1. **Flow mismatch — implicit vs PKCE.** Supabase is configured with
+   the default `flowType: 'implicit'` (tokens posted to the URL
+   fragment for client-side JS to parse). Our `/auth/callback`
+   expects `flowType: 'pkce'` (a `?code=...` query param that the
+   server exchanges via `exchangeCodeForSession`). `type=signup` in
+   the fragment also indicates Supabase treated this as a
+   first-time signup, not a returning magic-link sign-in — the
+   "Confirm signup" template runs by default, not "Magic Link". The
+   two templates can be configured separately in the Supabase
+   dashboard.
+
+2. **Cookie adapter is read-only.** Even once PKCE is enabled and
+   `/auth/callback?code=...` gets hit, the existing `supabaseServer`
+   factory (`packages/db/src/server.ts:27-34`) uses
+   `@supabase/supabase-js`'s `createClient` with `persistSession:
+   false` and a cookies-as-string input. It can READ the Cookie
+   header but has no way to WRITE Set-Cookie on the response. So
+   `exchangeCodeForSession` succeeds against Supabase Auth, gets a
+   valid session back, and drops it on the floor. The user bounces
+   right back to `/auth` via the dashboard's "no session → redirect
+   to /auth" guard.
+
+**Fix (both required, one PR is cleanest):**
+
+A. In `packages/db/src/server.ts`, add a new factory
+   `supabaseServerWithCookies(adapter)` that uses `@supabase/ssr`'s
+   `createServerClient` with a full getAll/setAll cookies adapter.
+   Keep the existing `supabaseServer(cookieHeader: string)` around for
+   Inngest callers that don't have a response to write cookies to.
+   Set `flowType: 'pkce'` on the new factory.
+
+B. In `apps/web/lib/supabase.ts`, have `supabaseForRequest()` use the
+   new factory, constructing the adapter from `next/headers`'s
+   `cookies()`. Wrap the `setAll` in a try/catch — Server Components
+   can't set cookies, only route handlers + server actions can, and
+   the documented pattern swallows the error in the Server Component
+   path.
+
+C. In the Supabase dashboard, verify the **email templates** for both
+   "Confirm signup" and "Magic Link" use the PKCE redirect URL
+   format. Default templates send the tokens in the URL fragment; for
+   PKCE they must instead point at `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`
+   or equivalent. This is a dashboard change, not code. Document in
+   `README.md` so the runbook catches it.
+
+D. Regression test: an integration test that stubs
+   `exchangeCodeForSession` and asserts a Set-Cookie header is
+   present on the callback's redirect response. Without this test,
+   the cookie-write regression would re-surface silently on any
+   future auth refactor.
+
+**Rollback:** Revert the PR. User is back to current state (email
+delivers, but sign-in never completes). No additional regressions.
+
+**Why this was never caught until now:** The magic-link button itself
+was broken all session (PRs #13 → #17 were fixing the send side).
+This is the FIRST successful magic-link email we've ever sent, so the
+callback flow has been untested since v0 scaffold (PR #5).
+
 ## Next session's opener (priority order)
 
-### 1. Framework specialist council persona (issue #18)
+### 1. Fix the callback flow (implicit → PKCE + cookie adapter)
 
-**Why this is #1:** Three sequential PRs this session all landed on
+See §Live bug at handoff above for the full diagnosis. This is the
+P0: without it, no user can complete a sign-in. Fix is auth surface
+→ plan + council required. Scope ~30-50 LoC across two files plus a
+Supabase dashboard config change.
+
+### 2. Framework specialist council persona (issue #18)
+
+**Why:** Three sequential PRs this session all landed on
 Next.js / Vercel framework-boundary issues (static vs dynamic rendering;
 middleware vs prerender timing; client-bundle inlining semantics). The
 existing six personas (a11y, arch, bugs, cost, product, security) reason
 about general code quality, not framework-specific footguns. Adding a
-seventh persona collapses the three-PR arc into one.
+seventh persona collapses the three-PR arc into one. Would ideally
+also catch the callback bug above before it hits production.
 
 Draft `.harness/council/framework.md` covering:
 - App Router static vs dynamic (`○` vs `ƒ`) and how it interacts with
@@ -55,14 +137,6 @@ Plan → PR → council r1 (the persona file is the thing being reviewed,
 so r1 will be self-referential but that's fine) → human approval →
 merge. `council.py` glob already scans `.harness/council/*.md` so no
 wiring change needed.
-
-### 2. Confirm the button works end-to-end
-
-User's browser test of the merged `/auth` form is the real success
-metric for the whole three-PR arc. If the button still doesn't work,
-check the `[magic-link]` server log lines (new in PR #17) — upstream
-Supabase / Upstash errors are now logged with full context. Vercel
-Functions → Runtime Logs → filter for `[magic-link]`.
 
 ### 3. Complete the sign-in → dashboard round trip
 

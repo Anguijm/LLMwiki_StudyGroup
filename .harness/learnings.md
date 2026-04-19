@@ -278,3 +278,25 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 - **Codex P2 reviews**: caught the `/diag` `force-static` override deviation in PR #16 r1 (already caught by my local build; my commit message documented it). Caught a weakened whitespace validation in PR #17 plan prose vs my actual implementation (already correct in code). Codex is useful for consistency checks but doesn't replace council's security / framework / a11y axes.
 - **Total council spend this session:** ~11 rounds × 7 calls = ~77 calls. CALL_CAP is 15 per run; monthly cap is separate. Well within budget.
 
+
+## 2026-04-19 17:15 UTC — callback flow bug (deferred to next session)
+
+### KEEP
+
+- **The first successful test of a feature often reveals the next layer of bugs.** PRs #13 → #17 fixed everything needed to SEND a magic link. The first click on the link exposed that the RECEIVE side (callback → session persistence → dashboard redirect) was never actually wired up correctly. Pattern: "green CI ≠ working feature" — end-to-end user tests are the real validation.
+- **A URL with tokens in a fragment (`#access_token=...&type=signup`) is diagnostic of Supabase implicit-flow default + signup email template.** Saved ~20 min of hypothesis-testing by reading the URL shape directly.
+
+### IMPROVE
+
+- **Should have anticipated this.** PR #17's scope was "rate-limited server-side magic-link send." I didn't audit the callback side because it looked unchanged. But the callback side had been broken since PR #5 (v0 scaffold) — nobody noticed because the send side was broken worse. Default rule: when shipping a fix for one half of a two-step user flow, explicitly verify the OTHER half is already wired correctly before declaring done.
+
+### INSIGHT
+
+- **Supabase `createClient` from `@supabase/supabase-js` is NOT the right client for Next.js SSR.** It can read cookies (via the `global.headers.cookie` escape hatch) but cannot WRITE Set-Cookie on the response. For any route handler that calls `exchangeCodeForSession`, `signInWithPassword`, or anything that creates a session, use `@supabase/ssr`'s `createServerClient` with a full getAll/setAll cookies adapter. The `@supabase/ssr` package exists specifically to bridge this gap.
+- **Supabase default `flowType` is `'implicit'`.** The tokens land in a URL fragment (`#access_token=...`). PKCE (`flowType: 'pkce'`) is the more secure modern pattern and what our `/auth/callback` expects. The server-side client option must match the Supabase project's email-template configuration; changing one without the other produces the bug we just saw.
+- **Supabase treats a first-ever `signInWithOtp` as a signup, not a sign-in.** The `type=signup` in the fragment matters: Supabase uses a DIFFERENT email template ("Confirm signup" vs "Magic Link"). Both templates must be configured for PKCE independently; fixing one leaves the other broken for the other user path.
+
+### COUNCIL
+
+- Zero council rounds this entry — diagnosis only, no code changes.
+

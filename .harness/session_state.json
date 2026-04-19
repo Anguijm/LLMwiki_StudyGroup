@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "active_plan": ".harness/active_plan.md",
-  "focus_area": "CSP + auth bug arc shipped (PRs #13 #16 #17 merged). Next session opens with framework council persona (issue #18).",
+  "focus_area": "CSP + auth button arc shipped (PRs #13 #16 #17). NEW P0: callback flow bug found on first real magic-link test — Supabase implicit flow + read-only cookie adapter means sign-in never completes. Next session must fix callback BEFORE anything else, including the framework persona (#18).",
   "approval_state": "handoff",
   "last_council": "2026-04-19T16:48:53+00:00 (PR #17 r4 PROCEED 8/10/9/10/10/9 on executed diff; zero non-negotiable violations)",
   "last_commit": null,
