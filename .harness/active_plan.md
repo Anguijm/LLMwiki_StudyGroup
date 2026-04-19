@@ -1,202 +1,254 @@
-# Session handoff: deploy-readiness landed, /auth blank-page bug under diagnosis
+# Plan: CSP-nonce middleware to unblock Next.js App Router hydration
 
-## Status
+## Problem
 
-- r1: REVISE. a11y 7 / arch 9 / bugs 5 / cost 10 / product 10 / security 9.
-  Council synthesis added 8-step ordered execution plan, three security
-  non-negotiables, and concretized the likely root cause (dynamic
-  `process.env[key]` not inlined by Next.js client bundle).
-- r2 folds:
-  - Council's 8-step execution order into §Next-session roadmap (below).
-  - README runbook amended this session with Vercel Root Directory +
-    Framework Preset (council non-negotiable; own learnings flagged).
-  - error.tsx + global-error.tsx: `aria-live="assertive"` added (a11y gap).
-  - GH tracking issue for `/diag` removal + error-boundary production
-    hardening (council security non-negotiable).
+Production pages (`/`, `/auth`, `/diag`) render their server HTML, paint
+briefly in the browser, then go blank. The handoff plan hypothesised a
+client-side `requireEnv` issue in `/auth`. That hypothesis was wrong:
+`/diag` (pure server component, zero workspace imports, inline styles,
+no client JS of its own) reproduces the same blank-page symptom on the
+user's device.
 
-## What shipped this session (PRs merged to `main`)
+## Root cause (confirmed this session)
 
-1. **PR #8** (`06ae4da`) — **deploy-readiness**:
-   - New `@llmwiki/lib-utils` workspace package with `requireEnv` helper
-     (rejects nullish, empty, whitespace-only incl. `\n`, `\t`).
-   - `packages/db/src/{server,browser}.ts`: env guards moved from module
-     top-level into factory-invocation time. Vercel build failure
-     ("NEXT_PUBLIC_SUPABASE_URL missing at Collecting page data") fixed.
-   - `packages/lib/ai/pdfparser.ts`: `resolvePdfParser()` with
-     config-aware key validation and `.toLocaleLowerCase('en-US')`.
-   - `packages/lib/ratelimit` + `inngest/src/functions/ingest-pdf.ts`:
-     `requireEnv` adoption.
-   - `apps/web/tests/unit/route-module-load.test.ts`: CI guardrail.
-   - README "Deploy runbook" section (A–G).
-   - Council arc: r1 REVISE → r2 PROCEED → r3 PROCEED → **r4 PROCEED
-     10/10/10/10/10/10** on executed diff.
+`apps/web/next.config.js:12-23` ships a static CSP header:
 
-2. **PR #9** (`951299d`) — **error boundaries** (`error.tsx`, `global-error.tsx`).
-   Merged `[skip council]` as live-incident diagnostic.
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; ...
+```
 
-3. **PR #10** (`db31445`) — **/diag static control page** for isolating
-   the blank-page bug. Merged `[skip council]`.
+Next.js 15 App Router emits inline `<script>` tags to ship the React
+Flight payload to the client (verified by `curl -sL` against `/diag`):
 
-## Live-environment state at handoff
+```html
+<script>(self.__next_f=self.__next_f||[]).push([0])</script>
+<script>self.__next_f.push([1,"1:\"$Sreact.fragment\"\n..."])</script>
+```
 
-### Supabase (✅ fully provisioned)
+`script-src 'self'` (no `'unsafe-inline'`, no nonce, no hash) blocks
+every one of those inline scripts. Resulting chain:
 
-- Project created; URL, anon key, service-role key, project ref collected.
-- 5 migrations applied via SQL Editor, 8 tables present in `public`.
-- `ingest` bucket: private, 4 RLS policies, 25 MB limit.
-- `cohorts` seeded (id `00000000-...-000001`, name `Default Cohort`).
-- **Auth redirects set**: production `/auth/callback`, preview
-  wildcard `/auth/callback`, `localhost:3000/auth/callback`, Site URL
-  = `https://llmwiki-study-group.vercel.app`.
+1. Server sends valid HTML → page paints briefly.
+2. Browser parses inline scripts → CSP violation → scripts are dropped.
+3. External `main-app.js` (allowed by `'self'`) runs, expects
+   `self.__next_f` populated → it's empty.
+4. React client attempts hydration against a missing Flight payload →
+   mismatch / throw → App Router tears down the tree to client-render
+   → client render also fails (no hydration data) → DOM is blank.
 
-### Vercel (partially provisioned)
+Error boundaries don't trigger because the failure happens below React's
+error-boundary reach (Flight payload bootstrap is pre-hydration).
 
-- Project: `llmwiki-study-group` (`anguijms-projects`).
-- **Settings applied this session**:
-  - Root Directory → `apps/web`.
-  - Framework Preset → **Next.js**.
-  - "Include files outside of the Root Directory" → ON.
-- **Env vars set** (9 of 13):
-  `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
-  `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_PROJECT_REF`,
-  `ANTHROPIC_API_KEY`, `PDF_PARSER=llamaparse`, `LLAMAPARSE_API_KEY`,
-  `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`.
-- **Env vars missing** (must be set before smoke test):
-  - ❌ `VOYAGE_API_KEY` — voyageai.com.
-  - ❌ `APP_BASE_URL=https://llmwiki-study-group.vercel.app`.
-  - ❌ `INNGEST_EVENT_KEY` — auto-populates.
-  - ❌ `INNGEST_SIGNING_KEY` — auto-populates.
-- **Inngest Vercel marketplace integration**: NOT INSTALLED.
-  Install at vercel.com/integrations/inngest — auto-populates both
-  `INNGEST_*` keys + registers `/api/inngest`.
+## Proposed fix
 
-## Active bug at handoff
+Replace the static CSP with a **per-request nonce** generated in a new
+`apps/web/middleware.ts`. Next.js 15 reads the `x-nonce` request header
+and automatically stamps that nonce on every inline script it emits.
+Result: inline scripts have `nonce="<value>"`, CSP header whitelists
+that exact nonce for this request, browser executes them, hydration
+completes.
 
-**Symptom**: `/auth` renders form briefly, then goes blank. URL stays at
-`/auth`. Reproduces in normal AND incognito. Site-data clearing doesn't
-fix. PR #9's error boundaries do NOT trigger → React isn't throwing
-during render/hydration → something else is wiping the DOM.
+This is the officially documented Next.js pattern for App Router + CSP
+([nextjs.org/docs/app/building-your-application/configuring/content-security-policy](https://nextjs.org/docs/app/building-your-application/configuring/content-security-policy)).
 
-**Ruled out**:
+### Why not `'unsafe-inline'`?
 
-- Server-side HTML serves correctly (6976 bytes with full form, correct
-  CSP, Supabase URL baked in).
-- All `_next/static/chunks/*.js` and CSS assets return 200.
-- CSP permissions adequate.
-- Tailwind `brand-*` compiled with correct RGB.
-- No service-worker registration in HTML.
-- No edge-injected external scripts.
-- No mobile-user-agent variance.
-- React error boundaries don't trigger (so not a render-time throw).
+Tempting one-line fix. Council will (rightly) reject it:
+- `'unsafe-inline'` on script-src = XSS defense-in-depth collapses.
+- `rehype-sanitize` is the primary XSS backstop on Markdown, but
+  defense-in-depth is a council non-negotiable on any auth-adjacent
+  surface. `/auth` sets the Supabase session; any XSS there is a full
+  account takeover.
 
-**Likely root cause candidates** (ranked by council synthesis):
+### Why not per-request hashes?
 
-1. **Unhandled promise rejection** from Supabase's
-   `@supabase/ssr/createBrowserClient` session check firing outside
-   React's lifecycle. Async errors in event handlers / effects escape
-   error boundaries. **First thing to check next session.**
-2. **`process.env[dynamic_key]` not inlined** by Next.js client bundle.
-   My `requireEnv(name)` helper uses `process.env[name]` with a variable
-   key, which the Next.js compiler cannot replace at build time. On the
-   client, `process.env` is an empty shim → `requireEnv('NEXT_PUBLIC_SUPABASE_URL')`
-   returns `undefined` → throws "missing or empty". Currently only
-   triggers on form submit, but worth validating this isn't running
-   during hydration too.
-3. Client-side clock skew causing Supabase JWT validation failures
-   (less likely; flagged as edge case).
+Hashes of Next.js's Flight payload change every request (payload
+includes timestamps, session-specific data). Recomputing SHA-256
+per request is strictly worse than nonces: same security guarantee,
+more CPU, harder to audit.
 
-**Pending diagnostic**: `/diag` static page (PR #10) — does it render
-on user's mobile browser?
-- renders → bug in `/auth` client code (#1 or #2 above).
-- also blank → bug in `layout.tsx` / globals.css / browser environment.
+## Files changed
 
-## Next-session roadmap (council-approved r1 synthesis, 8 steps)
+1. **`apps/web/middleware.ts`** *(new)*
+   - Generates 16-byte nonce via `crypto.getRandomValues` → base64.
+   - Builds CSP string with `'nonce-<value>' 'strict-dynamic'` in
+     `script-src`. `'strict-dynamic'` lets nonced scripts transitively
+     load the `_next/static/chunks/*.js` files without each chunk
+     needing its own nonce — the modern CSP Level 3 pattern Next.js
+     recommends.
+   - Sets `x-nonce` on the *request* (so server components can read
+     it if needed) and the `content-security-policy` header on the
+     *response*.
+   - Config: `matcher` excludes `_next/static`, `_next/image`,
+     `favicon.ico`, and anything in `/api/inngest` (Inngest's webhook
+     signing check shouldn't interact with our CSP). Include everything
+     else.
+   - Runtime: default (edge). Nonce generation is ~1µs; no measurable
+     latency cost.
 
-### 1. README runbook: Vercel settings
-**Done this session** in r2 of this plan. Root Directory + Framework
-Preset documented in README §C.
+2. **`apps/web/next.config.js`** *(modified)*
+   - Delete the static CSP block (lines 9-22 + the CSP entry in
+     `async headers()`).
+   - Keep the other response headers (`X-Content-Type-Options`,
+     `Referrer-Policy`, `Permissions-Policy`) — those don't need
+     per-request values, stay in `next.config.js`.
 
-### 2. GH tracking issue: `/diag` removal + error-boundary hardening
-**Done this session** — [issue #12](https://github.com/Anguijm/LLMwiki_StudyGroup/issues/12). Covers:
-- Delete `apps/web/app/diag/page.tsx` post-fix.
-- Harden `error.tsx` / `global-error.tsx` to production UX (i18n
-  strings via `t()`, AA contrast confirmed, focus management).
+3. **`apps/web/middleware.test.ts`** *(new)*
+   - Unit test: import the middleware default export, call with a mock
+     `NextRequest`, assert:
+     - Response has a `content-security-policy` header.
+     - That header contains `script-src` with `nonce-` prefix and a
+       base64-ish value of ≥22 chars.
+     - That header contains `'strict-dynamic'`.
+     - Two successive invocations produce different nonces
+       (cryptographic randomness sanity check).
+     - The request-side `x-nonce` header is set to the same value as
+       the CSP nonce.
+   - No Next.js server runtime required for this test — `NextRequest`
+     is constructible from `vitest`.
 
-### 3. Diagnose root cause via browser console
-Next session's first action after reading the `/diag` test result:
-- Check user's browser console (or iterate remotely) for unhandled
-  promise rejections.
-- Check `window.onerror` / `window.onunhandledrejection` handlers.
-- Check Network tab for failed requests during the blank-page
-  transition.
-- Document findings in a PR comment.
+4. **`apps/web/tests/unit/route-module-load.test.ts`** *(audit only)*
+   - Existing regression test. Confirm no breakage: the module-load
+     test already imports routes with scrubbed env; middleware isn't
+     a route, won't affect it. No change expected.
 
-### 4. Refactor client-side env var access
-Replace `requireEnv('NEXT_PUBLIC_SUPABASE_URL')` with a direct,
-statically-analyzable `process.env.NEXT_PUBLIC_SUPABASE_URL` in client
-code paths. The generic `requireEnv` helper stays for server-only
-code. New unit test: simulate a Next.js client bundle (`process.env`
-is NOT the full system env) and assert the client factory still
-works.
+## Verification plan
 
-Files:
-- `packages/db/src/browser.ts`
-- `packages/db/src/browser.test.ts` (new assertion)
-- Audit any other client-side code that imports `requireEnv`.
+Pre-push (local):
 
-### 5. Accessibility hardening on error boundaries
-- `role="alert"` + `aria-live="assertive"` — **DONE this session**.
-- Confirm WCAG AA contrast of the red palette (manual check or axe).
-- Consider i18n of error copy (defer if scope balloons; flag issue).
+1. `pnpm -r run typecheck` passes.
+2. `pnpm -r run test` passes (new middleware test + existing tests).
+3. `pnpm --filter web run lint` passes.
+4. `env -i PATH="$PATH" HOME="$HOME" npx next build` inside
+   `apps/web/` passes (same scrubbed-env trick used in PR #8 to catch
+   `Collecting page data` bugs).
 
-### 6. Implement the `/auth` fix
-Based on step 3's diagnosis. Runs through council (new plan, not
-`[skip council]`). Must pass security review (council
-non-negotiable: auth regression risk).
+Post-deploy (production):
 
-### 7. Smoke test expansion: failure + idempotency modes
-New `inngest/src/functions/ingest-pdf.test.ts` (or amended):
-- Corrupted/0-byte PDF → job transitions to `failed`.
-- Re-triggering event for same file → no duplicate note (unique
-  constraint on `source_ingestion_id` holds).
+5. `curl -sI https://llmwiki-study-group.vercel.app/diag` shows a
+   `content-security-policy` header with `nonce-` in `script-src`.
+6. `curl -sL https://llmwiki-study-group.vercel.app/diag | grep -oE 'nonce="[^"]+"' | head` shows Next.js's inline scripts now carry the nonce.
+7. Human visits `/diag` and `/auth` on their mobile device. Both
+   render stably (no blank-out).
+8. Human completes one magic-link sign-in end-to-end. Session lands;
+   dashboard renders; upload button responds.
 
-### 8. Remove diagnostic scaffolding
-- `git rm apps/web/app/diag/page.tsx`.
-- Decide: keep `error.tsx` + `global-error.tsx` as production error
-  screens (hardened per step 5) or strip back.
-- Runtime check: `/diag` on production returns 404.
+## Non-goals
 
-## Open tracking items (v1+)
+- Removing `/diag`. Keep until (7) is confirmed on the user's
+  device — issue #12 tracks its eventual removal in a follow-up PR.
+- Any `/auth` code changes. Root cause is layout-layer, not `/auth`.
+- Hardening `style-src` away from `'unsafe-inline'`. Tailwind emits
+  inline styles at runtime; nonceing them is a separate plan with
+  its own tradeoffs. Out of scope here.
+- Refactoring `requireEnv` client-side. The previous handoff listed
+  this as roadmap step 4. Since `requireEnv` is not the root cause,
+  it's a pure code-quality improvement; defer to v1 or a dedicated
+  plan. File issue if not already tracked.
+- Adding Vercel Analytics or any third-party inline script. Would
+  require CSP extensions with its own review.
+- Any database / RLS / migration work.
 
-- Issue **#6**: Storage RLS metadata refactor (v0 deferral).
-- Issue **#7**: `db-tests` pgTAP flake (continue-on-error).
-- Issue **#4**: restore `.harness/council/product.md`.
-- **Issue #12**: `/diag` removal + error-boundary production hardening.
-  Created this session per council must-do.
+## Non-negotiables (carry-over from CLAUDE.md)
 
-## Next-session opening protocol (per CLAUDE.md)
+- **Auth-adjacent security surface.** CSP on a page that sets a
+  Supabase session cookie. Council security must-review. No
+  `[skip council]` on this PR.
+- **Nonce must be CSPRNG.** `crypto.getRandomValues` is the only
+  correct primitive. `Math.random()` would be a critical bug.
+- **Nonce must be per-request.** A module-level or ISR-cached nonce
+  re-uses the same token across users / sessions → defeats the
+  purpose. Generation must live inside the middleware function body,
+  not outside it.
+- **Middleware matcher must exclude static assets.** Matching
+  `_next/static/*` would add CSP overhead to every chunk request
+  and potentially break Vercel's edge cache for immutable assets.
+- **`strict-dynamic` must be paired with the nonce**, not used as
+  a standalone crutch. If `strict-dynamic` is present without a
+  valid nonce, CSP-L2-only browsers (older Safari) fall back to
+  `'self'` behaviour, which would re-trigger the blank-page bug on
+  those clients. Mitigation: ship the nonce. The `'strict-dynamic'`
+  is additive, not a substitute.
 
-1. Read `.harness/session_state.json`.
-2. Read last ~20 lines of `.harness/yolo_log.jsonl`.
-3. Read the 2026-04-19 block in `.harness/learnings.md`.
-4. Read this plan (§Active bug + §Next-session roadmap).
-5. Human will provide the `/diag` test result in their opening message.
-6. Branch off the step in §Next-session roadmap that matches the test
-   outcome. Default: full plan + council round for the fix (step 6).
+## Rollback
 
-## Non-goals for the next session
+If deploy regresses anything:
+- Revert the PR on `main` → CSP reverts to the current (broken-but-
+  deployed) static version.
+- User's symptom returns (blank page) but no new regressions
+  introduced elsewhere — nothing outside this PR's three files
+  changes.
 
-- Feature work. v1 kickoff waits until blank-page is fixed AND smoke
-  test passes.
-- Descoping any of the council's 8 steps without a new council review.
-- Gold-plating the error boundaries beyond WCAG AA + i18n.
+Rollback path is clean because the change is self-contained:
+middleware + next.config + one test.
 
-## Non-negotiables carried forward
+## Cost posture
 
-- The eventual `/auth` fix PR must receive its own security review
-  (council must-do, auth-regression risk).
-- The README runbook is now the source of truth for Vercel setup;
-  any drift from it (e.g., Vercel UI changes) must be PR'd against
-  the doc, not worked around locally.
-- Diagnostic routes (`/diag`) are NOT production surface; must be
-  removed before any user-facing launch.
+- Zero API calls added. No Claude / Gemini / Voyage / AssemblyAI /
+  Reducto spend.
+- One edge-function invocation per request (middleware). Vercel
+  Hobby plan: 1M middleware invocations/month free. Well within
+  budget for v0.
+
+## Open questions for council
+
+1. **Should middleware also scrub the cached Flight payload?**
+   Vercel's edge cache can HIT the same HTML across users. If the
+   HTML embeds the nonce and CSP is regenerated per request, an
+   edge-cache HIT would serve stale HTML with an old nonce against
+   a fresh CSP header — browser rejects the scripts again. Mitigation:
+   either (a) set `Cache-Control: private, no-store` on responses
+   passing through middleware (kills edge cache but safe), or (b)
+   ensure the middleware runs on every edge cache miss + hit so CSP
+   and HTML stay paired. Next.js 15's default is (b) — middleware
+   runs on every request including cache hits, and the cached HTML
+   is regenerated per-request when middleware adds headers. Worth
+   council verification.
+
+2. **Should `/api/inngest` be excluded from middleware?**
+   Inngest's inbound webhook from their infrastructure does a
+   signature check on the raw body; middleware shouldn't mutate
+   the request or add Vary headers that break Inngest's signature
+   verification. Proposed matcher excludes `/api/inngest`; council
+   to confirm whether other `/api/*` routes also need exclusion
+   (e.g., Supabase auth callback `/auth/callback`).
+
+3. **Should we report CSP violations somewhere?**
+   Adding `report-uri` / `report-to` would surface future CSP
+   breakage before users hit blank pages. Out of scope for this
+   PR (would need a new endpoint + storage), but worth a follow-up
+   issue.
+
+## Execution order (if approved)
+
+Single batch — the three files are tightly coupled. No intermediate
+push is safe:
+
+1. Write `apps/web/middleware.ts`.
+2. Edit `apps/web/next.config.js` (remove static CSP).
+3. Write `apps/web/middleware.test.ts`.
+4. Run full local verification (typecheck + test + lint + scrubbed-
+   env next build).
+5. Commit with `fix(web): per-request CSP nonce via middleware`.
+6. Push. Council re-runs on the diff.
+7. If council PROCEEDs on the diff, await human approval for merge.
+8. After merge, verify (5)-(8) from §Verification plan.
+9. Reflect in `.harness/learnings.md` (KEEP: curl-from-sandbox
+   caught the CSP header; IMPROVE: should have caught this in the
+   original CSP PR; INSIGHT: `unsafe-inline` vs nonce tradeoff
+   for Tailwind vs Next.js inline scripts; COUNCIL: synthesis
+   outcome).
+
+## Why this is the right plan (not a premature abstraction)
+
+- Smallest change that fixes the bug: three files, no new deps, no
+  architectural shift.
+- Uses the documented Next.js pattern — council won't flag this as
+  a DIY reinvention.
+- Reversible: one revert commit undoes the whole thing.
+- No `[skip council]` shortcut: auth-adjacent security change, rules
+  are rules.
+- Does not bundle unrelated cleanup (`/diag` removal, `requireEnv`
+  refactor, error-boundary hardening) into the fix. Those belong in
+  their own plans per CLAUDE.md "Don't add features, refactor, or
+  introduce abstractions beyond what the task requires."
