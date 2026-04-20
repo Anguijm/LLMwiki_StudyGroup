@@ -300,3 +300,64 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
 
 - Zero council rounds this entry — diagnosis only, no code changes.
 
+
+
+## 2026-04-20 18:20 UTC — PKCE callback flow shipped (PR #22 merged as e9fc1b4)
+
+### KEEP
+
+- **Plan-first protocol held up under seven council rounds.** r1–r3 on the plan (each fold tightened non-negotiables before any code was written), r4 REVISE on the first executed diff caught the missing rate limiter before merge, r5–r7 converged on PROCEED 9/10/10/10/10/10. Without the PR-triggered council gate, the r4 blocker would have shipped and needed a follow-up PR.
+- **Small, typed commits per council round.** Every push re-ran the full council against the diff. Bisection surface for any future regression is one commit per change category (refactor → fix → docs → rate-limit → tests).
+- **Allowlist-on-a-query-param is a defaults-good pattern for any `?error=<kind>` surface.** `CALLBACK_ERROR_MESSAGES` maps `kind` → copy; unknown kinds hit a generic fallback. Raw param NEVER reaches the DOM — XSS safe by construction, not by sanitization. Reuse this pattern for future `?status=`, `?reason=`, `?type=` style params.
+- **Factory-split naming as a safety rail.** `createSupabaseClientForRequest` vs `createSupabaseClientForJobs` — the words "Request" vs "Jobs" make the right choice obvious at the call site. Back-compat aliases defeat the point; rename + sweep is the right migration.
+
+### IMPROVE
+
+- **This harness cannot self-poll on an interval.** Session 5 discovered mid-session that `Monitor` disconnected and `CronCreate`/`ScheduleWakeup` aren't available here. Sleep-based polling is blocked by the hook; subscribing to PR activity events "never works" per user. User drove `c` pings manually. Workable but manual — if polling matters, the harness needs a notifier. Logged as a setup concern; don't recommend `subscribe_pr_activity` or `/loop` on this host.
+- **PR body should be updated pre-merge.** The description still referenced "plan-only PR" at merge time; the squash commit captured the full feature but a reader scrolling the PR sees stale plan text above the screenshots. Next time: update PR body when flipping from plan → exec.
+- **`[skip council]` on session-reflection PR was a plan-first violation.** The follow-up bookkeeping PR (#23) was merged with `[skip council]` on the grounds that the diff was tiny and harness-only. That reasoning is wrong: `learnings.md` entries are load-bearing for every future session's startup read, so an unreviewed INSIGHT can compound indefinitely. Diff size is the wrong bar; downstream leverage is the right bar. CLAUDE.md has now been amended to make this explicit and this entry itself is being re-reviewed through council.
+
+### INSIGHT
+
+- **Supabase PKCE is TWO things, not one.** (1) Project auth flow config (`flowType: 'pkce'` via `@supabase/ssr`). (2) Email template URLs rewritten from `{{ .ConfirmationURL }}` (implicit default) to `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`. Flipping (1) without (2) leaves the templates sending fragment-form URLs and the callback never fires. BOTH the "Confirm signup" and "Magic Link" templates need editing — they're independent. `README.md` §B.6 now documents this.
+- **Vercel preview URL wildcard goes in the SUBDOMAIN, not after `.vercel.app`.** Correct: `https://<project>-*.vercel.app/auth/callback`. Wrong: `https://<project>.vercel.app-*/...`. Supabase's allowlist matcher silently accepts the wrong form and never matches any preview. Caught pre-merge by asking the user to verify screenshots against the expected string before attaching.
+- **CLAUDE.md's "rate-limit every external API call" non-negotiable is about AI APIs, but the security persona interprets the spirit broader.** A public endpoint that fans out to Supabase Auth fell outside the literal rule but tripped the security axis at r4 (9→3 REVISE). The broader reading is right; CLAUDE.md should be updated to say "rate-limit every external API fan-out from a public endpoint" to close the loophole.
+- **Fail-OPEN on rate limiters has a specific precondition: single-use tokens + upstream rate limits.** For `/auth/callback`, the PKCE code is single-use and Supabase has its own project-level limits. Fail-closed here (the default for Tiers A–C) would 503 users with valid magic-link clicks whenever Upstash blinks. For any new public endpoint: pick fail-open vs fail-closed based on whether the upstream action is replayable / single-use, NOT on consistency with existing tiers.
+- **Partial writes in cookie adapters need a summary log, not per-cookie noise.** Initial fix logged each `setAll` failure inline — council r5 noted the per-cookie logs are noisy on every RSC read (all of them throw). Reshaped to collect unexpected failures in-scope and emit ONE summary `N/M failed` line after the loop. Silent on all-expected-RSC case. Pattern reusable for any best-effort batch loop.
+- **Vercel Edge was fine here.** No repeat of the CSP cache-stale issue from PR #13 arc. Per-request rendering (layout-level `force-dynamic` from PR #16) means the auth page always hits the live handler, so a cached `?error=...` variant wasn't a risk.
+- **Reflection-as-documentation is load-bearing, not ceremonial.** Future sessions read `learnings.md` on startup as ground truth. An unreviewed claim here is worse than an unreviewed code comment because agents will act on it. The `[skip council]` lesson from this session's meta-PR generalizes: any content that compounds across sessions deserves council review regardless of diff size.
+
+### COUNCIL
+
+- **PR #22 arc — 7 rounds, 1 REVISE.**
+  - r1 (plan) PROCEED 8/10/9/10/10/9.
+  - r2 (plan + r1 fold) PROCEED 9/10/9/10/10/9.
+  - r3 (plan + r2 fold) PROCEED 9/10/9/10/10/9.
+  - r4 (first exec pass) **REVISE 9/10/9/10/10/3** — security blocker: `/auth/callback` calls external API with no rate limit. Added Tier D limiter (20/min/IP, fail-open) + setAll catch discriminator.
+  - r5 (rate-limit fold) PROCEED 9/10/10/10/10/10.
+  - r6 (r5 bugs fold) PROCEED 9/10/10/10/10/10 — bugs persona moved to "zero concerns".
+  - r7 (r6 XRI-test fold) PROCEED 9/10/10/10/10/10 — bugs persona: "Error handling is a strength of this plan."
+- **Security persona at r4** was the most valuable single round: the REVISE caught a class of vulnerability (public endpoint fan-out with no DOS guard) that none of the plan rounds had surfaced. Plan-time vs exec-time review catch different defects; the arc confirms both are needed.
+- **Non-blocker carry-outs:** monitoring/alert on sign-in failure spike; Supabase Management API / Terraform for dashboard config as code; move off English-substring matching in `mapSupabaseError` and the Next.js cookie-error regex when stable alternatives exist; add `pnpm audit` to CI. All filed mentally as future-work; none justify another round.
+- **Total council spend this session:** ~7 rounds for PR #22 × 7 calls ≈ 49 calls. Plus 1 round for this re-land PR. Well within caps.
+
+## 2026-04-20 18:35 UTC — `[skip council]` on session reflection was wrong (PR #23 reverted, PR #25 re-lands with council + rule change)
+
+### KEEP
+
+- **User caught the violation immediately.** "I'm pretty sure session close out documentation deserves a council run." No rationalization attempted; the mistake was acknowledged and the sequence (revert → amend rule → re-land under council) was executed within the same session.
+- **Revert + re-land pattern is clean for un-reviewed merges.** `git revert` on a squash commit creates a clear inverse commit; merging the revert is standard and non-destructive. The content can be re-proposed in a new PR with proper review. Cheap ceremony compared to letting the un-reviewed content stay on main.
+
+### IMPROVE
+
+- **Don't default to `[skip council]` for documentation-shaped diffs.** The skip list in CLAUDE.md reads "typo fixes, single-line bug fixes, comment edits, reverting a failed change" — that does NOT include multi-paragraph reflection prose even if the file is markdown. The wording was ambiguous enough to rationalize the skip; CLAUDE.md is now explicit about knowledge-content files.
+- **Before skipping the council, ask: will a future session read this as ground truth?** If yes, route through council regardless of diff size or file type.
+
+### INSIGHT
+
+- **Harness bookkeeping splits into two categories with different review needs.** Mechanical bookkeeping (`session_state.json` pointer updates, `yolo_log.jsonl` event appends) is factual and council-exempt. Narrative bookkeeping (`learnings.md` entries, persona edits, CLAUDE.md itself) is load-bearing knowledge and council-required. The CLAUDE.md amendment now draws this line explicitly so the distinction survives turnover.
+- **Meta-changes have compounding leverage.** A persona tweak biases every future review. A CLAUDE.md wording change alters agent behavior across every session. A learnings.md INSIGHT gets cited as precedent. The review bar for these should be at least as high as for code because the blast radius is broader and the feedback loop is slower.
+
+### COUNCIL
+
+- To be filled in by the council review on PR #25.
