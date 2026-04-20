@@ -76,7 +76,7 @@ describe('supabaseForRequest — setAll cookie-write discriminator', () => {
     expect(errSpy).not.toHaveBeenCalled();
   });
 
-  it('logs console.error on an unexpected setAll throw (Route Handler bug)', async () => {
+  it('logs a partial-write summary on an unexpected setAll throw (Route Handler bug)', async () => {
     setStub.mockImplementation(() => {
       throw new Error('ECONNRESET — upstream write failed');
     });
@@ -87,7 +87,8 @@ describe('supabaseForRequest — setAll cookie-write discriminator', () => {
     ]);
     expect(errSpy).toHaveBeenCalledTimes(1);
     const [message, context] = errSpy.mock.calls[0] as [string, unknown];
-    expect(message).toMatch(/setAll failed/i);
+    expect(message).toMatch(/setAll partial write/i);
+    expect(message).toMatch(/1\/1/);
     // Regression guard: cookie name + value must NOT appear in the log.
     const contextString = JSON.stringify(context);
     expect(message).not.toContain('sb-access-token');
@@ -96,9 +97,36 @@ describe('supabaseForRequest — setAll cookie-write discriminator', () => {
     expect(contextString).not.toContain('SECRET');
   });
 
+  it('reports N/M when some writes succeed and some fail (council bugs r5)', async () => {
+    // @supabase/ssr typically sends multiple chunked cookies; a partial
+    // write (1 of 3 fails) must surface as "1/3 cookie writes failed"
+    // so the debugger sees the split state at a glance.
+    setStub.mockImplementation((name: string) => {
+      if (name === 'sb-access-token.1') {
+        throw new Error('ECONNRESET — upstream write failed');
+      }
+    });
+    const { supabaseForRequest } = await import('./supabase');
+    await supabaseForRequest();
+    capturedAdapter.current!.setAll([
+      { name: 'sb-access-token.0', value: 'part0', options: {} },
+      { name: 'sb-access-token.1', value: 'part1', options: {} },
+      { name: 'sb-access-token.2', value: 'part2', options: {} },
+    ]);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const [message] = errSpy.mock.calls[0] as [string, unknown];
+    expect(message).toMatch(/1\/3/);
+    expect(message).toMatch(/partial write/i);
+    // Cookie identifiers and values must not appear in the summary.
+    expect(message).not.toContain('sb-access-token');
+    expect(message).not.toContain('part0');
+    expect(message).not.toContain('part1');
+    expect(message).not.toContain('part2');
+  });
+
   it('continues processing the remaining cookies after one throws', async () => {
-    // The setAll loop must not halt on a single throw — otherwise a
-    // partial write leaves the client in an inconsistent state.
+    // Regression: the loop must not halt on a single throw — otherwise
+    // a single flaky cookie would skip the rest of the session chunks.
     const attempted: string[] = [];
     setStub.mockImplementation((name: string) => {
       attempted.push(name);
@@ -115,6 +143,24 @@ describe('supabaseForRequest — setAll cookie-write discriminator', () => {
       { name: 'third', value: 'c', options: {} },
     ]);
     expect(attempted).toEqual(['first', 'second', 'third']);
+  });
+
+  it('emits no summary log when all throws are the expected RSC case', async () => {
+    // An all-RSC-expected pass should stay silent — the previous
+    // iteration inadvertently logged once per cookie, which would be
+    // noisy in every Server Component render.
+    setStub.mockImplementation(() => {
+      throw new Error(
+        'Cookies can only be modified in a Server Action or Route Handler',
+      );
+    });
+    const { supabaseForRequest } = await import('./supabase');
+    await supabaseForRequest();
+    capturedAdapter.current!.setAll([
+      { name: 'a', value: '1', options: {} },
+      { name: 'b', value: '2', options: {} },
+    ]);
+    expect(errSpy).not.toHaveBeenCalled();
   });
 
   it('treats a non-Error throw as unexpected and logs it', async () => {

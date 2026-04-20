@@ -153,6 +153,17 @@ describe('GET /auth/callback — input validation (no Supabase call)', () => {
     expect(exchangeCodeForSession).not.toHaveBeenCalled();
   });
 
+  it('redirects to ?error=invalid_request when code is below MIN_CODE_LEN by one (council bugs r5)', async () => {
+    // Boundary guard: MIN_CODE_LEN = 16. A code of exactly 15 chars must
+    // be rejected. Pairs with the "accepts 16" success test below.
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${'a'.repeat(15)}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'invalid_request',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
   it('redirects to ?error=invalid_request when code exceeds 4KB (also > 2048)', async () => {
     const { GET } = await import('../../app/auth/callback/route');
     const hugeCode = 'a'.repeat(5000);
@@ -233,6 +244,30 @@ describe('GET /auth/callback — success', () => {
     const res = await GET(makeReq(`?code=${VALID_CODE}&next=%2Fadmin`));
     const loc = new URL(res.headers.get('location') ?? '');
     expect(loc.pathname).toBe('/');
+  });
+
+  it('accepts a code of exactly MIN_CODE_LEN=16 chars (council bugs r5 boundary)', async () => {
+    const minCode = 'a'.repeat(16);
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${minCode}`));
+    expect(new URL(res.headers.get('location') ?? '').pathname).toBe('/');
+    expect(exchangeCodeForSession).toHaveBeenCalledWith(minCode);
+  });
+
+  it('accepts a code of exactly MAX_CODE_LEN=2048 chars (council bugs r5 boundary)', async () => {
+    const maxCode = 'a'.repeat(2048);
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${maxCode}`));
+    expect(new URL(res.headers.get('location') ?? '').pathname).toBe('/');
+    expect(exchangeCodeForSession).toHaveBeenCalledWith(maxCode);
   });
 
   it('uses the first `code` value when duplicated (council bugs r3)', async () => {
