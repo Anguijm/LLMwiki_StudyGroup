@@ -50,15 +50,29 @@ The callback already does the right thing; the email link just needs to point at
 
 ### B. Human smoke test post-dashboard-change, pre-merge
 
-The human performs a real end-to-end sign-in on production (magic link to real inbox, click from the same device/browser, confirm redirect to `/` with a session cookie). **This is a merge gate, not a post-merge check.** The class of bug this plan exists to fix is specifically the kind that unit tests and dashboard screenshots cannot catch.
+The human performs real end-to-end sign-in scenarios on production. **This is a merge gate, not a post-merge check.** The class of bug this plan exists to fix is specifically the kind that unit tests and dashboard screenshots cannot catch.
 
-Pass criteria:
+Three scenarios, all required for merge (council bugs r1):
+
+**B.1 — Happy path, same device, same browser.** Submit the magic-link form and click the link from the same device/browser. Pass criteria:
 
 - `/auth/callback` returns 307 to `/` (not to `/auth?error=...`).
 - Landing on `/` shows the authenticated surface (not a middleware bounce back to `/auth`).
 - Supabase Dashboard → Logs → Auth shows `/token | request completed` with no 404 immediately after.
 
-If any of the three fail, revert the template changes, re-open the plan.
+**B.2 — Stale link.** Submit the magic-link form twice in quick succession (same email). Click the FIRST link. Pass criteria:
+
+- `/auth/callback` returns 307 to `/auth?error=token_used` (or, if Supabase invalidates by time rather than use, `?error=token_expired`).
+- `/auth` renders the allowlisted copy for that kind — "This sign-in link has already been used. Request a new one." or "This sign-in link has expired. Request a new one." — never the raw query param.
+- Supabase Dashboard → Logs → Auth shows the invalidation with an error message that `mapSupabaseError` recognizes (matches `/already.*used|consumed|used_otp|invalid_grant|expired/`).
+
+**B.3 — Cross-device click (known-limitation test, not a pass/fail gate).** Submit the form on device A; click the link on device B with a different browser profile. **Expected outcome: `/auth?error=server_error`**, because PKCE with `@supabase/ssr` stores the code verifier as an `HttpOnly` cookie on device A; device B has no verifier, so `exchangeCodeForSession` fails with "no valid flow state found" — the same upstream error we're fixing for same-device today, just for a structural reason specific to cross-device.
+
+This row is a **document-and-accept** test, not a revert trigger. Record the observed behavior in the PR body so the limitation is explicit. If cross-device sign-in is later deemed required, that's a separate plan (see Out-of-scope §Cross-device sign-in UX below).
+
+**Council bugs r1 rebuttal (cross-device):** the bugs persona's r1 edge-case note expected cross-device to succeed and framed failure as "surprising device-binding." It is not surprising given our architecture — PKCE with cookie-stored verifier is device-bound by design, independently of Fix A. Fix A corrects the template-primitive mismatch; it does not change the verifier storage model. If council r2 persists on cross-device success being a requirement, the correct response is to escalate to a Fix B plan (switch callback to `verifyOtp({ token_hash, type })`, which does not require a device-local verifier) — not to claim Fix A will satisfy it.
+
+If B.1 fails, revert the template changes and re-open the plan. If B.2 fails, the template fix is still valid but the error-kind regex at `callback/route.ts:101-105` needs extending — file a follow-up issue rather than blocking this PR. If B.3 fails in the unexpected direction (cross-device actually succeeds), that's information worth recording but does not block merge.
 
 ### C. Runbook correction — `README.md` §B.6
 
@@ -88,10 +102,20 @@ In-place note on the 2026-04-20 18:20 UTC INSIGHT bullet about PKCE email templa
 
 Don't delete the original text. Leaving the wrong claim visible with a correction pointer is how future agents learn the lesson rather than re-discovering it.
 
+### F. Code-to-config anchor on the callback route
+
+Add a top-of-file comment block to `apps/web/app/auth/callback/route.ts` that explicitly names the email-template dependency and points at `README.md` §B.6. Suggested wording (final text at execution time):
+
+> This route assumes the Supabase "Magic Link" and "Confirm signup" email templates use the default `{{ .ConfirmationURL }}` body link. If either template is changed to the `?token_hash=&type=` form, `exchangeCodeForSession` below will fail with "no valid flow state found" and every sign-in will return `?error=server_error`. See `README.md` §B.6 for the template-vs-callback-primitive binding.
+
+Rationale: the code and the dashboard config are tightly coupled; without an in-repo anchor a future maintainer changing the template can't know they're also changing the callback behavior. Council security r1 nice-to-have, elevated to execution step because the PR #22 → PR #27 chain is itself the proof that the coupling matters. One comment, zero runtime change.
+
 ## Out of scope for this PR
 
 - **Playwright end-to-end smoke test (issue #20).** The ideal regression guard for this class of bug is a headless run that clicks a real link, but Playwright setup is non-trivial (Supabase test-user provisioning, email-capture fixture, CI secrets). Stays as issue #20; add a reference to this plan in that issue so the motivation survives.
+- **Cross-device sign-in UX.** PKCE with `@supabase/ssr`'s cookie-stored verifier is device-bound by design: the user must click the magic link on the same device/browser that submitted the form. The B.3 smoke test row documents this explicitly. If cross-device sign-in becomes a product requirement, the options are (a) switch the callback to `verifyOtp({ token_hash, type })` with a custom `?token_hash=&type=` template (Fix B in this session's diagnosis — moves to a non-device-bound flow), (b) add a 6-digit OTP code path as an alternative sign-in method, or (c) migrate to a shared server-side verifier store keyed by email. Each is its own plan + council round. File as a new issue if prioritized; not in flight today.
 - **`mapSupabaseError` regex extension** to classify "no valid flow state" as its own kind. Once the template is correct, this path is unreachable for a properly-configured project. If it fires again in prod it's a genuine server_error and the generic copy is correct.
+- **Supabase-hosted `/auth/v1/verify` failure surfaces.** Council bugs r1 noted: if the allowlist is misconfigured or Supabase's verify endpoint 500s, the user lands on a Supabase-branded error page before ever reaching our app, and we have no hook to observe it. Not mitigable in our code without moving the OTP-verification step in-app (that's Fix B). Monitoring via Supabase Auth logs is the existing mitigation; no new instrumentation in this PR.
 - **Issue #26** (transactional setAll + fail-open alerting) remains queued; separate surface, separate PR.
 - **Terraform / Management API for dashboard state.** Council carry-out from PR #22. Would have prevented this regression but is a v1 workstream.
 - Any v1 feature work.
@@ -138,7 +162,8 @@ Added by this plan:
 
 ## Council history
 
-- Awaiting r1.
+- **r1** (PR #27 @ commit `af9c3ba`, 2026-04-20T20:27:50Z) — PROCEED, a11y 9 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Folded: expanded smoke test matrix (B.1 same-device happy path, B.2 stale-link error copy, B.3 cross-device document-and-accept), §F code-to-config anchor comment on the callback route, new out-of-scope lines for cross-device UX and Supabase `/verify` failure surfaces. Rebutted in plan: bugs persona's r1 cross-device expectation — PKCE with cookie-stored verifier is device-bound by design; Fix A does not change that. Escalation path documented (Fix B / OTP codes) if cross-device becomes required.
+- Awaiting r2.
 
 ## Approval checklist (CLAUDE.md gate)
 
