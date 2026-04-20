@@ -5,6 +5,25 @@
 // the @supabase/ssr setAll adapter in apps/web/lib/supabase.ts) and
 // redirects to the dashboard.
 //
+// === REQUIRED DASHBOARD CONFIGURATION (see README.md §B.6) ===
+//
+// This route REQUIRES the Supabase "Magic Link" AND "Confirm signup"
+// email templates to use the default `{{ .ConfirmationURL }}` body link.
+// That template renders to `https://<ref>.supabase.co/auth/v1/verify?...`,
+// Supabase verifies the OTP server-side, generates a PKCE flow_state,
+// and redirects to `/auth/callback?code=<real_pkce_code>`. The call to
+// `exchangeCodeForSession(code)` below then looks up that flow_state and
+// exchanges the code for a session.
+//
+// If either template is changed to `/auth/callback?code={{ .TokenHash }}`
+// (the primitive for `verifyOtp`, NOT `exchangeCodeForSession`), Supabase
+// returns `/token | 404: invalid flow state, no valid flow state found`,
+// mapSupabaseError() falls through to `server_error`, and every sign-in
+// fails with "Could not sign you in right now." This happened once
+// (PR #22 shipped the wrong template; PR #27 corrected it). The README
+// has the full template-vs-primitive binding; do not change the template
+// without simultaneously switching the callback primitive.
+//
 // Security posture (plan PR #22, council rounds r1 / r2 / r3 / r4):
 //
 //   - Per-IP rate limit (20 req / min, fail-open on Upstash outage).
