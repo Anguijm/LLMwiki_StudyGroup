@@ -245,11 +245,36 @@ deploy. Work through top-to-bottom once; subsequent deploys are just
 4. Dashboard → **Storage**: confirm the `ingest` bucket exists. It's created
    by migration `20260417000002_rls_policies.sql`. If missing, the migration
    failed — re-run `supabase db push` or check migration logs.
-5. Dashboard → **Authentication → URL Configuration**:
+5. Dashboard → **Authentication → URL Configuration** — **security
+   surface, verify with screenshots on every auth-touching PR (council
+   non-negotiable)**:
    - **Site URL** → your production URL (e.g. `https://<app>.vercel.app`).
-   - **Redirect URLs** → add both of:
+   - **Redirect URLs** → ONLY these two entries. No wildcards beyond the
+     preview-URL pattern. A misconfigured allowlist lets an attacker
+     redirect a valid PKCE code to a host they control:
      - `https://<app>.vercel.app/auth/callback`
      - `https://<app>-*.vercel.app/auth/callback` (Vercel preview deploys)
+   - Confirm this matches `APP_BASE_URL` in Vercel env vars (§C.3). The
+     server-side `/api/auth/magic-link` route already hard-requires
+     `APP_BASE_URL` and rejects Host-header spoofing; the Supabase
+     allowlist is the second line of defense.
+6. Dashboard → **Authentication → Email Templates** — **PKCE flow
+   requires explicit template edits; Supabase defaults ship the
+   implicit-flow URL form**:
+   - Open the **Confirm signup** template AND the **Magic Link**
+     template. Both must exist and both must be edited — users who
+     have never signed in hit the "Confirm signup" template, returning
+     users hit "Magic Link".
+   - In the confirmation link, the URL MUST be:
+     ```
+     {{ .SiteURL }}/auth/callback?code={{ .TokenHash }}
+     ```
+     The default templates use `#access_token=` (implicit flow); that
+     form bypasses our server-side `/auth/callback` handler and leaves
+     the session unpersisted. Verify by clicking **Preview** in each
+     template and confirming the URL includes `/auth/callback?code=`.
+   - Screenshot both templates plus the URL Configuration section and
+     attach to the auth-surface PR before merge.
 
 ### C. Vercel: project + settings + env vars
 

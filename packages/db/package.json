@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@llmwiki/lib-utils": "workspace:*",
-    "@supabase/ssr": "^0.4.0",
+    "@supabase/ssr": "0.4.1",
     "@supabase/supabase-js": "^2.45.0",
     "server-only": "^0.0.1"
   },

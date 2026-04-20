@@ -1,244 +1,284 @@
-# Session handoff: CSP + auth fix arc shipped, framework persona is next session's opener
+# Plan: fix auth callback flow (implicit → PKCE + cookie-writing adapter)
 
-## What landed this session
+**Status:** draft, awaiting council + human approval.
+**Branch:** `claude/plan-session-agenda-rRwWN`.
+**Scope:** auth surface — non-negotiable council run required.
+**P0:** without this, no user can complete sign-in.
 
-Three sequential PRs on `main` closing out the production blank-page →
-dead-button bug:
+## Problem
 
-| PR | Commit | Scope |
-|---|---|---|
-| **#13** | `eb707b0` | Per-request CSP nonce via `apps/web/middleware.ts`. Replaced static `script-src 'self'` (which blocked Next.js 15's inline Flight-payload scripts) with nonce + `'strict-dynamic'`. `Cache-Control: private, no-store, max-age=0` to prevent Vercel Edge serving stale HTML with mismatched nonces. Matcher excludes `/api/inngest` and `/auth/callback`. Removed `https://*.vercel.app` wildcard from `connect-src`. Council arc r1→r4 PROCEED. |
-| **#16** | `ffec953` | `export const dynamic = 'force-dynamic'` on `apps/web/app/layout.tsx`. Per-request nonces can't stamp on prerendered HTML (baked at build time before middleware runs); layout-level `force-dynamic` forces every route to render per-request so Next.js reads `x-nonce` and stamps scripts correctly. Note: Next.js's layout-level `force-dynamic` overrides child `force-static`, so `/diag` is now dynamic too (acceptable — no DB calls, no interactivity). |
-| **#17** | `f4fc657` | New rate-limited server-side `apps/web/app/api/auth/magic-link/route.ts`; client `/auth/page.tsx` now `fetch()`es it. `packages/db/src/browser.ts` reads `process.env.NEXT_PUBLIC_*` via literal property access (Next.js can't inline dynamic `process.env[name]`). New Tier C limiter in `@llmwiki/lib-ratelimit` (per-IP 5/hr, per-email 3/hr). Open-redirect protection (required `APP_BASE_URL`, no Host-header fallback). Email alias stripping in rate-limit key. UX hardening on `/auth` (pending state, aria-live regions, "Sending…" copy swap). Council arc r1→r4, two REVISEs (security at r2, bugs at r3) both folded in. |
-
-Verified in prod via curl:
-- CSP header carries per-request nonce.
-- All `<script>` tags carry matching `nonce="..."` attributes.
-- `/api/auth/magic-link` returns 400 on bad JSON, bad email shape,
-  missing email, whitespace-only email, oversize email, missing
-  `x-forwarded-for`.
-- `APP_BASE_URL` confirmed set in Vercel All-Environments.
-- Human tested the button: first deploy (post PR #17) response
-  unverified as of handoff — user to confirm next session.
-
-## Live bug at handoff (verified after merge)
-
-**Symptom:** Magic-link email arrives and looks correct. Clicking the
-"Confirm" link in the email redirects the user back to `/auth` with
-the tokens in a URL fragment:
+First real magic-link email sent after the PR #13/#16/#17 arc landed. The
+email arrives correctly, but clicking the "Confirm" link redirects the
+user back to `/auth` with the session tokens sitting in a URL fragment:
 
 ```
-https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&token_type=bearer&type=signup
+https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&type=signup
 ```
 
-Session is NOT persisted — refresh `/auth` and the user is still
-logged out.
+Refreshing `/auth` shows the user still logged out. The session is never
+persisted.
 
-**Root cause (two separate bugs):**
+## Root cause (two bugs stacked)
 
-1. **Flow mismatch — implicit vs PKCE.** Supabase is configured with
-   the default `flowType: 'implicit'` (tokens posted to the URL
-   fragment for client-side JS to parse). Our `/auth/callback`
-   expects `flowType: 'pkce'` (a `?code=...` query param that the
-   server exchanges via `exchangeCodeForSession`). `type=signup` in
-   the fragment also indicates Supabase treated this as a
-   first-time signup, not a returning magic-link sign-in — the
-   "Confirm signup" template runs by default, not "Magic Link". The
-   two templates can be configured separately in the Supabase
-   dashboard.
+1. **Flow mismatch — implicit vs PKCE.** Supabase is on the default
+   `flowType: 'implicit'` (tokens in the URL fragment for client-side
+   parsing). Our `/auth/callback` is written for PKCE (`?code=...` query
+   param + server-side `exchangeCodeForSession`). The email also renders
+   as "Confirm signup" rather than "Magic Link" — both templates can
+   diverge in the Supabase dashboard and both need the PKCE redirect
+   form.
+2. **Cookie adapter is read-only.** `packages/db/src/server.ts:27-34`
+   builds the server client with `@supabase/supabase-js`'s `createClient`
+   and a Cookie-header string. It can READ cookies but has no way to
+   WRITE `Set-Cookie` on the response. Even once PKCE is enabled and
+   `/auth/callback?code=...` fires, `exchangeCodeForSession` succeeds
+   against Supabase Auth and then drops the resulting session on the
+   floor — no cookie is written, so the dashboard's "no session" guard
+   bounces the user straight back to `/auth`.
 
-2. **Cookie adapter is read-only.** Even once PKCE is enabled and
-   `/auth/callback?code=...` gets hit, the existing `supabaseServer`
-   factory (`packages/db/src/server.ts:27-34`) uses
-   `@supabase/supabase-js`'s `createClient` with `persistSession:
-   false` and a cookies-as-string input. It can READ the Cookie
-   header but has no way to WRITE Set-Cookie on the response. So
-   `exchangeCodeForSession` succeeds against Supabase Auth, gets a
-   valid session back, and drops it on the floor. The user bounces
-   right back to `/auth` via the dashboard's "no session → redirect
-   to /auth" guard.
+Both must be fixed together; fixing either alone leaves the user
+broken.
 
-**Fix (all required; TDD order; one PR):**
+## Fix (TDD order, single PR)
 
-A. **Write the failing integration test first.** New file
-   `apps/web/app/auth/callback/route.integration.test.ts` that stubs
-   `exchangeCodeForSession` and asserts, for each branch:
-   - **Success:** response is a 302 to `/`, with a `Set-Cookie`
-     header whose attributes include `HttpOnly`, `Secure`, and
-     `SameSite=Lax`.
-   - **Already-used / expired / network error:** response is a 302
-     to `/auth?error=<kind>` (kind ∈ `token_used`, `token_expired`,
-     `server_error`), NO Set-Cookie, NO session tokens or raw `code`
-     value in any log output (assert via a vi.spy on `console.error`).
-   - **No `code` / empty / whitespace `code`:** 302 to
-     `/auth?error=invalid_request` before any Supabase call is made.
+### A. Failing integration test first
 
-B. In `packages/db/src/server.ts`, add a new factory
-   `createSupabaseClientForRequest(adapter)` that uses `@supabase/ssr`'s
-   `createServerClient` with a full getAll/setAll cookies adapter and
-   `flowType: 'pkce'`. Rename the existing `supabaseServer` to
-   `createSupabaseClientForJobs` (read-only; used by Inngest and
-   cookie-less server contexts) so a future consumer can't silently
-   pick the read-only one for a cookie-writing surface — the council's
-   naming concern. Update all call sites (one-line import swap each).
-   Add a comment block at the top of server.ts explaining which
-   factory to pick and why. Pin the new `@supabase/ssr` dependency
-   version in `packages/db/package.json` + regenerate `pnpm-lock.yaml`.
+New file `apps/web/app/auth/callback/route.integration.test.ts`. Stubs
+`exchangeCodeForSession` and asserts each branch:
 
-C. In `apps/web/lib/supabase.ts`, have `supabaseForRequest()` use
-   `createSupabaseClientForRequest` with the `next/headers`
-   `cookies()` adapter. Wrap `setAll` in try/catch — Server Components
-   can't set cookies; swallow the throw there and let route handlers
-   + server actions write normally.
+- **Success:** 302 to `/`, with a `Set-Cookie` carrying `HttpOnly`,
+  `Secure`, `SameSite=Lax`.
+- **Already-used / expired / server error:** 302 to
+  `/auth?error=<kind>` for `kind ∈ {token_used, token_expired,
+  server_error}`. No `Set-Cookie`. No raw `code`, `access_token`, or
+  `refresh_token` in any `console.error` output (assert via
+  `vi.spyOn(console, 'error')`).
+- **Missing / empty / whitespace `code`:** 302 to
+  `/auth?error=invalid_request` before any Supabase call is made
+  (assert the stub is not invoked).
 
-D. In `apps/web/app/auth/callback/route.ts`, explicitly catch
-   `exchangeCodeForSession` failures. Map known Supabase error shapes
-   to error kinds (`token_used` if the code was consumed,
-   `token_expired` if the code is past TTL, `server_error` for
-   5xx / network). DO NOT log the incoming `code` query parameter,
-   the `access_token`, or the `refresh_token` under any branch. DO
-   log the error kind + sanitized error message (Supabase error kind,
-   no tokens). Redirect to `/auth?error=<kind>` on any failure.
+### B. New cookie-writing factory in `packages/db/src/server.ts`
 
-E. In `apps/web/app/auth/page.tsx`, read the `?error=` query param
-   (via `useSearchParams`) and render an `aria-live="assertive"`
-   error message with a kind-specific copy:
-   - `token_used` → "This sign-in link has already been used. Request a new one."
-   - `token_expired` → "This sign-in link has expired. Request a new one."
-   - `server_error` → "Could not sign you in right now. Please try again."
-   - `invalid_request` → "Sign-in link was invalid. Request a new one."
-   The form remains visible below so the user can request a fresh
-   link without extra clicks.
+Rename the existing read-only `supabaseServer` → `createSupabaseClientForJobs`
+(Inngest + cookie-less server contexts). Add
+`createSupabaseClientForRequest(adapter)` using `@supabase/ssr`'s
+`createServerClient` with a full `getAll` / `setAll` cookies adapter and
+`flowType: 'pkce'`. Header comment in `server.ts` documenting when to
+pick which — prevents a future consumer from silently re-using the
+read-only factory on a cookie-writing surface (council's naming
+concern).
 
-F. In the Supabase dashboard:
-   1. **Authentication → URL Configuration → Redirect URLs allowlist:**
-      confirm it contains ONLY `https://llmwiki-study-group.vercel.app/auth/callback`
-      + any preview-URL pattern. Remove any wildcards or non-project
-      origins. This is the open-redirect guard that complements the
-      server-side `APP_BASE_URL`-only policy in PR #17's magic-link
-      route.
-   2. **Authentication → Email Templates → Confirm signup + Magic
-      Link:** both must use the PKCE redirect URL format,
-      `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`. Default
-      templates send tokens in the URL fragment; PKCE requires the
-      code-query form. Verify and fix both templates.
-   3. Screenshot both dashboard sections and attach them to the PR
-      description as the pre-merge verification.
+Update all call sites (one-line import swap each).
 
-G. Update `README.md` "Deploy runbook" with the §F dashboard steps so
-   the checklist catches this in future environments.
+Pin `@supabase/ssr` in `packages/db/package.json`; regenerate
+`pnpm-lock.yaml`.
 
-**Rollback:** Revert the PR. User is back to current state (email
-delivers, but sign-in never completes). No additional regressions.
+### C. Wire the Next.js adapter in `apps/web/lib/supabase.ts`
 
-**Why this was never caught until now:** The magic-link button itself
-was broken all session (PRs #13 → #17 were fixing the send side).
-This is the FIRST successful magic-link email we've ever sent, so the
-callback flow has been untested since v0 scaffold (PR #5).
+`supabaseForRequest()` calls `createSupabaseClientForRequest` with the
+`next/headers` `cookies()` adapter. Wrap `setAll` in try/catch —
+Server Components can't set cookies (Next throws), so the catch runs
+there; route handlers and server actions write normally. On catch,
+log at `debug` level with no cookie values (council bugs r1) so the
+swallow isn't silent and a future maintainer misusing the adapter in
+a Server Component can find it.
 
-## Non-negotiables for the next session's fix PR
+Debug log message must explicitly state the expected cause (council
+security r2): `"supabase: setAll failed — expected in Server Component
+context, ignoring"`. Never include cookie values or names in the log
+line.
 
-Council r1 on PR #21 spelled these out explicitly; re-stated here so
-the fix PR's plan can mark them as already-inherited constraints:
+### D. Harden `apps/web/app/auth/callback/route.ts`
 
-- **No logging of `code` or session tokens.** Server-side logs must
-  redact both under every branch.
-- **Pin the `@supabase/ssr` version.** New dependency, lockfile must
-  reflect the pinned version.
-- **Supabase Redirect URLs allowlist** locked to `APP_BASE_URL`
-  before merge. Screenshot attached to PR description.
-- **Callback errors surface as user-facing messages**, not silent
-  redirects.
-- **Auth surface → council required.** No `[skip council]`.
+Catch `exchangeCodeForSession` failures explicitly. Map known Supabase
+error shapes to kinds:
 
-## Next session's opener (priority order)
+- consumed code → `token_used`
+- expired code → `token_expired`
+- 5xx / network → `server_error`
+- 200 OK with `data.session: null` → `server_error` (council bugs r1)
+- 200 OK with unparseable JSON body → `server_error` via the final
+  catch-all (council bugs r2)
+- any other thrown `Error` → `server_error` via a final catch-all so
+  the route can never return a 500 (council bugs r1)
 
-### 1. Fix the callback flow (implicit → PKCE + cookie adapter)
+**Redirect rules (non-negotiable, council bugs r2):** the success
+redirect destination is **hardcoded to `/`**. No query parameter
+(including `redirect_to`, `next`, `returnTo`, or any other caller-
+supplied value) may influence the destination URL. This closes the
+open-redirect vector the bugs persona flagged.
 
-See §Live bug at handoff above for the full diagnosis. This is the
-P0: without it, no user can complete a sign-in. Fix is auth surface
-→ plan + council required. Scope ~30-50 LoC across two files plus a
-Supabase dashboard config change.
+**Input validation (defense-in-depth, council security r2):** before
+invoking `exchangeCodeForSession`, validate the `code` param against a
+plausible charset (URL-safe base64 alphabet: `[A-Za-z0-9_\-]`) and
+length bound (reject `<16` or `>2048` chars). Fail to `invalid_request`.
+This is belt-and-suspenders; Supabase also validates, but a malformed
+code should never reach the network.
 
-### 2. Framework specialist council persona (issue #18)
+**Logging rules (non-negotiable):** never log `code`, `access_token`,
+or `refresh_token` under any branch. Log only the error kind + a
+sanitized Supabase error message. Redirect to `/auth?error=<kind>` on
+every failure branch.
 
-**Why:** Three sequential PRs this session all landed on
-Next.js / Vercel framework-boundary issues (static vs dynamic rendering;
-middleware vs prerender timing; client-bundle inlining semantics). The
-existing six personas (a11y, arch, bugs, cost, product, security) reason
-about general code quality, not framework-specific footguns. Adding a
-seventh persona collapses the three-PR arc into one. Would ideally
-also catch the callback bug above before it hits production.
+### E. Surface the error on `/auth/page.tsx`
 
-Draft `.harness/council/framework.md` covering:
-- App Router static vs dynamic (`○` vs `ƒ`) and how it interacts with
-  middleware / cookies / headers / CSP.
-- Build-time vs runtime `process.env` access (literal vs dynamic).
-- Edge runtime vs Node.js runtime differences.
-- Hydration error reach (async / pre-hydration failures bypass
-  `error.tsx`).
-- RSC / Flight payload flow and inline-script nonce stamping.
-- Cache-Control × Vercel Edge interaction.
-- `NEXT_PUBLIC_` prefix semantics (the "accidental client secret"
-  class).
-- Server Component vs Client Component module-graph implications
-  (`server-only`, `'use client'`).
+Read `?error=` via `useSearchParams`; render an `aria-live="assertive"`
+message with kind-specific copy selected by an **allowlist** (switch /
+object map) on the parameter value. The raw query-param value is
+NEVER rendered into the DOM — any unknown kind falls through to a
+generic "Sign-in failed. Request a new link." message. This closes
+the XSS vector the security persona flagged at r1.
 
-Include an explicit escape hatch: "if this diff does not touch
-Next.js / Vercel / React-server semantics, return `Score: 10` and
-`No framework concerns.`" — mitigates noise on DB migrations, pure
-styling changes, etc.
+Copy:
 
-Plan → PR → council r1 (the persona file is the thing being reviewed,
-so r1 will be self-referential but that's fine) → human approval →
-merge. `council.py` glob already scans `.harness/council/*.md` so no
-wiring change needed.
+- `token_used` → "This sign-in link has already been used. Request a new one."
+- `token_expired` → "This sign-in link has expired. Request a new one."
+- `server_error` → "Could not sign you in right now. Please try again."
+- `invalid_request` → "Sign-in link was invalid. Request a new one."
+- any other value → "Sign-in failed. Request a new link."
 
-### 3. Complete the sign-in → dashboard round trip
+Message text must meet **WCAG AA 4.5:1** contrast against its
+background (a11y r1).
 
-Once the button works:
-- Click magic link in email.
-- Land on `/auth/callback` (redirect-only route, excluded from
-  middleware).
-- Session cookie set; redirect to `/`.
-- Dashboard renders (cohort upsert, notes list, ingestion jobs).
-- Test a PDF upload end-to-end.
+Form stays visible below the message so the user can request a fresh
+link without extra clicks.
 
-This is the first real smoke test of the v0 vertical slice shipped
-in PR #5. If anything breaks on this path, it's the first real bug
-since the auth-flow blocker.
+### F. Supabase dashboard (manual, pre-merge)
 
-## Open issues queued by this session
+1. **Auth → URL Configuration → Redirect URLs allowlist:** only
+   `https://llmwiki-study-group.vercel.app/auth/callback` plus any
+   preview-URL pattern. No wildcards, no non-project origins.
+   Complements PR #17's `APP_BASE_URL`-only server policy.
+2. **Auth → Email Templates → Confirm signup AND Magic Link:** both
+   must use `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}` (PKCE
+   form). Default templates still carry the fragment form; both
+   templates need editing.
+3. Screenshot both sections; attach to the PR description as
+   pre-merge verification.
 
-- **#18** — Framework persona (above; next session's #1).
-- **#19** — Five PR #17 council r4 nice-to-haves: client `AbortSignal`
-  timeout, null-byte email test, case-variant bucket test, multi-IP
-  XFF test, serial IP→email rate check.
-- **#20** — Playwright nonce smoke test. Would have prevented the
-  PR #17 dead-button bug if it had existed.
-- **#14** — CSP `report-uri` endpoint.
-- **#15** — `style-src` hardening (remove `'unsafe-inline'`).
-- **#12** — `/diag` removal + error-boundary production hardening.
-  Now that the full fix arc is green, `/diag` can be deleted.
-  Low-effort cleanup.
-- **#7** — `db-tests` pgTAP flake (still `continue-on-error`).
-- **#6** — Storage RLS metadata refactor (v0 deferral).
+### G. Runbook update
 
-## Non-goals for next session
+Add §F to `README.md` "Deploy runbook" so the dashboard steps are in
+the checklist for any future environment.
 
-- Feature work (v1 kickoff waits for confirmed end-to-end sign-in
-  + a PDF upload smoke test).
-- Merging any of the open issues above without their own plan +
-  council round.
-- Re-opening the CSP nonce design.
+## Test matrix
 
-## Opening protocol (per CLAUDE.md)
+| Branch | Expected |
+|---|---|
+| valid `code`, stub returns session | 302 `/`, `Set-Cookie` HttpOnly+Secure+SameSite=Lax, `Path=/` |
+| stub throws `token_used` | 302 `/auth?error=token_used`, no Set-Cookie |
+| stub throws `token_expired` | 302 `/auth?error=token_expired`, no Set-Cookie |
+| stub throws 5xx / network | 302 `/auth?error=server_error`, no Set-Cookie |
+| stub returns 200 with `data.session: null` | 302 `/auth?error=server_error`, no Set-Cookie (council r1) |
+| stub throws generic `Error` | 302 `/auth?error=server_error`, no Set-Cookie, no 500 (council r1) |
+| missing `code` param | 302 `/auth?error=invalid_request`, stub NOT called |
+| empty `code` | same as missing |
+| whitespace-only `code` | same as missing |
+| `code` >4KB | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
+| `code` contains null byte / non-URL-safe chars | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
+| `code` outside URL-safe base64 alphabet (e.g. `foo'bar"baz<qux>`) | 302 `/auth?error=invalid_request`, stub NOT called (council bugs r2) |
+| `code` valid + extraneous `redirect_to=https://evil.com` | 302 to `/` (hardcoded), NOT to the supplied URL (council bugs r2 — open-redirect guard) |
+| stub returns 200 with unparseable JSON body | 302 `/auth?error=server_error` via final catch-all (council bugs r2) |
+| any failure branch | `console.error` spy sees no call whose args contain `code` / `access_token` / `refresh_token` (council r1) |
 
-1. Read `.harness/session_state.json`.
-2. Read last ~20 lines of `.harness/yolo_log.jsonl`.
-3. Read the 2026-04-19 16:55 UTC block in `.harness/learnings.md`.
-4. Read this plan (§Next session's opener).
-5. Human will provide the end-to-end sign-in test result.
-6. If sign-in works → go to roadmap item #1 (framework persona).
-7. If sign-in fails → diagnose via Vercel Runtime Logs + `[magic-link]`
-   server-side error lines before spinning new council.
+## Non-negotiables (inherited + council r1)
+
+Pre-existing (PR #21 handoff):
+
+- **No logging** of `code` or session tokens in any branch.
+- **Pin** `@supabase/ssr`; lockfile updated.
+- **Redirect URLs allowlist** locked to `APP_BASE_URL` pre-merge,
+  screenshot in PR body.
+- **Error surfacing** on `/auth` — no silent redirect.
+- **Council required** on this surface. No `[skip council]`.
+- **RLS unchanged.** Anon key only; no service-role exposure.
+
+Added by council r1:
+
+- **[security]** Integration test MUST `vi.spyOn(console, 'error')`
+  and assert no call's arguments contain `code`, `access_token`, or
+  `refresh_token` substrings under any failure branch. Single most
+  important safeguard per the security persona.
+- **[security]** `/auth/page.tsx` error rendering MUST use an
+  allowlist (switch / object map) on the `error` query-param value.
+  The raw param value is never rendered; unknown kinds fall through
+  to a generic message. Closes the XSS vector.
+- **[security]** Supabase dashboard screenshots (Redirect URLs
+  allowlist AND both email templates on the PKCE redirect form) must
+  be in the implementation PR body before merge.
+- **[a11y]** Error message MUST meet WCAG AA 4.5:1 contrast against
+  background. Verify at implementation.
+
+Added by council r2:
+
+- **[bugs]** Success-redirect destination is **hardcoded to `/`**.
+  No caller-supplied query param (`redirect_to`, `next`, etc.) may
+  influence the target URL. Tested by the extraneous-param row in
+  the matrix above. Open-redirect guard.
+- **[bugs]** Unparseable JSON from `exchangeCodeForSession` maps to
+  `server_error` via the final catch-all; explicit test row required.
+
+## Rollback
+
+Revert the PR. User returns to current state: email delivers, sign-in
+never completes. No additional regressions — this PR only touches the
+auth callback + its server-client factory; it does not migrate schema
+or change RLS.
+
+## Out of scope for this PR
+
+- Framework specialist persona (#18) — queued as next priority after
+  this P0 lands.
+- Playwright nonce smoke test (#20).
+- `/diag` removal (#12), CSP `report-uri` (#14), `style-src`
+  hardening (#15).
+- **i18n of the new error strings.** Hard-coded English copy is
+  acceptable for the P0 fix; externalization is a follow-up
+  (council a11y r1 noted this as a nice-to-have, not a blocker).
+- `pnpm audit` in CI. Council security r1 nice-to-have; separate
+  issue if we want it.
+- **`Set-Cookie` header exceeding browser max size.** Council bugs
+  r2 flagged this as a theoretical failure mode (browser silently
+  drops oversize cookies). Cookie name and size are controlled by
+  `@supabase/ssr`, which splits large sessions into chunked cookies
+  under the 4KB-per-cookie browser limit. Not mitigable in our code.
+  If sessions routinely exceed limits, that's a Supabase-library
+  issue to escalate — out of scope for this P0.
+- Any v1 feature work.
+
+## Success + kill criteria (council product r1)
+
+- **Success metric:** count of 302s from `/auth/callback` to `/` per
+  day (successful sign-ins). Track via existing server logs — no new
+  telemetry infra.
+- **Failure metric:** count of 302s from `/auth/callback` to
+  `/auth?error=<kind>` bucketed by kind.
+- **Kill criteria:** if total failure rate > 1% of sign-in attempts
+  24h after merge, revert the PR.
+- **Cost:** $0 marginal. Supabase Auth is MAU-billed, not per-call.
+
+## Council history
+
+- **r1** (PR #22 @ commit `1ae040f`, 2026-04-19T18:48:54Z) — PROCEED,
+  a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Four
+  new non-negotiables folded into this plan.
+- **r2** (PR #22 @ commit `ea3fc8a`, 2026-04-19T18:56:52Z) — PROCEED,
+  a11y **9** / arch 10 / bugs 9 / cost 10 / product 10 / security 9.
+  Five additions folded: open-redirect guard, unparseable-JSON test,
+  special-char code test, debug-log wording, defense-in-depth
+  charset/length validation on `code`. Full report:
+  [PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
+
+## Approval checklist (CLAUDE.md gate)
+
+Before writing implementation code, all three must be true:
+
+1. This file is committed on `claude/plan-session-agenda-rRwWN` and
+   pushed to origin.
+2. A PR is open against `main`; the latest `<!-- council-report -->`
+   comment from `.github/workflows/council.yml` was posted against a
+   commit SHA ≥ the commit that last modified this plan.
+3. The human has typed an explicit `approved` / `ship it` / `proceed`
+   after seeing (1) and (2).
+
+If any gate fails, stop and surface the gap.
