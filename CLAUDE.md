@@ -79,6 +79,16 @@ The `post-commit` git hook handles `last_commit` bookkeeping automatically — d
 - Cost-impacting change (token budget, model swap, cache policy).
 - Change that crosses the server/client boundary in Next.js.
 
+**Council is also required for institutional-knowledge content** — files that future sessions read as ground truth on startup or load into every council review. Specifically:
+
+- Any append to `.harness/learnings.md`. KEEP / IMPROVE / INSIGHT / COUNCIL entries compound across sessions; a single wrong claim in an INSIGHT block warps downstream decisions for as long as the file is read. Diff size does not determine review need; downstream leverage does.
+- Any edit to `.harness/council/*.md` persona files. Changing a persona changes the lens every future council review uses — a meta-change with compounding blast radius.
+- Any edit to `CLAUDE.md` itself (this file). Every session reads it at startup; wording changes are behavior changes.
+
+Mechanical session-state updates — `.harness/session_state.json` pointers and `.harness/yolo_log.jsonl` event appends — are factual bookkeeping (pointing at SHAs, timestamps, PR numbers) and remain council-exempt. If a `session_state.json` change includes narrative `notes` text that is doing the work of a learnings entry, route it through council instead.
+
+**Anti-pattern (forbidden, learned 2026-04-20):** Marking a session-reflection PR `[skip council]` because "the diff is small" or "it's just documentation." See the reflection entry dated 2026-04-20 for the specific violation. The `[skip council]` bypass is reserved for truly mechanical changes from the skip list (typo fixes, single-line bug fixes, comment edits, reverting a failed change) — not for content that future agents will treat as load-bearing truth.
+
 The council reads the personas in `.harness/council/` (one per axis, excluding `lead-architect.md` and `README.md`) and the Lead Architect synthesizes a single authoritative plan. Present the synthesis to the human before executing.
 
 **Cost caps:**
