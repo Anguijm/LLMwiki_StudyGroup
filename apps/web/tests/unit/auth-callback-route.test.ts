@@ -433,6 +433,24 @@ describe('GET /auth/callback — rate limiting (council r4 blocker)', () => {
     expect(reserveSpy).toHaveBeenCalledWith('203.0.113.9');
   });
 
+  it('falls back to x-real-ip when x-forwarded-for is absent (council bugs r6)', async () => {
+    // Some deployment targets (non-Vercel edges, local docker, odd
+    // proxy chains) set x-real-ip instead of x-forwarded-for. The
+    // implementation tries XFF first, then XRI, then the shared
+    // no-xff bucket. Lock the XRI branch in.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const req = new NextRequest(
+      new URL(`https://example.test/auth/callback?code=${VALID_CODE}`),
+      { headers: { 'x-real-ip': '198.51.100.5' } },
+    );
+    await GET(req);
+    expect(reserveSpy).toHaveBeenCalledWith('198.51.100.5');
+  });
+
   it('falls back to a shared "no-xff" bucket when XFF is missing', async () => {
     // Fail-closed on missing IP (a la /api/auth/magic-link) would bounce
     // any user behind an odd proxy chain. Shared bucket is worse for
