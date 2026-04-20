@@ -1,284 +1,151 @@
-# Plan: fix auth callback flow (implicit → PKCE + cookie-writing adapter)
+# Plan: fix magic-link email template (PKCE `ConfirmationURL`, not `TokenHash`)
 
 **Status:** draft, awaiting council + human approval.
-**Branch:** `claude/plan-session-agenda-rRwWN`.
-**Scope:** auth surface — non-negotiable council run required.
-**P0:** without this, no user can complete sign-in.
+**Branch:** `claude/plan-session-agenda-DWzNf`.
+**Scope:** auth surface + institutional-knowledge correction — non-negotiable council run required.
+**P0:** without this, no user can complete sign-in on production. PR #22 shipped a half-fix; the template side was wrong.
 
 ## Problem
 
-First real magic-link email sent after the PR #13/#16/#17 arc landed. The
-email arrives correctly, but clicking the "Confirm" link redirects the
-user back to `/auth` with the session tokens sitting in a URL fragment:
+Human smoke test on production (2026-04-21, Android Chrome + Gmail, same-device same-browser) bounces back to `/auth` with the generic "Could not sign you in right now" copy. Two consecutive attempts, both failed identically.
+
+Evidence trail:
+
+1. Vercel runtime log, `requestPath=/auth/callback`, level=error: `[auth/callback] sign-in failed { kind: 'server_error' }`. No preceding `[auth/callback] unexpected exchange failure` line → the try-block did not throw; `exchangeCodeForSession` returned a `{ error }` shape that fell through `mapSupabaseError`.
+2. Supabase Dashboard Logs → Auth, same attempt: `/token | 404: invalid flow state, no valid flow state found`. This is the upstream error `mapSupabaseError` couldn't classify.
+3. Both attempts produced `server_error`, not `token_used`. If Gmail prefetch had consumed the code the second click would have matched `invalid_grant` → `token_used`. It didn't. The failure is structural, not code-reuse.
+
+## Root cause
+
+PR #22 set both email templates (Confirm signup, Magic Link) to
 
 ```
-https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&type=signup
+{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}
 ```
 
-Refreshing `/auth` shows the user still logged out. The session is never
-persisted.
+and documented this pattern as correct for PKCE in `.harness/learnings.md` 2026-04-20 18:20 UTC INSIGHT block and `README.md` §B.6.
 
-## Root cause (two bugs stacked)
+**That template is the primitive for `supabase.auth.verifyOtp({ token_hash, type })`.** It is NOT the primitive for `supabase.auth.exchangeCodeForSession(code)`, which is what our callback at `apps/web/app/auth/callback/route.ts:159` calls.
 
-1. **Flow mismatch — implicit vs PKCE.** Supabase is on the default
-   `flowType: 'implicit'` (tokens in the URL fragment for client-side
-   parsing). Our `/auth/callback` is written for PKCE (`?code=...` query
-   param + server-side `exchangeCodeForSession`). The email also renders
-   as "Confirm signup" rather than "Magic Link" — both templates can
-   diverge in the Supabase dashboard and both need the PKCE redirect
-   form.
-2. **Cookie adapter is read-only.** `packages/db/src/server.ts:27-34`
-   builds the server client with `@supabase/supabase-js`'s `createClient`
-   and a Cookie-header string. It can READ cookies but has no way to
-   WRITE `Set-Cookie` on the response. Even once PKCE is enabled and
-   `/auth/callback?code=...` fires, `exchangeCodeForSession` succeeds
-   against Supabase Auth and then drops the resulting session on the
-   floor — no cookie is written, so the dashboard's "no session" guard
-   bounces the user straight back to `/auth`.
+Concretely:
 
-Both must be fixed together; fixing either alone leaves the user
-broken.
+- `{{ .TokenHash }}` is a hash of the OTP. No `auth.flow_state` row is keyed by it.
+- `exchangeCodeForSession(code)` looks up a PKCE `flow_state` by the `code` argument. Receiving a `token_hash` instead of a PKCE `code` produces the exact "no valid flow state found" 404 we observed.
 
-## Fix (TDD order, single PR)
+The PR #22 plan → council → merge loop never caught this because nobody clicked a live magic link end-to-end before merge. Dashboard screenshots were attached but no human sign-in smoke test preceded approval. The reflection review (PR #25 r1) caught two other mis-generalizations but did not verify the template claim against Supabase's PKCE docs.
 
-### A. Failing integration test first
+## Fix (Supabase Dashboard + docs + learnings correction — zero Next.js code change)
 
-New file `apps/web/app/auth/callback/route.integration.test.ts`. Stubs
-`exchangeCodeForSession` and asserts each branch:
+The callback already does the right thing; the email link just needs to point at the right primitive. Supabase's default `{{ .ConfirmationURL }}` renders to `https://<project>.supabase.co/auth/v1/verify?token=<hash>&type=<type>&redirect_to=<our_callback>`. Supabase verifies the OTP, creates the PKCE `flow_state`, and redirects to `/auth/callback?code=<real_pkce_code>`. Our existing `exchangeCodeForSession(code)` then exchanges a real PKCE code against a real flow state — which is what the code was written for.
 
-- **Success:** 302 to `/`, with a `Set-Cookie` carrying `HttpOnly`,
-  `Secure`, `SameSite=Lax`.
-- **Already-used / expired / server error:** 302 to
-  `/auth?error=<kind>` for `kind ∈ {token_used, token_expired,
-  server_error}`. No `Set-Cookie`. No raw `code`, `access_token`, or
-  `refresh_token` in any `console.error` output (assert via
-  `vi.spyOn(console, 'error')`).
-- **Missing / empty / whitespace `code`:** 302 to
-  `/auth?error=invalid_request` before any Supabase call is made
-  (assert the stub is not invoked).
+### A. Supabase Dashboard (manual, pre-merge)
 
-### B. New cookie-writing factory in `packages/db/src/server.ts`
+1. **Auth → Email Templates → Magic Link:** replace the custom `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}` body link with Supabase's default that uses `{{ .ConfirmationURL }}`. Standard snippet:
+   ```html
+   <a href="{{ .ConfirmationURL }}">Log In</a>
+   ```
+2. **Auth → Email Templates → Confirm signup:** same change. Both templates are independent; both must be edited.
+3. **Auth → URL Configuration → Redirect URLs allowlist:** confirm `https://llmwiki-study-group.vercel.app/auth/callback` + the preview wildcard are still present. `{{ .ConfirmationURL }}` uses `emailRedirectTo` as its `redirect_to`; an allowlist miss would 400 the verify step. No change expected, just verification.
+4. Screenshot each of the three panes; attach to the PR body as pre-merge evidence. Keep the naming scheme PR #22 established.
 
-Rename the existing read-only `supabaseServer` → `createSupabaseClientForJobs`
-(Inngest + cookie-less server contexts). Add
-`createSupabaseClientForRequest(adapter)` using `@supabase/ssr`'s
-`createServerClient` with a full `getAll` / `setAll` cookies adapter and
-`flowType: 'pkce'`. Header comment in `server.ts` documenting when to
-pick which — prevents a future consumer from silently re-using the
-read-only factory on a cookie-writing surface (council's naming
-concern).
+### B. Human smoke test post-dashboard-change, pre-merge
 
-Update all call sites (one-line import swap each).
+The human performs a real end-to-end sign-in on production (magic link to real inbox, click from the same device/browser, confirm redirect to `/` with a session cookie). **This is a merge gate, not a post-merge check.** The class of bug this plan exists to fix is specifically the kind that unit tests and dashboard screenshots cannot catch.
 
-Pin `@supabase/ssr` in `packages/db/package.json`; regenerate
-`pnpm-lock.yaml`.
+Pass criteria:
 
-### C. Wire the Next.js adapter in `apps/web/lib/supabase.ts`
+- `/auth/callback` returns 307 to `/` (not to `/auth?error=...`).
+- Landing on `/` shows the authenticated surface (not a middleware bounce back to `/auth`).
+- Supabase Dashboard → Logs → Auth shows `/token | request completed` with no 404 immediately after.
 
-`supabaseForRequest()` calls `createSupabaseClientForRequest` with the
-`next/headers` `cookies()` adapter. Wrap `setAll` in try/catch —
-Server Components can't set cookies (Next throws), so the catch runs
-there; route handlers and server actions write normally. On catch,
-log at `debug` level with no cookie values (council bugs r1) so the
-swallow isn't silent and a future maintainer misusing the adapter in
-a Server Component can find it.
+If any of the three fail, revert the template changes, re-open the plan.
 
-Debug log message must explicitly state the expected cause (council
-security r2): `"supabase: setAll failed — expected in Server Component
-context, ignoring"`. Never include cookie values or names in the log
-line.
+### C. Runbook correction — `README.md` §B.6
 
-### D. Harden `apps/web/app/auth/callback/route.ts`
+Rewrite the template instructions. Replace the `?code={{ .TokenHash }}` recipe with:
 
-Catch `exchangeCodeForSession` failures explicitly. Map known Supabase
-error shapes to kinds:
+- Default template (`{{ .ConfirmationURL }}`) + `exchangeCodeForSession(code)` in the callback. ← What we do.
+- Alternative (documented, not recommended for this repo): custom `?token_hash=&type=` template + `verifyOtp({ token_hash, type })`. Call out explicitly that the template choice binds the callback primitive — one implies the other, picking the wrong pair is the bug that landed this plan.
 
-- consumed code → `token_used`
-- expired code → `token_expired`
-- 5xx / network → `server_error`
-- 200 OK with `data.session: null` → `server_error` (council bugs r1)
-- 200 OK with unparseable JSON body → `server_error` via the final
-  catch-all (council bugs r2)
-- any other thrown `Error` → `server_error` via a final catch-all so
-  the route can never return a 500 (council bugs r1)
+Link to Supabase's PKCE flow docs inline so a future operator can verify directly against upstream rather than trusting this file.
 
-**Redirect rules (non-negotiable, council bugs r2):** the success
-redirect destination is **hardcoded to `/`**. No query parameter
-(including `redirect_to`, `next`, `returnTo`, or any other caller-
-supplied value) may influence the destination URL. This closes the
-open-redirect vector the bugs persona flagged.
+### D. Learnings correction — `.harness/learnings.md`
 
-**Input validation (defense-in-depth, council security r2):** before
-invoking `exchangeCodeForSession`, validate the `code` param against a
-plausible charset (URL-safe base64 alphabet: `[A-Za-z0-9_\-]`) and
-length bound (reject `<16` or `>2048` chars). Fail to `invalid_request`.
-This is belt-and-suspenders; Supabase also validates, but a malformed
-code should never reach the network.
+Append a new reflection entry dated today (2026-04-21) with KEEP / IMPROVE / INSIGHT / COUNCIL blocks covering:
 
-**Logging rules (non-negotiable):** never log `code`, `access_token`,
-or `refresh_token` under any branch. Log only the error kind + a
-sanitized Supabase error message. Redirect to `/auth?error=<kind>` on
-every failure branch.
+- **KEEP:** human smoke test as a merge gate for auth changes. Supabase Dashboard Logs → Auth as a first-look diagnostic path. Plan-first protocol enabling this corrective PR to land through council rather than as a hot-fix.
+- **IMPROVE:** PR #22 merged an auth fix without a live end-to-end sign-in. Dashboard screenshots are not a substitute for a single real click-through. Future auth-surface PRs include a human smoke test row in the test matrix and do not merge until it's checked.
+- **INSIGHT:** the Supabase PKCE email-template choice binds the callback primitive. `{{ .ConfirmationURL }}` ↔ `exchangeCodeForSession(code)`. `?token_hash=&type=` ↔ `verifyOtp({ token_hash, type })`. Mixing pairs produces "no valid flow state found" at the `/token` endpoint with no client-visible diagnostic. Explicitly annotate the prior PR #22 INSIGHT block as superseded — do not silently edit the old entry; leave it visible so the correction trail survives.
+- **COUNCIL:** this plan's rounds.
 
-### E. Surface the error on `/auth/page.tsx`
+Also add a ground-truth-drift note: the PR #25 reflection review narrowed two insights against live code, but did not verify the template claim against Supabase docs. Knowledge-content review catches logic mis-generalizations; it doesn't catch upstream-fact errors unless the reviewer is asked to verify against upstream. Future persona reviews on auth content should explicitly instruct a docs cross-check.
 
-Read `?error=` via `useSearchParams`; render an `aria-live="assertive"`
-message with kind-specific copy selected by an **allowlist** (switch /
-object map) on the parameter value. The raw query-param value is
-NEVER rendered into the DOM — any unknown kind falls through to a
-generic "Sign-in failed. Request a new link." message. This closes
-the XSS vector the security persona flagged at r1.
+### E. Mark prior PR #22 INSIGHT as superseded
 
-Copy:
+In-place note on the 2026-04-20 18:20 UTC INSIGHT bullet about PKCE email templates. One line:
 
-- `token_used` → "This sign-in link has already been used. Request a new one."
-- `token_expired` → "This sign-in link has expired. Request a new one."
-- `server_error` → "Could not sign you in right now. Please try again."
-- `invalid_request` → "Sign-in link was invalid. Request a new one."
-- any other value → "Sign-in failed. Request a new link."
+> **SUPERSEDED 2026-04-21:** the `?code={{ .TokenHash }}` template is for `verifyOtp`, not `exchangeCodeForSession`. See 2026-04-21 entry for the correction. Template was the root cause of the observed sign-in failure.
 
-Message text must meet **WCAG AA 4.5:1** contrast against its
-background (a11y r1).
-
-Form stays visible below the message so the user can request a fresh
-link without extra clicks.
-
-### F. Supabase dashboard (manual, pre-merge)
-
-1. **Auth → URL Configuration → Redirect URLs allowlist:** only
-   `https://llmwiki-study-group.vercel.app/auth/callback` plus any
-   preview-URL pattern. No wildcards, no non-project origins.
-   Complements PR #17's `APP_BASE_URL`-only server policy.
-2. **Auth → Email Templates → Confirm signup AND Magic Link:** both
-   must use `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}` (PKCE
-   form). Default templates still carry the fragment form; both
-   templates need editing.
-3. Screenshot both sections; attach to the PR description as
-   pre-merge verification.
-
-### G. Runbook update
-
-Add §F to `README.md` "Deploy runbook" so the dashboard steps are in
-the checklist for any future environment.
-
-## Test matrix
-
-| Branch | Expected |
-|---|---|
-| valid `code`, stub returns session | 302 `/`, `Set-Cookie` HttpOnly+Secure+SameSite=Lax, `Path=/` |
-| stub throws `token_used` | 302 `/auth?error=token_used`, no Set-Cookie |
-| stub throws `token_expired` | 302 `/auth?error=token_expired`, no Set-Cookie |
-| stub throws 5xx / network | 302 `/auth?error=server_error`, no Set-Cookie |
-| stub returns 200 with `data.session: null` | 302 `/auth?error=server_error`, no Set-Cookie (council r1) |
-| stub throws generic `Error` | 302 `/auth?error=server_error`, no Set-Cookie, no 500 (council r1) |
-| missing `code` param | 302 `/auth?error=invalid_request`, stub NOT called |
-| empty `code` | same as missing |
-| whitespace-only `code` | same as missing |
-| `code` >4KB | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
-| `code` contains null byte / non-URL-safe chars | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
-| `code` outside URL-safe base64 alphabet (e.g. `foo'bar"baz<qux>`) | 302 `/auth?error=invalid_request`, stub NOT called (council bugs r2) |
-| `code` valid + extraneous `redirect_to=https://evil.com` | 302 to `/` (hardcoded), NOT to the supplied URL (council bugs r2 — open-redirect guard) |
-| stub returns 200 with unparseable JSON body | 302 `/auth?error=server_error` via final catch-all (council bugs r2) |
-| any failure branch | `console.error` spy sees no call whose args contain `code` / `access_token` / `refresh_token` (council r1) |
-
-## Non-negotiables (inherited + council r1)
-
-Pre-existing (PR #21 handoff):
-
-- **No logging** of `code` or session tokens in any branch.
-- **Pin** `@supabase/ssr`; lockfile updated.
-- **Redirect URLs allowlist** locked to `APP_BASE_URL` pre-merge,
-  screenshot in PR body.
-- **Error surfacing** on `/auth` — no silent redirect.
-- **Council required** on this surface. No `[skip council]`.
-- **RLS unchanged.** Anon key only; no service-role exposure.
-
-Added by council r1:
-
-- **[security]** Integration test MUST `vi.spyOn(console, 'error')`
-  and assert no call's arguments contain `code`, `access_token`, or
-  `refresh_token` substrings under any failure branch. Single most
-  important safeguard per the security persona.
-- **[security]** `/auth/page.tsx` error rendering MUST use an
-  allowlist (switch / object map) on the `error` query-param value.
-  The raw param value is never rendered; unknown kinds fall through
-  to a generic message. Closes the XSS vector.
-- **[security]** Supabase dashboard screenshots (Redirect URLs
-  allowlist AND both email templates on the PKCE redirect form) must
-  be in the implementation PR body before merge.
-- **[a11y]** Error message MUST meet WCAG AA 4.5:1 contrast against
-  background. Verify at implementation.
-
-Added by council r2:
-
-- **[bugs]** Success-redirect destination is **hardcoded to `/`**.
-  No caller-supplied query param (`redirect_to`, `next`, etc.) may
-  influence the target URL. Tested by the extraneous-param row in
-  the matrix above. Open-redirect guard.
-- **[bugs]** Unparseable JSON from `exchangeCodeForSession` maps to
-  `server_error` via the final catch-all; explicit test row required.
-
-## Rollback
-
-Revert the PR. User returns to current state: email delivers, sign-in
-never completes. No additional regressions — this PR only touches the
-auth callback + its server-client factory; it does not migrate schema
-or change RLS.
+Don't delete the original text. Leaving the wrong claim visible with a correction pointer is how future agents learn the lesson rather than re-discovering it.
 
 ## Out of scope for this PR
 
-- Framework specialist persona (#18) — queued as next priority after
-  this P0 lands.
-- Playwright nonce smoke test (#20).
-- `/diag` removal (#12), CSP `report-uri` (#14), `style-src`
-  hardening (#15).
-- **i18n of the new error strings.** Hard-coded English copy is
-  acceptable for the P0 fix; externalization is a follow-up
-  (council a11y r1 noted this as a nice-to-have, not a blocker).
-- `pnpm audit` in CI. Council security r1 nice-to-have; separate
-  issue if we want it.
-- **`Set-Cookie` header exceeding browser max size.** Council bugs
-  r2 flagged this as a theoretical failure mode (browser silently
-  drops oversize cookies). Cookie name and size are controlled by
-  `@supabase/ssr`, which splits large sessions into chunked cookies
-  under the 4KB-per-cookie browser limit. Not mitigable in our code.
-  If sessions routinely exceed limits, that's a Supabase-library
-  issue to escalate — out of scope for this P0.
+- **Playwright end-to-end smoke test (issue #20).** The ideal regression guard for this class of bug is a headless run that clicks a real link, but Playwright setup is non-trivial (Supabase test-user provisioning, email-capture fixture, CI secrets). Stays as issue #20; add a reference to this plan in that issue so the motivation survives.
+- **`mapSupabaseError` regex extension** to classify "no valid flow state" as its own kind. Once the template is correct, this path is unreachable for a properly-configured project. If it fires again in prod it's a genuine server_error and the generic copy is correct.
+- **Issue #26** (transactional setAll + fail-open alerting) remains queued; separate surface, separate PR.
+- **Terraform / Management API for dashboard state.** Council carry-out from PR #22. Would have prevented this regression but is a v1 workstream.
 - Any v1 feature work.
 
-## Success + kill criteria (council product r1)
+## Test matrix
 
-- **Success metric:** count of 302s from `/auth/callback` to `/` per
-  day (successful sign-ins). Track via existing server logs — no new
-  telemetry infra.
-- **Failure metric:** count of 302s from `/auth/callback` to
-  `/auth?error=<kind>` bucketed by kind.
-- **Kill criteria:** if total failure rate > 1% of sign-in attempts
-  24h after merge, revert the PR.
-- **Cost:** $0 marginal. Supabase Auth is MAU-billed, not per-call.
+This plan is primarily a configuration + docs change. No new automated tests are added because the callback/route integration tests from PR #22 already cover the code path; the bug is upstream of the code. The smoke test in §B is the acceptance test.
+
+| Step | Expected |
+|---|---|
+| Magic Link template rendered with a test send | Link URL starts with `https://<project>.supabase.co/auth/v1/verify?token=...&type=magiclink&redirect_to=...`, NOT `https://llmwiki-study-group.vercel.app/auth/callback?code=...` |
+| Confirm signup template rendered with a test send | Same shape as above, `type=signup` |
+| Click the Magic Link from a real inbox on the same device/browser as the form submission | 307 to `/auth/callback`, callback returns 307 to `/`, landing page shows authenticated surface |
+| Supabase Dashboard Logs → Auth during the click | `/token \| request completed`, no 404 |
+| Vercel runtime log during the click | No `[auth/callback] sign-in failed` line |
+| Redirect URLs allowlist unchanged | Entry `https://llmwiki-study-group.vercel.app/auth/callback` present; preview wildcard present |
+
+## Rollback
+
+Revert the template changes in the Supabase Dashboard (restore `?code={{ .TokenHash }}` form). User returns to the observed broken state. Revert the README and learnings commits via `git revert`. No schema, RLS, code, or dependency changes to undo.
+
+## Non-negotiables (inherited + this plan)
+
+Inherited:
+
+- **RLS unchanged.** Anon key only; no service-role exposure.
+- **No logging** of `code` or session tokens in any branch. The callback at `apps/web/app/auth/callback/route.ts:175-180` already redacts.
+- **Redirect URLs allowlist** unchanged; APP_BASE_URL-only server policy from PR #17 stands.
+- **Error surfacing** on `/auth` — no silent redirect. Unchanged; we're not touching the error rendering surface.
+- **Council required.** No `[skip council]` under any framing. The CLAUDE.md institutional-knowledge clause means `learnings.md` and `README.md` edits route through council even when there is no code diff.
+
+Added by this plan:
+
+- **[product]** Human smoke test is a merge gate for this PR. No merge without the §B pass criteria in the PR body.
+- **[product]** Dashboard screenshots attached pre-merge (both templates + URL configuration).
+- **[institutional knowledge]** Prior PR #22 INSIGHT block annotated as superseded, not deleted. Correction trail survives.
+- **[institutional knowledge]** New reflection entry records the `{{ .ConfirmationURL }}` ↔ `exchangeCodeForSession` / `?token_hash` ↔ `verifyOtp` binding so future sessions can't mix the pairs.
+
+## Success + kill criteria
+
+- **Success metric:** first human sign-in on production completes 302 → `/` with a valid session. Follow-on: the 24h callback-error rate from the shipped logging drops to the Vercel-noise floor (< 1% of attempts).
+- **Failure metric:** same log-derived callback-error rate. If > 5% 24h post-merge, revert the template changes and re-open this plan.
+- **Cost:** $0 marginal. Supabase Auth is MAU-billed; this plan does not change volume.
 
 ## Council history
 
-- **r1** (PR #22 @ commit `1ae040f`, 2026-04-19T18:48:54Z) — PROCEED,
-  a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Four
-  new non-negotiables folded into this plan.
-- **r2** (PR #22 @ commit `ea3fc8a`, 2026-04-19T18:56:52Z) — PROCEED,
-  a11y **9** / arch 10 / bugs 9 / cost 10 / product 10 / security 9.
-  Five additions folded: open-redirect guard, unparseable-JSON test,
-  special-char code test, debug-log wording, defense-in-depth
-  charset/length validation on `code`. Full report:
-  [PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
+- Awaiting r1.
 
 ## Approval checklist (CLAUDE.md gate)
 
-Before writing implementation code, all three must be true:
+Before any implementation work (dashboard edits count as implementation), all three must be true:
 
-1. This file is committed on `claude/plan-session-agenda-rRwWN` and
-   pushed to origin.
-2. A PR is open against `main`; the latest `<!-- council-report -->`
-   comment from `.github/workflows/council.yml` was posted against a
-   commit SHA ≥ the commit that last modified this plan.
-3. The human has typed an explicit `approved` / `ship it` / `proceed`
-   after seeing (1) and (2).
+1. This file is committed on `claude/plan-session-agenda-DWzNf` and pushed to origin.
+2. A PR is open against `main`; the latest `<!-- council-report -->` comment from `.github/workflows/council.yml` was posted against a commit SHA ≥ the commit that last modified this plan.
+3. The human has typed an explicit `approved` / `ship it` / `proceed` after seeing (1) and (2).
 
 If any gate fails, stop and surface the gap.
