@@ -1,284 +1,276 @@
-# Plan: fix auth callback flow (implicit → PKCE + cookie-writing adapter)
+# Plan: auth hardening — transactional cookie-write + rate-limit fail-open alerting (issue #26)
 
 **Status:** draft, awaiting council + human approval.
-**Branch:** `claude/plan-session-agenda-rRwWN`.
-**Scope:** auth surface — non-negotiable council run required.
-**P0:** without this, no user can complete sign-in.
+**Branch:** `claude/issue-26-auth-hardening`.
+**Scope:** auth surface — non-negotiable council run required. No `[skip council]`.
+**P0:** council r2 on PR #25 explicitly designated #26 as top-priority; its kill criterion was "the next session begins with a task other than the P0-designated issue #26."
 
 ## Problem
 
-First real magic-link email sent after the PR #13/#16/#17 arc landed. The
-email arrives correctly, but clicking the "Confirm" link redirects the
-user back to `/auth` with the session tokens sitting in a URL fragment:
+Two shipped-code bugs that council r1 on PR #25 flagged via reflection review of PR #22 (`e9fc1b4`):
 
-```
-https://llmwiki-study-group.vercel.app/auth#access_token=<JWT>&expires_at=...&refresh_token=...&type=signup
-```
+1. **`setAll` in `apps/web/lib/supabase.ts` is best-effort in an auth context.** The adapter's `setAll` iterates `cookiesToSet`, catches per-write failures, discriminates expected RSC read-only throws (swallow) from unexpected throws (accumulate), and emits a single post-loop summary log for the unexpected ones. For non-auth batch writes that pattern is fine. For session-cookie writes it is not: if one chunk fails and the rest succeed, the route handler's success branch still redirects to `/`, the browser holds a partial/invalid session, the next request bounces through the auth guard back to `/auth`, and the user sees a silent failure after clicking a valid link.
 
-Refreshing `/auth` shows the user still logged out. The session is never
-persisted.
+2. **Tier D rate limiter (`packages/lib/ratelimit/src/index.ts` → `makeAuthCallbackLimiter`) fails open silently on Upstash outage.** Fail-open is the correct tradeoff (a Redis blip must not 503 a legitimate magic-link click); silence is not. If Upstash stays down, the `/auth/callback` DOS guard is gone with zero visibility and no future monitor can alert on it. Council security r2 on PR #25: *"A silently disabled control is not a control."*
 
-## Root cause (two bugs stacked)
+Plus three edge cases the council surfaced on PR #25 r2 that must be covered in the same PR:
 
-1. **Flow mismatch — implicit vs PKCE.** Supabase is on the default
-   `flowType: 'implicit'` (tokens in the URL fragment for client-side
-   parsing). Our `/auth/callback` is written for PKCE (`?code=...` query
-   param + server-side `exchangeCodeForSession`). The email also renders
-   as "Confirm signup" rather than "Magic Link" — both templates can
-   diverge in the Supabase dashboard and both need the PKCE redirect
-   form.
-2. **Cookie adapter is read-only.** `packages/db/src/server.ts:27-34`
-   builds the server client with `@supabase/supabase-js`'s `createClient`
-   and a Cookie-header string. It can READ cookies but has no way to
-   WRITE `Set-Cookie` on the response. Even once PKCE is enabled and
-   `/auth/callback?code=...` fires, `exchangeCodeForSession` succeeds
-   against Supabase Auth and then drops the resulting session on the
-   floor — no cookie is written, so the dashboard's "no session" guard
-   bounces the user straight back to `/auth`.
+3. **Double-click / mail-client prefetch** — Outlook Safe Links and similar consume the single-use PKCE code before the user clicks; the second request hits `exchangeCodeForSession` with a consumed code and should cleanly map to `token_used`. `mapSupabaseError` already targets this (`/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/`), but the code path has no explicit test and no prefetch-as-first-GET scenario exists in the suite.
 
-Both must be fixed together; fixing either alone leaves the user
-broken.
+4. **Supabase 200 OK with missing / malformed session payload** — Today this maps to `server_error` via the `!data?.session` branch. Council r2 suggested either (a) adding a dedicated `exchange_failed` error kind, or (b) documenting the explicit decision to keep the mapping. This plan chooses **(b): keep `server_error`**. Rationale: `server_error` copy ("Could not sign you in right now. Please try again.") correctly invites a retry, which is the right user action for any "Supabase replied but something's off" case — whether the session is null, the body is malformed, or a generic Error was thrown. Splitting into `exchange_failed` adds a user-facing kind that produces identical copy, leaks Supabase internals into our error taxonomy, and expands the `/auth` allowlist for no user benefit. Documented at the `!data?.session` branch in `route.ts` so the non-choice is explicit.
+
+5. **Cross-tab auth state sync** — Explicitly out of scope per the issue; tracked separately.
+
+## Root cause
+
+Both code bugs trace to reasonable-at-the-time decisions that didn't anticipate the auth failure mode:
+
+- The `setAll` accumulator pattern was written assuming best-effort is acceptable because the RSC case dominates. It isn't — Route Handlers and Server Actions both call through this adapter, and for those a partial write IS a real failure.
+- The rate-limiter fail-open was chosen deliberately (`reserve`'s internal docstring: *"a transient Redis outage must not deny a legit user's link-click"*). The design was correct; the observability affordance was missed.
 
 ## Fix (TDD order, single PR)
 
-### A. Failing integration test first
+### A. Failing tests first
 
-New file `apps/web/app/auth/callback/route.integration.test.ts`. Stubs
-`exchangeCodeForSession` and asserts each branch:
+New and extended tests in `apps/web/lib/supabase.test.ts`, `apps/web/tests/unit/auth-callback-route.test.ts`, and `packages/lib/ratelimit/src/index.test.ts` (new file if it doesn't exist). Run before any implementation; all must fail against current `main`.
 
-- **Success:** 302 to `/`, with a `Set-Cookie` carrying `HttpOnly`,
-  `Secure`, `SameSite=Lax`.
-- **Already-used / expired / server error:** 302 to
-  `/auth?error=<kind>` for `kind ∈ {token_used, token_expired,
-  server_error}`. No `Set-Cookie`. No raw `code`, `access_token`, or
-  `refresh_token` in any `console.error` output (assert via
-  `vi.spyOn(console, 'error')`).
-- **Missing / empty / whitespace `code`:** 302 to
-  `/auth?error=invalid_request` before any Supabase call is made
-  (assert the stub is not invoked).
+**`apps/web/lib/supabase.test.ts`** — extend existing suite:
 
-### B. New cookie-writing factory in `packages/db/src/server.ts`
+- RSC read-only throw from `store.set` → `setAll` returns normally; `getCookieWriteFailure()` returns `null`; no `console.error` call.
+- Unexpected throw on cookie #2 of 3 → `getCookieWriteFailure()` returns `{ errorName: <throw.name> }`; `getWrittenCookieNames()` returns only cookie #1's name (successful write BEFORE the failure); no further writes attempted after the failure (assert via call count on a spy `store.set`).
+- Multiple unexpected throws → first unexpected error name is reported; subsequent writes are NOT attempted (transactional halt).
+- Existing partial-write summary-log behavior should be REMOVED (`console.error` is no longer called from setAll — rollback is now the caller's job).
 
-Rename the existing read-only `supabaseServer` → `createSupabaseClientForJobs`
-(Inngest + cookie-less server contexts). Add
-`createSupabaseClientForRequest(adapter)` using `@supabase/ssr`'s
-`createServerClient` with a full `getAll` / `setAll` cookies adapter and
-`flowType: 'pkce'`. Header comment in `server.ts` documenting when to
-pick which — prevents a future consumer from silently re-using the
-read-only factory on a cookie-writing surface (council's naming
-concern).
+**`apps/web/tests/unit/auth-callback-route.test.ts`** — extend:
 
-Update all call sites (one-line import swap each).
+- `cookie_failure` branch: stub `exchangeCodeForSession` to succeed AND stub the cookie adapter to produce a non-RSC failure → 307 to `/auth?error=cookie_failure`; any cookie successfully written during the transaction is deleted (assert via `store.delete` spy or a Set-Cookie with expired `Max-Age=0`); `console.error` never sees the code, `access_token`, `refresh_token`.
+- `token_used` via double-click: first call with code X returns a session; second call with code X throws a Supabase error whose message contains `already.*used` → second response is 307 `/auth?error=token_used`, no Set-Cookie on the second response.
+- Regression: missing / empty / whitespace code branches still land at `invalid_request` after the refactor.
 
-Pin `@supabase/ssr` in `packages/db/package.json`; regenerate
-`pnpm-lock.yaml`.
+**`packages/lib/ratelimit/src/index.test.ts`** — new or extended:
 
-### C. Wire the Next.js adapter in `apps/web/lib/supabase.ts`
+- `makeAuthCallbackLimiter().reserve(ip)` when the underlying `limiter.limit` throws → resolves without error (fail-open preserved) AND `console.error` was called with an object argument that deep-equals `{ alert: true, tier: 'auth_callback_ip', errorName: <name>, ip_bucket: <prefix-or-hash> }`. No raw IP anywhere in the log.
+- Happy-path (`limit` resolves `success: true`) → resolves; no `console.error`.
+- Over-limit (`limit` resolves `success: false`) → throws `RateLimitExceededError('auth_callback_ip', ...)`; no `console.error`.
 
-`supabaseForRequest()` calls `createSupabaseClientForRequest` with the
-`next/headers` `cookies()` adapter. Wrap `setAll` in try/catch —
-Server Components can't set cookies (Next throws), so the catch runs
-there; route handlers and server actions write normally. On catch,
-log at `debug` level with no cookie values (council bugs r1) so the
-swallow isn't silent and a future maintainer misusing the adapter in
-a Server Component can find it.
+### B. Transactional `setAll` in `apps/web/lib/supabase.ts`
 
-Debug log message must explicitly state the expected cause (council
-security r2): `"supabase: setAll failed — expected in Server Component
-context, ignoring"`. Never include cookie values or names in the log
-line.
+Change the factory return shape from `SupabaseClient` to a discriminated object. Two new exported helpers on the returned object expose the adapter's transactional state to the caller:
 
-### D. Harden `apps/web/app/auth/callback/route.ts`
+```ts
+interface CookieWriteState {
+  getCookieWriteFailure(): { errorName: string } | null;
+  getWrittenCookieNames(): readonly string[];
+}
 
-Catch `exchangeCodeForSession` failures explicitly. Map known Supabase
-error shapes to kinds:
+export async function supabaseForRequest(): Promise<
+  SupabaseClient & CookieWriteState
+> { … }
+```
 
-- consumed code → `token_used`
-- expired code → `token_expired`
-- 5xx / network → `server_error`
-- 200 OK with `data.session: null` → `server_error` (council bugs r1)
-- 200 OK with unparseable JSON body → `server_error` via the final
-  catch-all (council bugs r2)
-- any other thrown `Error` → `server_error` via a final catch-all so
-  the route can never return a 500 (council bugs r1)
+Behaviorally:
 
-**Redirect rules (non-negotiable, council bugs r2):** the success
-redirect destination is **hardcoded to `/`**. No query parameter
-(including `redirect_to`, `next`, `returnTo`, or any other caller-
-supplied value) may influence the destination URL. This closes the
-open-redirect vector the bugs persona flagged.
+- Keep the existing RSC read-only discriminator (`/cookies.*modif|server\s*action|route\s*handler/i`). That branch silently returns, same as today.
+- On an UNEXPECTED throw, record `{ errorName }` on a closure-scoped `failure` variable AND **stop iterating** further cookies. This is the transactional part: no partial writes after a failure.
+- On a successful `store.set`, push the cookie name into a `writtenNames` array.
+- Expose `getCookieWriteFailure()` (reads `failure`) and `getWrittenCookieNames()` (snapshot copy of `writtenNames`) on the returned object.
+- DELETE the post-loop `console.error` summary log. Rollback is now the caller's job; the adapter is quiet on both happy and sad paths (the caller logs on rollback).
+- Callers that DON'T care about cookie-write transactionality (dashboard, note page, magic-link route, ingest route) ignore the new methods — zero-behavior-change refactor for them. They get the returned client as before via the spread.
 
-**Input validation (defense-in-depth, council security r2):** before
-invoking `exchangeCodeForSession`, validate the `code` param against a
-plausible charset (URL-safe base64 alphabet: `[A-Za-z0-9_\-]`) and
-length bound (reject `<16` or `>2048` chars). Fail to `invalid_request`.
-This is belt-and-suspenders; Supabase also validates, but a malformed
-code should never reach the network.
+**Attach via Proxy, not by mutating the Supabase client.** `createSupabaseClientForRequest` returns a `SupabaseClient` from `@supabase/ssr`; adding properties to that object risks clobbering library internals across version bumps. Instead wrap it:
 
-**Logging rules (non-negotiable):** never log `code`, `access_token`,
-or `refresh_token` under any branch. Log only the error kind + a
-sanitized Supabase error message. Redirect to `/auth?error=<kind>` on
-every failure branch.
+```ts
+return new Proxy(client, {
+  get(target, prop, receiver) {
+    if (prop === 'getCookieWriteFailure') return () => failure;
+    if (prop === 'getCookieWriteNames') return () => [...writtenNames];
+    return Reflect.get(target, prop, receiver);
+  }
+});
+```
 
-### E. Surface the error on `/auth/page.tsx`
+Proxy avoids any collision with Supabase's surface.
 
-Read `?error=` via `useSearchParams`; render an `aria-live="assertive"`
-message with kind-specific copy selected by an **allowlist** (switch /
-object map) on the parameter value. The raw query-param value is
-NEVER rendered into the DOM — any unknown kind falls through to a
-generic "Sign-in failed. Request a new link." message. This closes
-the XSS vector the security persona flagged at r1.
+### C. Rollback path in `apps/web/app/auth/callback/route.ts`
 
-Copy:
+After `exchangeCodeForSession` returns (or throws), BEFORE the success redirect, call `supabase.getCookieWriteFailure()`. If non-null:
 
-- `token_used` → "This sign-in link has already been used. Request a new one."
-- `token_expired` → "This sign-in link has expired. Request a new one."
-- `server_error` → "Could not sign you in right now. Please try again."
-- `invalid_request` → "Sign-in link was invalid. Request a new one."
-- any other value → "Sign-in failed. Request a new link."
+1. Iterate `supabase.getCookieWriteNames()` and for each name, call `(await cookies()).delete(name)`. This clears any partially-written session cookies from the current response.
+2. `console.error('[auth/callback] sign-in failed', { kind: 'cookie_failure', errorName: failure.errorName })`. Token-leak guard still applies — `errorName` is a class name, never a value.
+3. 307 to `/auth?error=cookie_failure`.
 
-Message text must meet **WCAG AA 4.5:1** contrast against its
-background (a11y r1).
+Ordering nuance: a failure on cookie #1 means `writtenNames` is empty and the rollback loop is a no-op — correct. A failure mid-stream means we clear the cookies we did write. The route MUST check `getCookieWriteFailure()` AFTER `exchangeCodeForSession` regardless of whether that call succeeded or threw — a throw from setAll bubbles up as a generic Error through the supabase call, and the existing catch-all would currently mis-map it to `server_error`. We want `cookie_failure` precedence.
 
-Form stays visible below the message so the user can request a fresh
-link without extra clicks.
+Concretely: in the `try { exchangeCodeForSession } catch (err) { … }` block, add a pre-check in the `catch` branch:
 
-### F. Supabase dashboard (manual, pre-merge)
+```ts
+} catch (err) {
+  const failure = supabase.getCookieWriteFailure?.();
+  if (failure) {
+    // Rollback + redirect flow below.
+  } else {
+    console.error('[auth/callback] unexpected exchange failure', {
+      kind: 'server_error',
+      errorName: err instanceof Error ? err.name : typeof err,
+    });
+    failureKind = 'server_error';
+  }
+}
+```
 
-1. **Auth → URL Configuration → Redirect URLs allowlist:** only
-   `https://llmwiki-study-group.vercel.app/auth/callback` plus any
-   preview-URL pattern. No wildcards, no non-project origins.
-   Complements PR #17's `APP_BASE_URL`-only server policy.
-2. **Auth → Email Templates → Confirm signup AND Magic Link:** both
-   must use `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}` (PKCE
-   form). Default templates still carry the fragment form; both
-   templates need editing.
-3. Screenshot both sections; attach to the PR description as
-   pre-merge verification.
+And on the success path (after the try/catch):
 
-### G. Runbook update
+```ts
+if (failureKind === null) {
+  const failure = supabase.getCookieWriteFailure?.();
+  if (failure) {
+    failureKind = 'cookie_failure';
+    console.error('[auth/callback] sign-in failed', {
+      kind: 'cookie_failure',
+      errorName: failure.errorName,
+    });
+    // rollback below
+  }
+}
+```
 
-Add §F to `README.md` "Deploy runbook" so the dashboard steps are in
-the checklist for any future environment.
+Centralize rollback: one helper `rollbackPartialCookies(supabase)` called before the error-redirect `return`.
 
-## Test matrix
+`ErrorKind` union gets a new `'cookie_failure'` member; `mapSupabaseError` does NOT emit it (cookie_failure is not a Supabase-origin error kind).
+
+### D. `/auth` page copy for `cookie_failure`
+
+`apps/web/app/auth/page.tsx` — add to `CALLBACK_ERROR_MESSAGES`:
+
+```ts
+cookie_failure: 'We couldn't save your sign-in. Please try again.',
+```
+
+Contrast still meets WCAG AA 4.5:1 — uses the same `text-danger` class as existing entries. The existing `aria-live="assertive"` region announces it automatically; no wiring change. Unknown kinds continue to fall through to `GENERIC_CALLBACK_ERROR` (XSS allowlist semantics preserved).
+
+### E. Fail-open alerting in `packages/lib/ratelimit/src/index.ts`
+
+Change `makeAuthCallbackLimiter().reserve` to log on the fail-open branch:
+
+```ts
+async function reserve(ip: string): Promise<void> {
+  let result: Awaited<ReturnType<typeof limiter.limit>>;
+  try {
+    result = await limiter.limit(ip);
+  } catch (err) {
+    // Fail-OPEN by design — a transient Upstash outage must not deny a legit
+    // link-click. But a SILENTLY disabled DOS guard is worse than no guard;
+    // a future monitor will grep for `alert: true, tier: 'auth_callback_ip'`
+    // in log drain and page the on-call. Shape is stable — do not rename
+    // these keys without a search across monitoring config.
+    // eslint-disable-next-line no-console
+    console.error('[rate-limit] fail-open triggered', {
+      alert: true,
+      tier: 'auth_callback_ip',
+      errorName: err instanceof Error ? err.name : typeof err,
+      ip_bucket: ip.slice(0, 3), // coarse prefix; never the full IP
+    });
+    return;
+  }
+  if (!result.success) {
+    throw new RateLimitExceededError('auth_callback_ip', new Date(result.reset));
+  }
+}
+```
+
+`ip_bucket` as a short prefix (3 chars) is a PII-safe coarse locality signal — enough to spot "wave from a /16 subnet" while not re-identifying a user. NO raw IP in the log. Shape-stable keys (`alert`, `tier`, `errorName`, `ip_bucket`) are documented inline as the monitor-grep contract.
+
+### F. Update call sites (no behavior change)
+
+Touch every call site of `supabaseForRequest()` to confirm the new return type compiles:
+
+- `apps/web/app/page.tsx` — ignore new methods; uses `.auth.getUser()` only.
+- `apps/web/app/note/[slug]/page.tsx` — same.
+- `apps/web/app/api/ingest/route.ts` — same.
+- `apps/web/app/api/auth/magic-link/route.ts` — same. (Magic-link cookie writes are code-verifier chunks; a failure here would break the subsequent callback. Out of scope to harden this route in the same PR; tracked as a follow-up issue if the proxy surface shows it's useful.)
+- `apps/web/app/auth/callback/route.ts` — uses the new methods.
+
+TypeScript's structural types mean "client with extra methods" is assignable to "client" everywhere; no cast needed.
+
+### G. Test matrix (additions to PR #22's matrix)
 
 | Branch | Expected |
 |---|---|
-| valid `code`, stub returns session | 302 `/`, `Set-Cookie` HttpOnly+Secure+SameSite=Lax, `Path=/` |
-| stub throws `token_used` | 302 `/auth?error=token_used`, no Set-Cookie |
-| stub throws `token_expired` | 302 `/auth?error=token_expired`, no Set-Cookie |
-| stub throws 5xx / network | 302 `/auth?error=server_error`, no Set-Cookie |
-| stub returns 200 with `data.session: null` | 302 `/auth?error=server_error`, no Set-Cookie (council r1) |
-| stub throws generic `Error` | 302 `/auth?error=server_error`, no Set-Cookie, no 500 (council r1) |
-| missing `code` param | 302 `/auth?error=invalid_request`, stub NOT called |
-| empty `code` | same as missing |
-| whitespace-only `code` | same as missing |
-| `code` >4KB | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
-| `code` contains null byte / non-URL-safe chars | 302 `/auth?error=invalid_request`, stub NOT called (council r1) |
-| `code` outside URL-safe base64 alphabet (e.g. `foo'bar"baz<qux>`) | 302 `/auth?error=invalid_request`, stub NOT called (council bugs r2) |
-| `code` valid + extraneous `redirect_to=https://evil.com` | 302 to `/` (hardcoded), NOT to the supplied URL (council bugs r2 — open-redirect guard) |
-| stub returns 200 with unparseable JSON body | 302 `/auth?error=server_error` via final catch-all (council bugs r2) |
-| any failure branch | `console.error` spy sees no call whose args contain `code` / `access_token` / `refresh_token` (council r1) |
+| adapter `setAll` throws RSC read-only message | `getCookieWriteFailure()` is null; loop continues; no console.error |
+| adapter `setAll` throws unexpected error on cookie #1 | `getCookieWriteFailure()` reports; `getCookieWriteNames()` empty; remaining writes SKIPPED |
+| adapter `setAll` throws unexpected on cookie #2 of 3 | failure reported once; names = [#1]; write #3 NOT attempted |
+| callback: exchange success + cookie adapter healthy | 302 `/`, Set-Cookie on all chunks |
+| callback: exchange success + cookie adapter throws unexpected mid-stream | 307 `/auth?error=cookie_failure`, delete-me Set-Cookie clearing partial, no token substrings in console.error |
+| callback: exchange throws, cookie adapter healthy | 307 `/auth?error=<mapped-kind>`, no rollback needed, existing behavior |
+| callback: exchange throws a setAll-originated error (bubbled through supabase) | rollback precedence — `cookie_failure` beats the catch-all's `server_error` |
+| callback: double-click / prefetch (second GET with consumed code) | 307 `/auth?error=token_used` |
+| ratelimit: limiter.limit resolves success | reserve resolves; no console.error |
+| ratelimit: limiter.limit rejects | reserve resolves (fail-open) AND console.error called once with `{ alert: true, tier: 'auth_callback_ip', errorName, ip_bucket }` |
+| ratelimit: fail-open log never contains raw `ip` value | assert `ip` NOT in any console.error arg |
+| any failure branch (all rows) | console.error spy sees no call whose args contain `code`, `access_token`, `refresh_token` (preserved from PR #22) |
 
-## Non-negotiables (inherited + council r1)
+### H. Runbook note
 
-Pre-existing (PR #21 handoff):
+Add one line to the `README.md` "Monitoring" section (or create a stub `## Monitoring` §) describing the `alert: true, tier: 'auth_callback_ip'` log shape as the grep target for fail-open alerting. No infra yet — this is the seam for a future Vercel log drain + Datadog rule.
 
-- **No logging** of `code` or session tokens in any branch.
-- **Pin** `@supabase/ssr`; lockfile updated.
-- **Redirect URLs allowlist** locked to `APP_BASE_URL` pre-merge,
-  screenshot in PR body.
-- **Error surfacing** on `/auth` — no silent redirect.
-- **Council required** on this surface. No `[skip council]`.
-- **RLS unchanged.** Anon key only; no service-role exposure.
+## Non-negotiables (inherited + new)
 
-Added by council r1:
+Inherited from PR #22:
 
-- **[security]** Integration test MUST `vi.spyOn(console, 'error')`
-  and assert no call's arguments contain `code`, `access_token`, or
-  `refresh_token` substrings under any failure branch. Single most
-  important safeguard per the security persona.
-- **[security]** `/auth/page.tsx` error rendering MUST use an
-  allowlist (switch / object map) on the `error` query-param value.
-  The raw param value is never rendered; unknown kinds fall through
-  to a generic message. Closes the XSS vector.
-- **[security]** Supabase dashboard screenshots (Redirect URLs
-  allowlist AND both email templates on the PKCE redirect form) must
-  be in the implementation PR body before merge.
-- **[a11y]** Error message MUST meet WCAG AA 4.5:1 contrast against
-  background. Verify at implementation.
+- **No logging** of `code`, `access_token`, or `refresh_token` in any branch. Tests spy + assert.
+- **`@supabase/ssr` pinned.** No version bump in this PR.
+- **Redirect URLs allowlist** unchanged. No dashboard edits.
+- **Success redirect hardcoded to `/`.** No caller-supplied query param can influence destination.
+- **RLS unchanged.** Anon key only.
+- **`/auth` error rendering stays allowlist-only** (raw `?error` value never interpolated).
+- **WCAG AA 4.5:1** contrast on new error copy.
+- **Council required.** No `[skip council]`.
 
-Added by council r2:
+New this plan:
 
-- **[bugs]** Success-redirect destination is **hardcoded to `/`**.
-  No caller-supplied query param (`redirect_to`, `next`, etc.) may
-  influence the target URL. Tested by the extraneous-param row in
-  the matrix above. Open-redirect guard.
-- **[bugs]** Unparseable JSON from `exchangeCodeForSession` maps to
-  `server_error` via the final catch-all; explicit test row required.
+- **Transactional setAll.** First unexpected throw halts the loop; subsequent writes NOT attempted.
+- **Rollback precedence.** When both `exchangeCodeForSession` and `setAll` produce failures, `cookie_failure` wins over `server_error` — the cookie-write failure is the proximate, actionable cause.
+- **Monitor contract.** `{ alert: true, tier: 'auth_callback_ip' }` key names are a STABLE public contract; renaming requires a coordinated monitoring-config change and a migration note.
+- **No raw IPs in fail-open logs.** Enforced by test.
+- **Proxy-wrap the Supabase client.** Do NOT mutate the `@supabase/ssr` return value — library internals can collide on version bumps.
 
 ## Rollback
 
-Revert the PR. User returns to current state: email delivers, sign-in
-never completes. No additional regressions — this PR only touches the
-auth callback + its server-client factory; it does not migrate schema
-or change RLS.
+Revert the PR. The system returns to:
 
-## Out of scope for this PR
+- `setAll` best-effort + summary log (the shipped PR #22 behavior).
+- Silent fail-open on Upstash outage (the shipped PR #22 behavior).
+- No `cookie_failure` kind; a partial-write bug presents as a silent login-loop (the known pre-fix failure mode).
 
-- Framework specialist persona (#18) — queued as next priority after
-  this P0 lands.
-- Playwright nonce smoke test (#20).
-- `/diag` removal (#12), CSP `report-uri` (#14), `style-src`
-  hardening (#15).
-- **i18n of the new error strings.** Hard-coded English copy is
-  acceptable for the P0 fix; externalization is a follow-up
-  (council a11y r1 noted this as a nice-to-have, not a blocker).
-- `pnpm audit` in CI. Council security r1 nice-to-have; separate
-  issue if we want it.
-- **`Set-Cookie` header exceeding browser max size.** Council bugs
-  r2 flagged this as a theoretical failure mode (browser silently
-  drops oversize cookies). Cookie name and size are controlled by
-  `@supabase/ssr`, which splits large sessions into chunked cookies
-  under the 4KB-per-cookie browser limit. Not mitigable in our code.
-  If sessions routinely exceed limits, that's a Supabase-library
-  issue to escalate — out of scope for this P0.
-- Any v1 feature work.
+No schema migration, no RLS change, no dashboard edit — pure revert is clean.
 
-## Success + kill criteria (council product r1)
+## Out of scope
 
-- **Success metric:** count of 302s from `/auth/callback` to `/` per
-  day (successful sign-ins). Track via existing server logs — no new
-  telemetry infra.
-- **Failure metric:** count of 302s from `/auth/callback` to
-  `/auth?error=<kind>` bucketed by kind.
-- **Kill criteria:** if total failure rate > 1% of sign-in attempts
-  24h after merge, revert the PR.
-- **Cost:** $0 marginal. Supabase Auth is MAU-billed, not per-call.
+- Magic-link route (`/api/auth/magic-link`) transactional hardening. Tracked as follow-up if the proxy surface proves useful.
+- Cross-tab auth state sync (council r2 explicit out-of-scope).
+- `exchange_failed` as a distinct user-facing kind (see Problem §4 — decision documented; keep `server_error`).
+- Datadog / Sentry / Vercel log drain integration itself. This PR ships the log SHAPE; monitoring wiring is a separate effort with its own cost line.
+- Dedicated `pgTAP` migration-flake fix (#7).
+- `/diag` removal (#12), Playwright smoke (#20), framework persona (#18).
+- i18n of new error copy (council a11y r1 nice-to-have, unchanged decision).
 
-## Council history
+## Success + kill criteria
 
-- **r1** (PR #22 @ commit `1ae040f`, 2026-04-19T18:48:54Z) — PROCEED,
-  a11y 8 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Four
-  new non-negotiables folded into this plan.
-- **r2** (PR #22 @ commit `ea3fc8a`, 2026-04-19T18:56:52Z) — PROCEED,
-  a11y **9** / arch 10 / bugs 9 / cost 10 / product 10 / security 9.
-  Five additions folded: open-redirect guard, unparseable-JSON test,
-  special-char code test, debug-log wording, defense-in-depth
-  charset/length validation on `code`. Full report:
-  [PR #22 council comment](https://github.com/Anguijm/LLMwiki_StudyGroup/pull/22#issuecomment-4276576994).
+- **Success metric:** count of 307s from `/auth/callback` to `/auth?error=cookie_failure` per day (should round to zero — when it's non-zero, monitor fires). Alerting signal presence tracked via log-drain grep.
+- **Failure metric:** same count, trending up or spiking on a single request hot-path. OR: `alert: true` log fires without a concurrent Upstash incident ticket.
+- **Kill criteria:** revert if cookie_failure > 0.1% of sign-ins 48h post-merge AND no Upstash / cookie library incident correlates — that means we introduced a regression in the happy path.
+- **Cost:** $0 marginal. No new API calls. `console.error` volume negligible.
 
-## Approval checklist (CLAUDE.md gate)
+## Approval checklist (CLAUDE.md hard gate)
 
 Before writing implementation code, all three must be true:
 
-1. This file is committed on `claude/plan-session-agenda-rRwWN` and
-   pushed to origin.
-2. A PR is open against `main`; the latest `<!-- council-report -->`
-   comment from `.github/workflows/council.yml` was posted against a
-   commit SHA ≥ the commit that last modified this plan.
-3. The human has typed an explicit `approved` / `ship it` / `proceed`
-   after seeing (1) and (2).
+1. This file committed on `claude/issue-26-auth-hardening` and pushed to origin.
+2. PR open against `main`; latest `<!-- council-report -->` comment from `.github/workflows/council.yml` posted against a commit SHA ≥ the commit that last modified this plan.
+3. Human typed explicit `approved` / `ship it` / `proceed` after seeing (1) and (2).
 
 If any gate fails, stop and surface the gap.
+
+## Council history
+
+(empty — awaiting r1)
