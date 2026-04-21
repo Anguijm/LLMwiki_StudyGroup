@@ -44,12 +44,18 @@ New and extended tests in `apps/web/lib/supabase.test.ts`, `apps/web/tests/unit/
 **`apps/web/tests/unit/auth-callback-route.test.ts`** — extend:
 
 - `cookie_failure` branch: stub `exchangeCodeForSession` to succeed AND stub the cookie adapter to produce a non-RSC failure → 307 to `/auth?error=cookie_failure`; any cookie successfully written during the transaction is deleted (assert via `store.delete` spy or a Set-Cookie with expired `Max-Age=0`); `console.error` never sees the code, `access_token`, `refresh_token`.
-- `token_used` via double-click: first call with code X returns a session; second call with code X throws a Supabase error whose message contains `already.*used` → second response is 307 `/auth?error=token_used`, no Set-Cookie on the second response.
+- `token_used` via double-click / mail-client prefetch (council security r1 must-do): simulate two sequential `GET` calls to the route handler with the SAME code — the first returns a session (302 `/`), the second hits `exchangeCodeForSession` which throws a Supabase error whose message contains `already.*used` → second response is 307 `/auth?error=token_used`, no `Set-Cookie` on the second response. This is an integration-style test of the full route flow, not a direct stub of the `token_used` path.
+- **Rollback-fail edge case** (council bugs r1): stub the cookie adapter to fail AND stub `cookies().delete` on the rollback path to throw → the route's final catch-all runs, returning a 500 (NextResponse behavior) rather than a 307. Explicit behavior documentation: a failure-within-a-failure-handler is allowed to 500 because the user is already on a degraded path and 500 is greppable; swallowing the secondary throw would hide the bug. Assert status 500 and no token substrings in `console.error`.
+- **Proxy passthrough** (council security r1 top-risk #1): assert that accessing a symbol property (`client[Symbol.iterator]`) and a non-existent string property (`client.__nonexistent__`) returns whatever the underlying Supabase client returns (usually `undefined` for non-existent; whatever `Reflect.get` yields for symbols). Covers the blast-radius concern that a bad Proxy handler could break unrelated auth calls.
 - Regression: missing / empty / whitespace code branches still land at `invalid_request` after the refactor.
 
 **`packages/lib/ratelimit/src/index.test.ts`** — new or extended:
 
-- `makeAuthCallbackLimiter().reserve(ip)` when the underlying `limiter.limit` throws → resolves without error (fail-open preserved) AND `console.error` was called with an object argument that deep-equals `{ alert: true, tier: 'auth_callback_ip', errorName: <name>, ip_bucket: <prefix-or-hash> }`. No raw IP anywhere in the log.
+- `makeAuthCallbackLimiter().reserve(ip)` when the underlying `limiter.limit` throws (string IP) → resolves without error (fail-open preserved) AND `console.error` was called with an object arg containing `{ alert: true, tier: 'auth_callback_ip', errorName: <name>, ip_bucket: <first-3-chars-of-ip> }`.
+- **PII substring guard** (council security r1 must-do): under the fail-open branch, spy on `console.error` and assert that the RAW `ip` string is NOT a substring of ANY argument to ANY call — stringify objects via `JSON.stringify` + scan. Stronger than "ip not passed directly": this catches a future refactor that accidentally includes `ip` inside a nested debug key.
+- `reserve(undefined)` + `limiter.limit` throws → resolves; `ip_bucket === 'unknown'`; no `TypeError`.
+- `reserve(null)` + `limiter.limit` throws → resolves; `ip_bucket === 'unknown'`; no `TypeError`.
+- `reserve('')` + `limiter.limit` throws → resolves; `ip_bucket === 'unknown'`; no `TypeError`.
 - Happy-path (`limit` resolves `success: true`) → resolves; no `console.error`.
 - Over-limit (`limit` resolves `success: false`) → throws `RateLimitExceededError('auth_callback_ip', ...)`; no `console.error`.
 
@@ -68,6 +74,14 @@ export async function supabaseForRequest(): Promise<
 > { … }
 ```
 
+**Method names are STABLE across the plan.** Council arch r1 flagged an
+inconsistency in the first draft (interface used `getWrittenCookieNames`,
+Proxy example used `getCookieWriteNames`). Single source of truth, used
+by every reference in this document and every test assertion:
+
+- `getCookieWriteFailure(): { errorName: string } | null`
+- `getWrittenCookieNames(): readonly string[]`
+
 Behaviorally:
 
 - Keep the existing RSC read-only discriminator (`/cookies.*modif|server\s*action|route\s*handler/i`). That branch silently returns, same as today.
@@ -83,13 +97,20 @@ Behaviorally:
 return new Proxy(client, {
   get(target, prop, receiver) {
     if (prop === 'getCookieWriteFailure') return () => failure;
-    if (prop === 'getCookieWriteNames') return () => [...writtenNames];
+    if (prop === 'getWrittenCookieNames') return () => [...writtenNames];
     return Reflect.get(target, prop, receiver);
   }
 });
 ```
 
-Proxy avoids any collision with Supabase's surface.
+Proxy avoids any collision with Supabase's surface. The handler intercepts
+only our two sentinel property names (string keys); every other access —
+including `Symbol.iterator`, `Symbol.toPrimitive`, `then` (Supabase client
+is thenable-free but future versions might add), and any unknown property
+— flows through `Reflect.get` unchanged. Council security r1 top-risk
+#1: the test suite must exhaustively assert that symbol properties and
+non-existent properties reach the underlying client (see test matrix row
+"proxy — symbol + unknown key passthrough").
 
 ### C. Rollback path in `apps/web/app/auth/callback/route.ts`
 
@@ -143,32 +164,51 @@ Centralize rollback: one helper `rollbackPartialCookies(supabase)` called before
 `apps/web/app/auth/page.tsx` — add to `CALLBACK_ERROR_MESSAGES`:
 
 ```ts
-cookie_failure: 'We couldn't save your sign-in. Please try again.',
+cookie_failure: "We couldn't save your sign-in. Request a new link.",
 ```
 
-Contrast still meets WCAG AA 4.5:1 — uses the same `text-danger` class as existing entries. The existing `aria-live="assertive"` region announces it automatically; no wiring change. Unknown kinds continue to fall through to `GENERIC_CALLBACK_ERROR` (XSS allowlist semantics preserved).
+**Copy choice (council bugs r1):** the first-draft copy ("Please try
+again") is misleading because the PKCE code was successfully consumed
+during the exchange — clicking the same link a second time will map to
+`token_used`, not retry. The user's actual recovery action is to request
+a NEW magic link. This copy matches the sibling messages' cadence
+("Request a new one." / "Request a new link.") and tells the user what
+to do without implying "just click again."
+
+Contrast still meets WCAG AA 4.5:1 — uses the same `text-danger` class
+as existing entries. The existing `aria-live="assertive"` region
+announces it automatically; no wiring change. Unknown kinds continue to
+fall through to `GENERIC_CALLBACK_ERROR` (XSS allowlist semantics
+preserved).
 
 ### E. Fail-open alerting in `packages/lib/ratelimit/src/index.ts`
 
 Change `makeAuthCallbackLimiter().reserve` to log on the fail-open branch:
 
 ```ts
-async function reserve(ip: string): Promise<void> {
+async function reserve(ip: string | null | undefined): Promise<void> {
   let result: Awaited<ReturnType<typeof limiter.limit>>;
   try {
-    result = await limiter.limit(ip);
+    result = await limiter.limit(ip ?? 'no-xff');
   } catch (err) {
     // Fail-OPEN by design — a transient Upstash outage must not deny a legit
     // link-click. But a SILENTLY disabled DOS guard is worse than no guard;
     // a future monitor will grep for `alert: true, tier: 'auth_callback_ip'`
     // in log drain and page the on-call. Shape is stable — do not rename
     // these keys without a search across monitoring config.
+    //
+    // ip_bucket uses ?. + ?? so a missing header can't throw TypeError and
+    // swallow the alert entirely (council bugs r1 top bug — a TypeError
+    // here would make fail-open silent again, re-introducing the very gap
+    // this plan is closing).
     // eslint-disable-next-line no-console
     console.error('[rate-limit] fail-open triggered', {
       alert: true,
       tier: 'auth_callback_ip',
       errorName: err instanceof Error ? err.name : typeof err,
-      ip_bucket: ip.slice(0, 3), // coarse prefix; never the full IP
+      ip_bucket: typeof ip === 'string' && ip.length > 0
+        ? ip.slice(0, 3)
+        : 'unknown',
     });
     return;
   }
@@ -178,7 +218,22 @@ async function reserve(ip: string): Promise<void> {
 }
 ```
 
-`ip_bucket` as a short prefix (3 chars) is a PII-safe coarse locality signal — enough to spot "wave from a /16 subnet" while not re-identifying a user. NO raw IP in the log. Shape-stable keys (`alert`, `tier`, `errorName`, `ip_bucket`) are documented inline as the monitor-grep contract.
+Signature widens to accept `string | null | undefined` (the route's
+`rateLimitBucket` already falls back to `'no-xff'`, but widening the type
+signals that the limiter itself is robust to upstream carelessness).
+
+`ip_bucket` as a short prefix (3 chars) is a PII-safe coarse locality
+signal — enough to spot "wave from a /16 subnet" while not re-identifying
+a user. For a null / undefined / empty `ip`, the bucket becomes the
+literal string `'unknown'` — explicit, greppable, and doesn't hide a
+bug. NO raw IP in the log under ANY branch. Shape-stable keys (`alert`,
+`tier`, `errorName`, `ip_bucket`) are documented inline as the monitor-
+grep contract.
+
+**Alerting defense-in-depth:** the `console.error` call itself can throw
+only on OOM (argument allocation). A try/catch around the log would be
+defending against a fault that, if present, already means the process
+is dying. Out of scope; no wrapping.
 
 ### F. Update call sites (no behavior change)
 
@@ -205,13 +260,47 @@ TypeScript's structural types mean "client with extra methods" is assignable to 
 | callback: exchange throws a setAll-originated error (bubbled through supabase) | rollback precedence — `cookie_failure` beats the catch-all's `server_error` |
 | callback: double-click / prefetch (second GET with consumed code) | 307 `/auth?error=token_used` |
 | ratelimit: limiter.limit resolves success | reserve resolves; no console.error |
-| ratelimit: limiter.limit rejects | reserve resolves (fail-open) AND console.error called once with `{ alert: true, tier: 'auth_callback_ip', errorName, ip_bucket }` |
-| ratelimit: fail-open log never contains raw `ip` value | assert `ip` NOT in any console.error arg |
+| ratelimit: limiter.limit rejects (string ip) | reserve resolves (fail-open) AND console.error called once with `{ alert: true, tier: 'auth_callback_ip', errorName, ip_bucket: <3-char-prefix> }` |
+| ratelimit: limiter.limit rejects, `ip` is `undefined` | reserve resolves; `ip_bucket === 'unknown'`; no TypeError |
+| ratelimit: limiter.limit rejects, `ip` is `null` | reserve resolves; `ip_bucket === 'unknown'`; no TypeError |
+| ratelimit: limiter.limit rejects, `ip === ''` | reserve resolves; `ip_bucket === 'unknown'`; no TypeError |
+| ratelimit: fail-open log never contains raw `ip` string anywhere | stringify every console.error arg and assert `ip` is NOT a substring of any |
+| proxy: access `Symbol.iterator` on client | returns whatever underlying Supabase client returns; no Proxy interception |
+| proxy: access unknown string property | returns `undefined` (passes through `Reflect.get`); no Proxy interception |
+| callback: cookie adapter fails AND `cookies().delete` throws on rollback | status 500 via final catch-all; no token substrings in console.error; explicit test row |
+| callback: double-click — two sequential GETs with same code | first: 302 `/` + Set-Cookie; second: 307 `/auth?error=token_used`, no Set-Cookie |
 | any failure branch (all rows) | console.error spy sees no call whose args contain `code`, `access_token`, `refresh_token` (preserved from PR #22) |
 
-### H. Runbook note
+### H. Runbook — `README.md` `## Monitoring` section
 
-Add one line to the `README.md` "Monitoring" section (or create a stub `## Monitoring` §) describing the `alert: true, tier: 'auth_callback_ip'` log shape as the grep target for fail-open alerting. No infra yet — this is the seam for a future Vercel log drain + Datadog rule.
+Create (not just extend — it doesn't exist yet) a `## Monitoring`
+section in `README.md` after the "Deploy runbook" section. Content
+(exact wording adjustable; the contract is what matters):
+
+> ### Rate-limit fail-open alert
+>
+> The `/auth/callback` rate limiter (`makeAuthCallbackLimiter`) fails
+> OPEN on Upstash outage — a Redis blip cannot be allowed to 503 a
+> legitimate magic-link click. When this happens, the limiter emits a
+> structured log for monitoring to grep:
+>
+> ```
+> [rate-limit] fail-open triggered { alert: true, tier: 'auth_callback_ip', errorName: '<cls>', ip_bucket: '<3-char-prefix-or-unknown>' }
+> ```
+>
+> **Grep contract** (stable — do NOT rename without a coordinated
+> monitoring-config change):
+> - `alert: true` — monitor trigger flag
+> - `tier: 'auth_callback_ip'` — which limiter fired
+>
+> A Vercel log drain routing `alert: true` matches to Datadog / Sentry
+> / PagerDuty is the intended integration seam. Not yet wired — ship
+> the log shape first, wire the drain when a cohort exists.
+
+Council security r1 "must-do before merge" item: this section must
+exist wherever alerting will eventually be configured. `README.md` is
+the visible default; when a runbooks/ directory is created, this
+content moves there and `README.md` links into it.
 
 ## Non-negotiables (inherited + new)
 
@@ -231,8 +320,11 @@ New this plan:
 - **Transactional setAll.** First unexpected throw halts the loop; subsequent writes NOT attempted.
 - **Rollback precedence.** When both `exchangeCodeForSession` and `setAll` produce failures, `cookie_failure` wins over `server_error` — the cookie-write failure is the proximate, actionable cause.
 - **Monitor contract.** `{ alert: true, tier: 'auth_callback_ip' }` key names are a STABLE public contract; renaming requires a coordinated monitoring-config change and a migration note.
-- **No raw IPs in fail-open logs.** Enforced by test.
+- **No raw IPs in fail-open logs.** Enforced by test — raw `ip` NOT a substring of any `console.error` argument.
+- **Null-safe `ip_bucket`.** Use `typeof ip === 'string' && ip.length > 0 ? ip.slice(0, 3) : 'unknown'` — never `ip.slice(...)` unguarded. A TypeError here would swallow the very alert this plan is adding (council bugs r1).
 - **Proxy-wrap the Supabase client.** Do NOT mutate the `@supabase/ssr` return value — library internals can collide on version bumps.
+- **Stable adapter method names.** `getCookieWriteFailure()` and `getWrittenCookieNames()` — single canonical spelling across interface, implementation, tests, and documentation (council arch r1).
+- **Accurate error copy.** `cookie_failure` message directs the user to request a NEW magic link, not to retry the consumed one (council bugs r1).
 
 ## Rollback
 
@@ -273,4 +365,32 @@ If any gate fails, stop and surface the gap.
 
 ## Council history
 
-(empty — awaiting r1)
+- **r1** (PR #28 @ commit `a46682e`, 2026-04-21T10:34:09Z) — **PROCEED**,
+  a11y 9 / arch 10 / bugs 9 / cost 10 / product 9 / security 10. Folded
+  into this plan:
+  - Adapter method naming standardized to `getCookieWriteFailure` /
+    `getWrittenCookieNames` (arch — drift between interface + Proxy
+    example).
+  - `ip_bucket` guarded against non-string `ip` (bugs — `ip.slice(0,3)`
+    on `undefined` would TypeError and swallow the alert).
+  - `cookie_failure` copy rewritten to direct user to request a new
+    link (bugs — "try again" misleading; code already consumed).
+  - Ratelimit test added: raw `ip` string NOT a substring of any
+    `console.error` arg (security must-do).
+  - Callback test added: two sequential GETs with same code for the
+    double-click / prefetch case (security — integration-style, not
+    stub-swapped).
+  - Callback test added: rollback-itself-fails → 500 via final catch-
+    all (bugs — failure-within-failure documented explicitly).
+  - Proxy test added: symbol + unknown-key passthrough via
+    `Reflect.get` (security top-risk #1 — blast-radius guard).
+  - `README.md ## Monitoring` section created with the fail-open log-
+    shape grep contract (security must-do + arch).
+  - Decisions confirmed and explicitly kept:
+    - `server_error` stays as the mapping for 200-OK-with-null-session
+      (no new `exchange_failed` kind) — council product r1 noted this
+      as a judgement call; plan chose (b).
+    - Magic-link-route transactional hardening remains out of scope,
+      tracked as a follow-up.
+    - i18n / Pino structured logger / Datadog wiring all remain
+      out-of-scope nice-to-haves.
