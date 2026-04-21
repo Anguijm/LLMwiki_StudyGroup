@@ -392,6 +392,41 @@ in Vercel.
 
 ---
 
+## Monitoring
+
+### Rate-limit fail-open alert (`/auth/callback`)
+
+The `/auth/callback` rate limiter (`makeAuthCallbackLimiter` in
+`packages/lib/ratelimit`) fails **open** on Upstash outage — a Redis
+blip cannot 503 a legitimate magic-link click. When this happens the
+limiter emits a structured `console.error` line for monitoring to grep:
+
+```
+[rate-limit] fail-open triggered { alert: true, tier: 'auth_callback_ip', errorName: '<cls>', ip_bucket: '<3-char-prefix-or-unknown>' }
+```
+
+**Grep contract (STABLE — do NOT rename without a coordinated monitor
+config change):**
+
+| Key | Meaning |
+|---|---|
+| `alert: true` | Monitor trigger flag. |
+| `tier: 'auth_callback_ip'` | Which limiter fired. |
+| `errorName: string` | Thrown error's `.name` (or `typeof` for non-Error throws). Class identifier only — no payload, no message, no stack. |
+| `ip_bucket: string` | 3-character prefix of the IP for coarse locality, or the literal `'unknown'` if the IP was missing. **Never** the full IP. |
+
+**Intended integration:** a Vercel log drain routing `alert: true`
+matches to Datadog / Sentry / PagerDuty is the seam. Not yet wired —
+ship the log shape first, wire the drain when a cohort exists.
+
+**Why we care:** a silently disabled control is not a control. If
+Upstash stays down, the DOS guard on `/auth/callback` disappears with
+zero visibility. Council r2 on PR #25 (the shipped-code review that
+surfaced this gap) treated alerting as the primary mitigation; this
+log is what makes the fail-open recoverable.
+
+---
+
 ## Database Schema (Key Tables)
 
 ```sql
