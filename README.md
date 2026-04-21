@@ -258,23 +258,25 @@ deploy. Work through top-to-bottom once; subsequent deploys are just
      server-side `/api/auth/magic-link` route already hard-requires
      `APP_BASE_URL` and rejects Host-header spoofing; the Supabase
      allowlist is the second line of defense.
-6. Dashboard → **Authentication → Email Templates** — **PKCE flow
-   requires explicit template edits; Supabase defaults ship the
-   implicit-flow URL form**:
+6. Dashboard → **Authentication → Email Templates** — **the template
+   choice binds the callback primitive; pick the wrong pair and every
+   sign-in fails with "no valid flow state found" (PR #27 was opened
+   to fix exactly that regression from PR #22)**:
    - Open the **Confirm signup** template AND the **Magic Link**
      template. Both must exist and both must be edited — users who
      have never signed in hit the "Confirm signup" template, returning
-     users hit "Magic Link".
-   - In the confirmation link, the URL MUST be:
+     users hit "Magic Link". The two templates are independent; fixing
+     one leaves the other broken for its user path.
+   - Use the default `{{ .ConfirmationURL }}` body link. Minimum snippet:
+     ```html
+     <a href="{{ .ConfirmationURL }}">Log In</a>
      ```
-     {{ .SiteURL }}/auth/callback?code={{ .TokenHash }}
-     ```
-     The default templates use `#access_token=` (implicit flow); that
-     form bypasses our server-side `/auth/callback` handler and leaves
-     the session unpersisted. Verify by clicking **Preview** in each
-     template and confirming the URL includes `/auth/callback?code=`.
-   - Screenshot both templates plus the URL Configuration section and
-     attach to the auth-surface PR before merge.
+     This renders to a Supabase-hosted `/auth/v1/verify?token=...&type=...&redirect_to=<your_callback>` URL. Supabase validates the OTP server-side, generates the PKCE `code`, and redirects to `<redirect_to>?code=<pkce_code>`. Our `/auth/callback` then calls `supabase.auth.exchangeCodeForSession(code)`, which is the primitive the callback is written for (`apps/web/app/auth/callback/route.ts`).
+   - **Do NOT use `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}`.**
+     That URL form is the primitive for `supabase.auth.verifyOtp({ token_hash, type })`, not `exchangeCodeForSession`. The token_hash is a hash of the OTP, not a PKCE code — no `auth.flow_state` row is keyed by it, so Supabase returns `/token | 404: invalid flow state, no valid flow state found` and our callback falls through `mapSupabaseError` to `?error=server_error`. See `.harness/learnings.md` 2026-04-21 entry for the full incident trail.
+   - If a future operator wants to verify directly against upstream rather than trust this file, read the Supabase PKCE docs at <https://supabase.com/docs/guides/auth/server-side/creating-a-client> (server-side client + PKCE flow section). The template ↔ primitive binding is also covered at <https://supabase.com/docs/guides/auth/passwordless-login/auth-magic-link>.
+   - Verify each template by clicking **Preview** in the dashboard and confirming the body link href resolves to `https://<project-ref>.supabase.co/auth/v1/verify?...`, not `https://<app>.vercel.app/auth/callback?code=...`. A preview that shows our callback host directly is the wrong form.
+   - Screenshot both templates plus the URL Configuration section and attach to the auth-surface PR before merge.
 
 ### C. Vercel: project + settings + env vars
 
