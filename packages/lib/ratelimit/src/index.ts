@@ -171,16 +171,49 @@ export function makeAuthCallbackLimiter(deps: RateLimitDeps = {}) {
    * Check-and-decrement the per-IP callback counter.
    *
    *   - Throws RateLimitExceededError('auth_callback_ip') if over the limit.
-   *   - FAIL-OPEN on Upstash unreachable: resolves without reserving.
-   *     Intentional: a transient Redis outage must not deny a legit
-   *     user's link-click. Supabase's own project rate limits provide
-   *     the deeper backstop against sustained abuse.
+   *   - FAIL-OPEN on Upstash unreachable: resolves without reserving, AND
+   *     emits a structured `alert: true` log so monitoring can page.
+   *     Intentional fail-open: a transient Redis outage must not deny a
+   *     legit user's link-click. Silent fail-open is worse than no
+   *     limiter — a disabled control with no visibility is invisibly
+   *     absent. The alert log shape is the stable grep contract;
+   *     see README.md §Monitoring.
+   *
+   * ### Monitor grep contract (STABLE)
+   *
+   * ```
+   * [rate-limit] fail-open triggered { alert: true, tier: 'auth_callback_ip', errorName, ip_bucket }
+   * ```
+   *
+   * - `alert: true` — monitor trigger flag
+   * - `tier: 'auth_callback_ip'` — which limiter fired
+   * - `errorName: string` — the thrown error's `.name` (or typeof for
+   *   non-Error throws) — a class identifier only, no payload
+   * - `ip_bucket: string` — 3-character prefix of the IP for coarse
+   *   locality, or the literal `'unknown'` if ip is missing. NEVER
+   *   the full IP.
+   *
+   * Do NOT rename these keys without a coordinated monitoring-config
+   * change.
    */
-  async function reserve(ip: string): Promise<void> {
+  async function reserve(ip: string | null | undefined): Promise<void> {
     let result: Awaited<ReturnType<typeof limiter.limit>>;
     try {
-      result = await limiter.limit(ip);
-    } catch {
+      result = await limiter.limit(ip ?? 'no-xff');
+    } catch (err) {
+      // Null-safe ip_bucket. Council bugs r1 on PR #28: `ip.slice(0,3)`
+      // on a missing ip would TypeError and swallow the alert entirely —
+      // re-introducing the very silent-fail-open gap this branch is
+      // adding visibility to.
+      const ip_bucket =
+        typeof ip === 'string' && ip.length > 0 ? ip.slice(0, 3) : 'unknown';
+      // eslint-disable-next-line no-console
+      console.error('[rate-limit] fail-open triggered', {
+        alert: true,
+        tier: 'auth_callback_ip',
+        errorName: err instanceof Error ? err.name : typeof err,
+        ip_bucket,
+      });
       return; // fail-OPEN; see docstring for rationale
     }
     if (!result.success) {

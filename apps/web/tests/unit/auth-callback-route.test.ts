@@ -31,9 +31,38 @@ import { NextRequest } from 'next/server';
 
 const exchangeCodeForSession = vi.fn();
 
+// Cookie-write transaction state controllable per-test. The route reads
+// these accessors after exchangeCodeForSession to decide whether a
+// setAll failure halted the session-cookie write and partial cookies
+// need rolling back.
+const cookieWriteFailure: { current: { errorName: string } | null } = {
+  current: null,
+};
+const writtenCookieNames: { current: readonly string[] } = { current: [] };
+
 vi.mock('../../lib/supabase', () => ({
   supabaseForRequest: () => ({
     auth: { exchangeCodeForSession },
+    getCookieWriteFailure: () => cookieWriteFailure.current,
+    getWrittenCookieNames: () => writtenCookieNames.current,
+  }),
+}));
+
+// next/headers cookies() stub. The route's cookie_failure rollback path
+// imports `cookies` from 'next/headers' and calls `.delete(name)` on each
+// name returned by getWrittenCookieNames. Individual tests control the
+// `.delete` behavior (including throwing to drive the rollback-fail
+// edge case). `.set` is unused by the route itself (writes go through
+// the Supabase adapter) — kept as a no-op so any accidental call is
+// observable via the spy.
+const cookieDeleteStub = vi.fn();
+const cookieSetStub = vi.fn();
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    getAll: () => [] as Array<{ name: string; value: string }>,
+    set: (name: string, value: string, options?: unknown) =>
+      cookieSetStub(name, value, options),
+    delete: (name: string) => cookieDeleteStub(name),
   }),
 }));
 
@@ -92,6 +121,10 @@ beforeEach(() => {
   exchangeCodeForSession.mockReset();
   reserveSpy.mockReset();
   reserveSpy.mockResolvedValue(undefined); // default: allow through
+  cookieWriteFailure.current = null;
+  writtenCookieNames.current = [];
+  cookieDeleteStub.mockReset();
+  cookieSetStub.mockReset();
   errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 
@@ -516,4 +549,149 @@ describe('GET /auth/callback — no token leakage in logs', () => {
       assertNoTokenLeaks(errorSpy, VALID_CODE);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #26 / PR #28: cookie_failure rollback path.
+//
+// When @supabase/ssr's setAll adapter halts mid-stream (first unexpected
+// throw), the route must:
+//   (a) detect the halt via supabase.getCookieWriteFailure(),
+//   (b) delete any cookies that WERE written before the halt,
+//   (c) 307 to /auth?error=cookie_failure,
+//   (d) never leak a token to logs.
+// ---------------------------------------------------------------------------
+describe('GET /auth/callback — cookie_failure rollback (issue #26)', () => {
+  it('detects a cookie-write halt after a successful exchange and redirects with error=cookie_failure', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-access-token.0'];
+
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(res.status).toBe(307);
+    const loc = new URL(res.headers.get('location') ?? '');
+    expect(loc.pathname).toBe('/auth');
+    expect(loc.searchParams.get('error')).toBe('cookie_failure');
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+
+  it('deletes every partially-written cookie name during rollback', async () => {
+    // The adapter tracks writes that succeeded BEFORE the halt. The
+    // route must call store.delete(name) for each so the user does not
+    // leave the /auth/callback request with a partial session cookie
+    // hanging around.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-access-token.0', 'sb-refresh-token'];
+
+    const { GET } = await import('../../app/auth/callback/route');
+    await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(cookieDeleteStub).toHaveBeenCalledTimes(2);
+    expect(cookieDeleteStub).toHaveBeenCalledWith('sb-access-token.0');
+    expect(cookieDeleteStub).toHaveBeenCalledWith('sb-refresh-token');
+  });
+
+  it('no partial-cookie deletion when nothing was written before the halt', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    cookieWriteFailure.current = { errorName: 'TypeError' };
+    writtenCookieNames.current = [];
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(cookieDeleteStub).not.toHaveBeenCalled();
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'cookie_failure',
+    );
+  });
+
+  it('cookie_failure takes precedence over server_error when exchange throws a setAll-origin error', async () => {
+    // A setAll throw bubbles up THROUGH exchangeCodeForSession as a
+    // generic Error. The route's existing catch-all would map it to
+    // server_error. Non-negotiable: cookie_failure wins, because the
+    // cookie-write failure is the proximate, actionable cause.
+    exchangeCodeForSession.mockRejectedValueOnce(new Error('setAll halted'));
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-access-token.0'];
+
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(res.status).toBe(307);
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'cookie_failure',
+    );
+    expect(cookieDeleteStub).toHaveBeenCalledWith('sb-access-token.0');
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+
+  it('rollback-itself-fails escalates to 500 (documented trade-off, council bugs r1)', async () => {
+    // Failure-within-a-failure-handler. cookies().delete(name) throws,
+    // e.g. a future Next.js version adding a guard. The route allows
+    // the throw to escalate to a 500 rather than silently swallowing —
+    // silent swallow would hide the bug. 500 is greppable.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-access-token.0'];
+    cookieDeleteStub.mockImplementation(() => {
+      throw new Error('cookies() store is frozen');
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(res.status).toBe(500);
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+
+  it('does not leak tokens in the cookie_failure log line', async () => {
+    // Regression guard on the new branch — keep the token-leak invariant.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-access-token.0'];
+    const { GET } = await import('../../app/auth/callback/route');
+    await GET(makeReq(`?code=${VALID_CODE}`));
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Double-click / mail-client prefetch: two sequential GETs with the same
+// code. First succeeds; second hits a consumed code and maps to token_used.
+// ---------------------------------------------------------------------------
+describe('GET /auth/callback — double-click / prefetch (council r1 security must-do)', () => {
+  it('maps a second GET with the consumed code to ?error=token_used', async () => {
+    // First call: Supabase returns a session; route redirects to /.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: { access_token: 'REDACTED' } },
+      error: null,
+    });
+    // Second call: Supabase reports the code was already consumed.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { message: 'Code already used; request a new magic link', status: 400 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const first = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(first.headers.get('location') ?? '').pathname).toBe('/');
+
+    const second = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(second.status).toBe(307);
+    expect(new URL(second.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_used',
+    );
+    expect(exchangeCodeForSession).toHaveBeenCalledTimes(2);
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
 });

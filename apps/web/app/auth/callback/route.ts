@@ -5,7 +5,8 @@
 // the @supabase/ssr setAll adapter in apps/web/lib/supabase.ts) and
 // redirects to the dashboard.
 //
-// Security posture (plan PR #22, council rounds r1 / r2 / r3 / r4):
+// Security posture (plan PR #22, council rounds r1 / r2 / r3 / r4;
+// PR #28 / issue #26 adds the cookie_failure branch):
 //
 //   - Per-IP rate limit (20 req / min, fail-open on Upstash outage).
 //     /auth/callback is a public endpoint that fans out to Supabase
@@ -13,35 +14,38 @@
 //     consume our server + Supabase's per-project rate budget (council
 //     security r4 blocker: non-negotiable on public endpoints with
 //     external API fan-out). Fail-open intentional: a Redis outage
-//     must not 503 a legit magic-link click.
+//     must not 503 a legit magic-link click. The limiter emits a
+//     monitorable `alert: true, tier: 'auth_callback_ip'` log on
+//     fail-open (PR #28 / issue #26).
 //
 //   - Input validation runs BEFORE the Supabase call. Missing /
 //     empty / whitespace / too-short / too-long / non-URL-safe `code`
 //     values redirect to /auth?error=invalid_request immediately.
-//     Defense in depth: Supabase also validates, but a malformed code
-//     should never touch the network.
 //
-//   - Every failure branch — Supabase-shaped errors, a 200 OK with
-//     `data.session: null`, unparseable JSON responses, and generic
-//     thrown Errors — maps to a known error kind and 307s to
+//   - Every failure branch maps to a known kind and 307s to
 //     /auth?error=<kind>. The final catch-all guarantees this route
-//     never returns a 500 (council bugs r1 / r2 / r3).
+//     never returns a 500 for auth failures (council bugs r1 / r2 / r3).
+//     The one exception is a rollback-itself-fails edge case where
+//     `cookies().delete()` throws on the cookie_failure recovery path —
+//     that escalates to 500 by design (council bugs r1 PR #28: silent
+//     swallow of a failure-within-a-failure-handler hides the bug).
 //
 //   - The success redirect is HARDCODED to `/`. No caller-supplied
-//     query parameter (`redirect_to`, `next`, etc.) may influence the
-//     destination URL. Forwarding an attacker-controlled URL here
-//     would be an open-redirect vector (council bugs r2). If a
-//     post-sign-in destination is ever needed, store it server-side
-//     (e.g., a cookie set at magic-link send time) — never in the
-//     callback query string.
+//     query parameter may influence the destination (open-redirect
+//     guard, council bugs r2).
+//
+//   - On a partial session-cookie write (@supabase/ssr setAll halts
+//     mid-stream), the route deletes any cookies that DID write before
+//     the halt and 307s to /auth?error=cookie_failure. This takes
+//     precedence over `server_error` when the setAll throw bubbles
+//     through exchangeCodeForSession (PR #28 / issue #26).
 //
 //   - Logs NEVER contain the `code`, `access_token`, or `refresh_token`
 //     values. Only the mapped error kind and (optionally) the thrown
-//     error's class name are emitted. The integration test suite at
-//     apps/web/tests/unit/auth-callback-route.test.ts spies on
-//     console.error and fails if any of those substrings appear.
+//     error's class name are emitted. Spy-enforced in the test suite.
 
 import { NextResponse, type NextRequest } from 'next/server';
+import { cookies } from 'next/headers';
 import { supabaseForRequest } from '../../../lib/supabase';
 import {
   makeAuthCallbackLimiter,
@@ -50,7 +54,12 @@ import {
 
 export const runtime = 'nodejs';
 
-type ErrorKind = 'invalid_request' | 'token_expired' | 'token_used' | 'server_error';
+type ErrorKind =
+  | 'invalid_request'
+  | 'token_expired'
+  | 'token_used'
+  | 'server_error'
+  | 'cookie_failure';
 
 // URL-safe base64 alphabet. Supabase PKCE codes are opaque strings within
 // this character set; anything else is an obvious probe / garbage and is
@@ -91,8 +100,7 @@ function rateLimitBucket(req: NextRequest): string {
  * match on message substrings with explicit fall-through to
  * `server_error`. If Supabase changes its error copy in a future
  * release, the result is more "server_error" toasts rather than a
- * crash — acceptable graceful degradation (council security r4
- * nice-to-have: revisit if Supabase ever exposes stable codes).
+ * crash — acceptable graceful degradation.
  */
 function mapSupabaseError(err: { message?: string; status?: number } | null): ErrorKind {
   if (!err) return 'server_error';
@@ -125,6 +133,23 @@ function tooManyRequests(resetsAt: Date): NextResponse {
   });
 }
 
+/**
+ * Delete partial session cookies when the setAll adapter halted the
+ * transaction. Throws are allowed to propagate — a failure here is a
+ * genuine bug (a frozen cookie store, a Next.js guard change) and
+ * swallowing would hide it. The route's outer `try` catches the throw
+ * and returns 500 explicitly so the failure mode is obvious in logs
+ * and CI rather than presenting as a weird inconsistent redirect.
+ * Council bugs r1 on PR #28.
+ */
+async function rollbackPartialCookies(names: readonly string[]): Promise<void> {
+  if (names.length === 0) return;
+  const store = await cookies();
+  for (const name of names) {
+    store.delete(name);
+  }
+}
+
 export async function GET(req: NextRequest): Promise<NextResponse> {
   // 1. Rate limit FIRST. Validation is cheap but unbounded requests to a
   // public endpoint still cost cycles, and a future refactor that moves
@@ -137,10 +162,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     }
     // Limiter's reserve() only throws RateLimitExceededError (it
     // fail-opens on Upstash outage). Any other throw is unexpected —
-    // let it propagate so the platform's error reporting picks it up;
-    // the route's final catch-all below won't run here because this
-    // block is outside the exchange try/catch by design (rate-limit
-    // failures are infrastructure errors, not sign-in errors).
+    // let it propagate.
     throw err;
   }
 
@@ -153,30 +175,54 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   const trimmedCode = (code as string).trim();
 
   // 3. Exchange the code, mapping every failure shape to a known kind.
+  const supabase = await supabaseForRequest();
   let failureKind: ErrorKind | null = null;
   try {
-    const supabase = await supabaseForRequest();
     const { data, error } = await supabase.auth.exchangeCodeForSession(trimmedCode);
     if (error) {
       failureKind = mapSupabaseError(error);
     } else if (!data?.session) {
-      // Unexpected: 200 OK with no session body. Treat as a server error
-      // rather than let a downstream null deref leak through (council
-      // bugs r1).
+      // Unexpected: 200 OK with no session body.
       failureKind = 'server_error';
     }
   } catch (err) {
-    // Final catch-all. A JSON parse failure, TypeError, network drop,
-    // or any non-Error throw lands here and is mapped to server_error.
-    // The route MUST NOT return a 500 (council bugs r1 / r2 / r3).
-    // We log only the error's class name — never the message (which
-    // might echo the code), never the object (which might carry
-    // access/refresh tokens from a partial Supabase response).
+    // Final catch-all. If the throw came FROM the setAll adapter
+    // (cookie_failure halt bubbled through exchangeCodeForSession),
+    // the adapter's failure state will be populated; we detect that
+    // in step 4 below and override this kind to cookie_failure.
     console.error('[auth/callback] unexpected exchange failure', {
       kind: 'server_error',
       errorName: err instanceof Error ? err.name : typeof err,
     });
     failureKind = 'server_error';
+  }
+
+  // 4. cookie_failure precedence. A setAll halt means the browser would
+  // be left with a partial session even if the exchange "succeeded";
+  // the cookie-write failure is the actionable cause and must take
+  // precedence over any generic `server_error` we set in the catch
+  // above. Check regardless of exchange outcome.
+  const cookieFailure = supabase.getCookieWriteFailure();
+  if (cookieFailure) {
+    failureKind = 'cookie_failure';
+    console.error('[auth/callback] sign-in failed', {
+      kind: 'cookie_failure',
+      errorName: cookieFailure.errorName,
+    });
+    try {
+      await rollbackPartialCookies(supabase.getWrittenCookieNames());
+    } catch (err) {
+      // Failure-within-failure-handler. Escalate to 500 by design
+      // rather than swallow. Log only the error class name — never the
+      // cookie names themselves (low leakage risk but keeps the log
+      // shape small for monitoring).
+      console.error('[auth/callback] cookie rollback failed', {
+        kind: 'server_error',
+        errorName: err instanceof Error ? err.name : typeof err,
+      });
+      return new NextResponse('sign-in recovery failed', { status: 500 });
+    }
+    return redirectToAuthError(req, 'cookie_failure');
   }
 
   if (failureKind !== null) {

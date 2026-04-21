@@ -31,6 +31,11 @@ const CALLBACK_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   token_expired: 'This sign-in link has expired. Request a new one.',
   server_error: 'Could not sign you in right now. Please try again.',
   invalid_request: 'Sign-in link was invalid. Request a new one.',
+  // PR #28 / issue #26: a partial session-cookie write halted mid-
+  // stream. Copy directs the user to request a NEW link rather than
+  // "try again," because the PKCE code was consumed during the halted
+  // exchange — clicking the same link would fail with token_used.
+  cookie_failure: "We couldn't save your sign-in. Request a new link.",
 };
 const GENERIC_CALLBACK_ERROR = 'Sign-in failed. Request a new link.';
 
