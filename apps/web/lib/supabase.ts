@@ -10,70 +10,118 @@ import {
 } from '@llmwiki/db/server';
 
 /**
+ * State exposed by the Proxy-wrapped Supabase client so the /auth/callback
+ * route can detect a partial session-cookie write and roll back.
+ *
+ * Added in PR #28 (issue #26). See §B of .harness/active_plan.md.
+ *
+ *   - `getCookieWriteFailure()` — returns `{ errorName }` for the first
+ *     unexpected setAll throw that halted the transaction, or `null` if
+ *     no halt occurred in this request's lifetime. `errorName` is the
+ *     thrown error's `.name` (or `typeof` for non-Error throws); the
+ *     value is a class identifier only — never a message, stack, or
+ *     cookie payload. Caller uses it to choose `cookie_failure` over
+ *     `server_error` when both produce failures.
+ *
+ *   - `getWrittenCookieNames()` — returns the names of cookies that
+ *     successfully wrote BEFORE the halt (if any). Returns a fresh
+ *     array copy each call — mutating it does not affect the adapter.
+ *     Caller iterates and `cookies().delete(name)` each so the browser
+ *     is not left with a partial session-cookie set.
+ */
+export interface CookieWriteState {
+  getCookieWriteFailure(): { errorName: string } | null;
+  getWrittenCookieNames(): readonly string[];
+}
+
+type SupabaseClientForRequest = ReturnType<typeof createSupabaseClientForRequest>;
+
+/**
  * Request-scoped Supabase client wired to Next.js's `cookies()` API.
  * Reads AND writes cookies — so this is the correct factory for Route
  * Handlers, Server Actions, AND Server Components (reads only).
  *
- * For PKCE sign-in: /auth/callback hits exchangeCodeForSession, which
- * writes the session cookie via the setAll callback below. Before PR
- * #22 this path used a read-only client and the session landed on the
- * floor. See packages/db/src/server.ts for the factory split rationale.
+ * Returns the Supabase client wrapped in a Proxy that surfaces
+ * cookie-write transaction state (see {@link CookieWriteState}).
+ * The Proxy intercepts ONLY the two sentinel accessor names — every
+ * other property / symbol read flows through `Reflect.get` unchanged,
+ * so the wrapper is transparent to consumers that only need the
+ * standard Supabase surface.
  *
- * In a Server Component, Next.js forbids cookie mutation — `store.set`
- * throws. That's expected when a component reads session state via this
- * client, so we catch the throw and debug-log rather than propagate.
+ * ### Transactional setAll
+ *
+ * @supabase/ssr's PKCE flow calls `setAll([...])` with multiple chunked
+ * cookies in a single invocation. Before PR #28 we tried every cookie
+ * and summary-logged partial failures. That was wrong for auth: a
+ * partial session-cookie write lands a broken session in the browser
+ * and the user experiences a silent login failure after clicking a
+ * valid link.
+ *
+ * The current adapter halts on the first UNEXPECTED throw. The expected
+ * Next.js "cookies can only be modified in a Server Action or Route
+ * Handler" throw from Server Components still swallows silently and
+ * does NOT halt (no write was actually attempted; the SC may still
+ * want to read session state). Anything else records a failure and
+ * stops the loop — the caller (route handler) reads the failure and
+ * rolls back.
+ *
+ * The adapter NEVER logs on its own. Logging lives where the rollback
+ * is decided — the route handler knows the error kind and writes a
+ * single authoritative line. Keeping the adapter quiet avoids
+ * double-logging and keeps the log set grep-stable for monitoring.
  */
-export async function supabaseForRequest() {
+export async function supabaseForRequest(): Promise<
+  SupabaseClientForRequest & CookieWriteState
+> {
   const store = await cookies();
-  return createSupabaseClientForRequest({
+
+  let failure: { errorName: string } | null = null;
+  const writtenNames: string[] = [];
+
+  const client = createSupabaseClientForRequest({
     getAll() {
       return store.getAll().map(({ name, value }) => ({ name, value }));
     },
     setAll(cookiesToSet) {
-      // Discriminate two failure modes per write (council bugs r4) AND
-      // accumulate unexpected failures so we can surface one partial-
-      // write summary at the end (council bugs r5).
-      //
-      //   1. Server Component context — Next.js forbids cookie mutation
-      //      from render. The thrown error's message contains "Cookies
-      //      can only be modified in a Server Action or Route Handler"
-      //      (or minor variants across Next versions). Expected when an
-      //      RSC reads session state via this client; swallow silently.
-      //
-      //   2. Anything else — a Route Handler or Server Action where the
-      //      write SHOULD have succeeded but didn't. @supabase/ssr
-      //      typically sends multiple chunked cookies in one setAll
-      //      call; if one fails but others succeed the user is left
-      //      with a partial session. Continuing the loop is right
-      //      (best-effort: maybe one chunk was transient), but a
-      //      post-loop summary log makes the partial-write signal
-      //      explicit so a future debug session doesn't miss it.
-      const unexpectedErrorNames: string[] = [];
+      // Skip entirely if a prior setAll call in this request already
+      // halted the transaction — @supabase/ssr can batch multiple
+      // setAll invocations, and we must not accept writes after a halt.
+      if (failure) return;
+
       for (const { name, value, options } of cookiesToSet) {
         try {
           store.set(name, value, options);
+          writtenNames.push(name);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const isExpectedRscContext =
             /cookies.*modif|server\s*action|route\s*handler/i.test(msg);
-          if (isExpectedRscContext) continue;
-          unexpectedErrorNames.push(
-            err instanceof Error ? err.name : typeof err,
-          );
+          if (isExpectedRscContext) {
+            // Server Component context — writes are forbidden by
+            // Next.js. Not an error; skip this name and continue so
+            // the SC can finish reading session state.
+            continue;
+          }
+          // Unexpected failure. Record (first wins) and halt the loop.
+          // Subsequent cookies in this batch are NOT attempted — a
+          // partial session-cookie set is the very failure mode this
+          // halt is closing.
+          failure = {
+            errorName: err instanceof Error ? err.name : typeof err,
+          };
+          break;
         }
-      }
-      if (unexpectedErrorNames.length > 0) {
-        // eslint-disable-next-line no-console
-        console.error(
-          `supabase: setAll partial write — ${unexpectedErrorNames.length}/` +
-            `${cookiesToSet.length} cookie writes failed in a write-capable ` +
-            'context. Session may be inconsistent. Cookie names and values ' +
-            'omitted to avoid leakage.',
-          { errorNames: unexpectedErrorNames },
-        );
       }
     },
   });
+
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === 'getCookieWriteFailure') return () => failure;
+      if (prop === 'getWrittenCookieNames') return () => [...writtenNames];
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as SupabaseClientForRequest & CookieWriteState;
 }
 
 /**

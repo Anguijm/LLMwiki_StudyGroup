@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   makeTokenBudgetLimiter,
   makeIngestEventLimiter,
@@ -122,6 +122,35 @@ describe('magic link limiter', () => {
 });
 
 describe('auth callback limiter (tier D)', () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errSpy.mockRestore();
+  });
+
+  /**
+   * Stringify a value for substring scanning. Objects via JSON; anything
+   * that fails to stringify falls back to String(). Used to assert that
+   * a raw IP is NEVER anywhere in a console.error argument — not as
+   * object key, value, nested property, or message.
+   */
+  function stringifyArg(x: unknown): string {
+    try {
+      return typeof x === 'string' ? x : JSON.stringify(x);
+    } catch {
+      return String(x);
+    }
+  }
+
+  /** Concatenation of every console.error argument across every call. */
+  function allErrArgs(spy: ReturnType<typeof vi.spyOn>): string {
+    return spy.mock.calls.flat().map(stringifyArg).join('\n');
+  }
+
   it('AUTH_CALLBACK_PER_IP_PER_MINUTE is 20', () => {
     expect(AUTH_CALLBACK_PER_IP_PER_MINUTE).toBe(20);
   });
@@ -135,6 +164,95 @@ describe('auth callback limiter (tier D)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
     const lim = makeAuthCallbackLimiter({ redis: redis as any });
     await expect(lim.reserve('1.2.3.4')).resolves.toBeUndefined();
+  });
+
+  // ===== Issue #26 / PR #28 — fail-open alerting =========================
+
+  it('emits a structured alert on fail-open so monitoring can page', async () => {
+    // Council security r2 on PR #25: "A silently disabled control is
+    // not a control." The fail-open branch MUST log a monitor-greppable
+    // record with stable keys so a log drain + alerting rule can fire
+    // when Upstash degrades.
+    const redis = { eval: async () => { throw new Error('network'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await lim.reserve('203.0.113.9');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const [message, context] = errSpy.mock.calls[0] as [string, unknown];
+    expect(message).toContain('fail-open');
+    expect(context).toMatchObject({
+      alert: true,
+      tier: 'auth_callback_ip',
+    });
+    // ip_bucket is a short prefix, not the full IP.
+    const ipBucket = (context as { ip_bucket?: unknown }).ip_bucket;
+    expect(typeof ipBucket).toBe('string');
+    expect((ipBucket as string).length).toBeLessThanOrEqual(3);
+  });
+
+  it('fail-open log NEVER contains the raw IP string anywhere in any argument', async () => {
+    // Council security r1 must-do: stringify EVERY console.error argument
+    // and assert the raw ip is not a substring anywhere — not just
+    // "not passed directly" but "not reachable by any grep."
+    const rawIp = '203.0.113.9';
+    const redis = { eval: async () => { throw new Error('network'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await lim.reserve(rawIp);
+    expect(allErrArgs(errSpy)).not.toContain(rawIp);
+  });
+
+  it('fail-open with undefined ip logs ip_bucket="unknown" without TypeError', async () => {
+    // Council bugs r1: if ip is missing, `ip.slice(0,3)` would TypeError
+    // and swallow the very alert the plan adds. Null-safe bucketing
+    // falls back to the literal string "unknown".
+    const redis = { eval: async () => { throw new Error('network'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+      lim.reserve(undefined as any),
+    ).resolves.toBeUndefined();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const [, context] = errSpy.mock.calls[0] as [string, unknown];
+    expect((context as { ip_bucket?: unknown }).ip_bucket).toBe('unknown');
+  });
+
+  it('fail-open with null ip logs ip_bucket="unknown" without TypeError', async () => {
+    const redis = { eval: async () => { throw new Error('network'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+      lim.reserve(null as any),
+    ).resolves.toBeUndefined();
+    const [, context] = errSpy.mock.calls[0] as [string, unknown];
+    expect((context as { ip_bucket?: unknown }).ip_bucket).toBe('unknown');
+  });
+
+  it('fail-open with empty-string ip logs ip_bucket="unknown"', async () => {
+    const redis = { eval: async () => { throw new Error('network'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await expect(lim.reserve('')).resolves.toBeUndefined();
+    const [, context] = errSpy.mock.calls[0] as [string, unknown];
+    expect((context as { ip_bucket?: unknown }).ip_bucket).toBe('unknown');
+  });
+
+  it('fail-open log includes a non-empty errorName (class identifier)', async () => {
+    // @upstash/ratelimit wraps the underlying redis throw before it
+    // reaches our catch, so we don't assert the exact class — the
+    // contract is "some class identifier string," stable enough for
+    // monitoring to distinguish "rate limiter is unhappy" from "rate
+    // limiter is quiet." Payload / message is NOT in the log.
+    const redis = { eval: async () => { throw new Error('redis down'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeAuthCallbackLimiter({ redis: redis as any });
+    await lim.reserve('198.51.100.1');
+    const [, context] = errSpy.mock.calls[0] as [string, unknown];
+    const errorName = (context as { errorName?: unknown }).errorName;
+    expect(typeof errorName).toBe('string');
+    expect((errorName as string).length).toBeGreaterThan(0);
   });
 
   it('accepts auth_callback_ip as a RateLimitExceededError kind', () => {
