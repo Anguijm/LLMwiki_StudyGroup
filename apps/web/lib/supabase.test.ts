@@ -197,6 +197,40 @@ describe('supabaseForRequest — setAll transactional cookie-write', () => {
     expect(errSpy).not.toHaveBeenCalled();
   });
 
+  it('subsequent setAll calls in the same request are no-ops after a halt (council r3 bugs)', async () => {
+    // @supabase/ssr may invoke setAll multiple times in one request
+    // lifecycle (session refresh plus code-exchange, etc.). If the FIRST
+    // call halted transactionally, any later call must be a no-op — we
+    // must not let a second batch land a partial session after the first
+    // already produced a cookie_failure.
+    const attempted: string[] = [];
+    setStub.mockImplementation((name: string) => {
+      attempted.push(name);
+      if (name === 'first') {
+        throw new Error('ECONNRESET — upstream write failed');
+      }
+    });
+    const { supabaseForRequest } = await import('./supabase');
+    const sb = await supabaseForRequest();
+
+    // First call: halts on `first`.
+    capturedAdapter.current!.setAll([
+      { name: 'first', value: 'a', options: {} },
+    ]);
+    expect(sb.getCookieWriteFailure()).toEqual({ errorName: 'Error' });
+    expect(attempted).toEqual(['first']);
+
+    // Second call: MUST be a no-op — no store.set attempts, failure
+    // state unchanged, writtenNames unchanged.
+    capturedAdapter.current!.setAll([
+      { name: 'second', value: 'b', options: {} },
+      { name: 'third', value: 'c', options: {} },
+    ]);
+    expect(attempted).toEqual(['first']); // unchanged
+    expect(sb.getWrittenCookieNames()).toEqual([]);
+    expect(sb.getCookieWriteFailure()).toEqual({ errorName: 'Error' });
+  });
+
   it('successful writes populate getWrittenCookieNames in order', async () => {
     // No throws — everything writes. Names track in call order so the
     // rollback path can delete them without relying on store.getAll().
