@@ -115,20 +115,71 @@ function rateLimitBucket(req: NextRequest): string {
 
 /**
  * Map a Supabase auth error to one of our user-facing kinds. Supabase
- * doesn't expose stable error codes for PKCE exchange failures, so we
- * match on message substrings with explicit fall-through to
- * `server_error`. If Supabase changes its error copy in a future
+ * doesn't expose stable error codes for PKCE exchange failures (in older
+ * versions), so we match on message substrings with explicit fall-through
+ * to `server_error`. If Supabase changes its error copy in a future
  * release, the result is more "server_error" toasts rather than a
  * crash — acceptable graceful degradation.
+ *
+ * PR #35 / issue #30 extends the vocabulary: the `err.code` field (when
+ * Supabase populates it) is preferred over substring matching since it's
+ * locale/version-stable. New message patterns cover the "Email link is
+ * invalid or has expired" and "no valid flow state found" cases the
+ * prior regex missed.
  */
-function mapSupabaseError(err: { message?: string; status?: number } | null): ErrorKind {
+function mapSupabaseError(
+  err: { message?: string; status?: number; code?: string } | null,
+): ErrorKind {
   if (!err) return 'server_error';
   if (typeof err.status === 'number' && err.status >= 500) return 'server_error';
   const msg = (err.message ?? '').toLowerCase();
+  const code = (err.code ?? '').toLowerCase();
+  // Code field takes priority when present — stable across Supabase
+  // versions and unaffected by message-copy drift.
+  if (/otp_used|used_otp|invalid_grant/.test(code)) return 'token_used';
+  if (/otp_expired|flow_state_expired/.test(code)) return 'token_expired';
+  // Token-used class by message.
   if (/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/.test(msg)) {
     return 'token_used';
   }
-  if (/expired|otp_expired/.test(msg)) return 'token_expired';
+  if (/email.*link.*invalid|no.*valid.*flow.*state/.test(msg)) {
+    return 'token_used';
+  }
+  // Token-expired class by message.
+  if (/\bexpired\b|otp_expired/.test(msg)) return 'token_expired';
+  return 'server_error';
+}
+
+/**
+ * Classify a Supabase redirect-error URL (e.g. /auth/callback?error=
+ * access_denied&error_code=otp_expired&error_description=...) without
+ * calling `exchangeCodeForSession`. Used when Supabase's /auth/v1/verify
+ * rejects upstream and redirects here with the error shape in the query
+ * string. Returns null if the URL has no `error` param (caller should
+ * proceed to normal code validation + exchange).
+ *
+ * CRITICAL: the raw `error` param value is NEVER used as the output
+ * ErrorKind. Classification is via allowlist-style matching on
+ * `error_code` (preferred, stable) and `error_description` (fallback,
+ * substring-based). Unknown values fall through to `server_error` —
+ * never reflected back to the user's browser as a raw string.
+ */
+function mapRedirectError(params: URLSearchParams): ErrorKind | null {
+  const err = params.get('error');
+  if (!err) return null;
+  const code = (params.get('error_code') ?? '').toLowerCase();
+  const desc = (params.get('error_description') ?? '').toLowerCase();
+  // Code field takes priority.
+  if (/otp_expired|flow_state_expired|magic_link_expired/.test(code)) {
+    return 'token_expired';
+  }
+  if (/otp_used|used_otp|invalid_grant/.test(code)) return 'token_used';
+  // Description substring fallback.
+  if (/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/.test(desc)) {
+    return 'token_used';
+  }
+  if (/email.*link.*invalid/.test(desc)) return 'token_used';
+  if (/\bexpired\b|link.*expired/.test(desc)) return 'token_expired';
   return 'server_error';
 }
 
@@ -185,8 +236,25 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     throw err;
   }
 
-  // 2. Input validation.
-  const code = new URL(req.url).searchParams.get('code');
+  // 2. Supabase redirect-error classification (BEFORE code validation).
+  //
+  // If Supabase's /auth/v1/verify rejected upstream, it redirects here
+  // with ?error=access_denied&error_code=...&error_description=... and
+  // usually no `code` param. Classifying from those params BEFORE
+  // `validateCode` runs is required (issue #30; PR #35 council r1 sec
+  // non-negotiable) — otherwise validateCode(null) would short-circuit
+  // to `invalid_request` before the error-param classification ever
+  // ran. If a URL has both `?error=...` AND `?code=...`, the error
+  // path wins — Supabase has already rejected the code upstream.
+  const searchParams = new URL(req.url).searchParams;
+  const redirectErrorKind = mapRedirectError(searchParams);
+  if (redirectErrorKind !== null) {
+    console.error('[auth/callback] sign-in failed', { kind: redirectErrorKind });
+    return redirectToAuthError(req, redirectErrorKind);
+  }
+
+  // 3. Input validation.
+  const code = searchParams.get('code');
   const validation = validateCode(code);
   if (validation !== null) {
     return redirectToAuthError(req, validation);
@@ -201,8 +269,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     if (error) {
       failureKind = mapSupabaseError(error);
     } else if (!data?.session) {
-      // Unexpected: 200 OK with no session body.
-      failureKind = 'server_error';
+      // 200 OK with no session and no error object. In practice the
+      // dominant cause is a stale PKCE code that resolved to no
+      // flow_state row (exact B.2 smoke test path from PR #27 evidence).
+      // Classify as token_used so the user gets actionable copy
+      // ("Request a new one.") rather than misleading retry copy.
+      //
+      // Trade-off: a rare genuine null-session response from Supabase
+      // (transient backend hiccup) is mis-labeled as token_used. The
+      // recovery action is identical — request a new link — so the
+      // mislabeling is user-harmless. If a dedicated `stale_link` kind
+      // is ever needed, add it; not in this PR (issue #30 / PR #35).
+      failureKind = 'token_used';
     }
   } catch (err) {
     // Final catch-all. If the throw came FROM the setAll adapter
