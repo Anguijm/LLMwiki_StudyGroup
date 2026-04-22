@@ -15,7 +15,9 @@ import { NonRetriableError } from 'inngest';
 process.env.ANTHROPIC_API_KEY = 'test-key-placeholder';
 import {
   estimateFlashcardTokens,
+  extractReservation,
   refundFlashcardBudget,
+  ReservationAwareError,
   runNoteCreatedFlashcards,
   NoteNotFoundError,
 } from './flashcard-gen';
@@ -349,7 +351,7 @@ describe('runNoteCreatedFlashcards — error branches', () => {
     );
   });
 
-  it('persist non-FK error (e.g., timeout) propagates (retryable)', async () => {
+  it('persist non-FK error (e.g., timeout) propagates retryable with cause preserved', async () => {
     const upsertSpy = vi.fn(async () => ({
       error: { code: '57014', message: 'canceling statement due to statement timeout' },
     }));
@@ -369,9 +371,12 @@ describe('runNoteCreatedFlashcards — error branches', () => {
       usage: { input_tokens: 100, output_tokens: 100 },
     });
     const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
-    // Not NonRetriableError (Inngest retries will fire, backing off).
+    // Not NonRetriableError — Inngest retries will fire, backing off.
     expect(err).not.toBeInstanceOf(NonRetriableError);
-    expect(err?.code).toBe('57014');
+    // Wrapped in ReservationAwareError so onFailure can refund exactly.
+    expect(err).toBeInstanceOf(ReservationAwareError);
+    // Original supabase error preserved in cause chain.
+    expect((err.cause as { code?: string })?.code).toBe('57014');
   });
 });
 
@@ -443,6 +448,165 @@ describe('runNoteCreatedFlashcards — token-estimate mismatch metric (council r
     // covered by this test's existence — the regression guard is that
     // usage.input_tokens > estimatedTokens is a branch we exercise.
     expect(generateFlashcardsMock).toHaveBeenCalled();
+  });
+});
+
+describe('ReservationAwareError + extractReservation (council r5 bugs)', () => {
+  it('extracts reservation payload from a direct ReservationAwareError', () => {
+    const err = new ReservationAwareError(3500, 'user-x', 'boom');
+    expect(extractReservation(err)).toEqual({
+      reservedTokens: 3500,
+      userId: 'user-x',
+    });
+  });
+
+  it('extracts reservation payload from a nested cause chain', () => {
+    const inner = new ReservationAwareError(2500, 'user-y', 'inner');
+    const middle = new Error('middle', { cause: inner });
+    const outer = new NonRetriableError('outer', { cause: middle });
+    expect(extractReservation(outer)).toEqual({
+      reservedTokens: 2500,
+      userId: 'user-y',
+    });
+  });
+
+  it('returns null for errors without a ReservationAwareError in the chain', () => {
+    expect(extractReservation(new Error('plain'))).toBeNull();
+    expect(extractReservation(null)).toBeNull();
+    expect(extractReservation(undefined)).toBeNull();
+  });
+});
+
+describe('runNoteCreatedFlashcards — wraps post-reservation errors in ReservationAwareError (council r5 bugs)', () => {
+  it('generate failure wraps the error so onFailure can refund exactly', async () => {
+    mockSupabase.from.mockImplementation((table: string) => {
+      if (table === 'notes') {
+        return {
+          select: () => ({
+            eq: () => ({
+              single: async () => ({ data: noteRow, error: null }),
+            }),
+          }),
+        };
+      }
+      return {};
+    });
+    generateFlashcardsMock.mockRejectedValueOnce(new Error('claude sideways'));
+    const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(ReservationAwareError);
+    // estimateFlashcardTokens(noteRow.body.length) — verify the reserved
+    // amount carried out equals what reserve() was called with.
+    const reservation = extractReservation(err);
+    expect(reservation).not.toBeNull();
+    expect(reservation!.userId).toBe('user-xyz');
+    expect(reservation!.reservedTokens).toBe(
+      estimateFlashcardTokens(noteRow.body.length),
+    );
+  });
+
+  it('persist non-FK failure also carries reservation for refund', async () => {
+    mockSupabase.from.mockImplementation((table: string) => {
+      if (table === 'notes') {
+        return {
+          select: () => ({
+            eq: () => ({
+              single: async () => ({ data: noteRow, error: null }),
+            }),
+          }),
+        };
+      }
+      if (table === 'srs_cards') {
+        return {
+          upsert: async () => ({
+            error: { code: '57014', message: 'statement timeout' },
+          }),
+        };
+      }
+      return {};
+    });
+    generateFlashcardsMock.mockResolvedValueOnce({
+      cards: [{ question: 'Q', answer: 'A' }],
+      usage: { input_tokens: 100, output_tokens: 100 },
+    });
+    const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(ReservationAwareError);
+    expect(extractReservation(err)!.userId).toBe('user-xyz');
+  });
+
+  it('FK violation still wraps the reservation inside the NonRetriableError', async () => {
+    mockSupabase.from.mockImplementation((table: string) => {
+      if (table === 'notes') {
+        return {
+          select: () => ({
+            eq: () => ({
+              single: async () => ({ data: noteRow, error: null }),
+            }),
+          }),
+        };
+      }
+      if (table === 'srs_cards') {
+        return {
+          upsert: async () => ({
+            error: { code: '23503', message: 'FK violation' },
+          }),
+        };
+      }
+      return {};
+    });
+    generateFlashcardsMock.mockResolvedValueOnce({
+      cards: [{ question: 'Q', answer: 'A' }],
+      usage: { input_tokens: 100, output_tokens: 100 },
+    });
+    const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(NonRetriableError);
+    // extractReservation walks the cause chain and finds the nested
+    // ReservationAwareError inside the NonRetriableError.
+    const reservation = extractReservation(err);
+    expect(reservation).not.toBeNull();
+    expect(reservation!.userId).toBe('user-xyz');
+  });
+});
+
+describe('refundFlashcardBudget — exact-mode vs fallback (council r5)', () => {
+  it('exact mode refunds the passed-in reservation without re-fetching the note', async () => {
+    refundSpy.mockReset();
+    // Intentionally DON'T set up a notes-fetch mock — if exact mode
+    // re-fetches, the test would break.
+    mockSupabase.from.mockReset();
+    await refundFlashcardBudget('note-abc', {
+      reservedTokens: 7777,
+      userId: 'user-exact',
+    });
+    expect(refundSpy).toHaveBeenCalledWith('user-exact', 7777);
+    expect(mockSupabase.from).not.toHaveBeenCalled();
+  });
+
+  it('exact mode is unaffected by a subsequent notes-row edit (council r5 exact-value non-negotiable)', async () => {
+    // Simulates the scenario council flagged: note body was edited
+    // between reservation and failure. Exact mode uses the reserved
+    // amount carried in the error, not a recomputed value. The
+    // `refund` call receives the ORIGINAL token amount even though
+    // the body is now larger.
+    refundSpy.mockReset();
+    const originalReservedTokens = 2500; // reserved when body was 4000 chars
+    // Note's body was edited to be much longer (8000 chars ≈ 3500 est)
+    // but exact mode must ignore that.
+    mockSupabase.from.mockImplementation(() => ({
+      select: () => ({
+        eq: () => ({
+          single: async () => ({
+            data: { user_id: 'user-zed', body: 'y'.repeat(8000) },
+            error: null,
+          }),
+        }),
+      }),
+    }));
+    await refundFlashcardBudget('note-xyz', {
+      reservedTokens: originalReservedTokens,
+      userId: 'user-zed',
+    });
+    expect(refundSpy).toHaveBeenCalledWith('user-zed', originalReservedTokens);
+    expect(mockSupabase.from).not.toHaveBeenCalled(); // no re-fetch in exact mode
   });
 });
 

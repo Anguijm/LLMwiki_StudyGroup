@@ -24,11 +24,7 @@ import { NonRetriableError } from 'inngest';
 import { inngest } from '../client';
 import { counter, histogram } from '@llmwiki/lib-metrics';
 import { supabaseService } from '@llmwiki/db/server';
-import {
-  makeAnthropicClient,
-  AiResponseShapeError,
-  AiRequestTimeoutError,
-} from '@llmwiki/lib-ai';
+import { makeAnthropicClient } from '@llmwiki/lib-ai';
 import { FLASHCARD_GEN_V1 } from '@llmwiki/prompts';
 import { requireEnv } from '@llmwiki/lib-utils/env';
 import {
@@ -52,6 +48,50 @@ export class NoteNotFoundError extends Error {
 }
 
 /**
+ * Carries the reservedTokens amount across the failure boundary so
+ * onFailure can refund the EXACT value that was reserved in the main
+ * execution, rather than recomputing from a re-fetched notes row that
+ * may have been edited between reservation and failure.
+ *
+ * Council r5 bugs: "the onFailure token refund amount must be the exact
+ * value reserved in the main function execution, not a value
+ * recalculated from a potentially stale notes row."
+ *
+ * Any throw AFTER `token-budget-reserve` succeeds should be wrapped in
+ * this error (or have `reservedTokens` attached to its cause chain) so
+ * onFailure can extract it.
+ */
+export class ReservationAwareError extends Error {
+  override readonly name = 'ReservationAwareError';
+  constructor(
+    public readonly reservedTokens: number,
+    public readonly userId: string,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+  }
+}
+
+/**
+ * Walk an error's cause chain looking for a ReservationAwareError and
+ * return its { reservedTokens, userId } payload if found.
+ */
+export function extractReservation(
+  err: unknown,
+): { reservedTokens: number; userId: string } | null {
+  // Walk up to 10 levels of cause to avoid pathological cycles.
+  let cur = err;
+  for (let i = 0; i < 10 && cur != null; i++) {
+    if (cur instanceof ReservationAwareError) {
+      return { reservedTokens: cur.reservedTokens, userId: cur.userId };
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+/**
  * Estimate token reservation from note body length. English/Latin-biased
  * heuristic (body.length / 4 ≈ tokens); CJK notes under-reserve by ~3×
  * and fail closed via Tier B's RateLimitExceededError — accepted v0
@@ -66,15 +106,35 @@ export function estimateFlashcardTokens(bodyLength: number): number {
 }
 
 /**
- * onFailure refund helper. Fetches the note by event.data.note_id to
- * recover user_id + body length, recomputes the reservation estimate,
- * and calls tokenBudget.refund. If the note can't be fetched (deleted,
- * transient DB hiccup), skips refund — the over-refund would go to an
- * unknown user and the budget auto-expires in 1h anyway.
+ * onFailure refund helper. Two modes:
  *
- * Exported for unit testing against the onFailure envelope.
+ *   1. **Exact mode** (preferred): caller passes `reservation` with the
+ *      exact { reservedTokens, userId } extracted from the failing
+ *      error's cause chain. Council r5 bugs non-negotiable — this is
+ *      the mode onFailure uses in practice.
+ *
+ *   2. **Fallback mode**: no reservation payload available (e.g., the
+ *      failure happened BEFORE `token-budget-reserve` ran, so there's
+ *      no reservedTokens to carry). In this mode the helper re-fetches
+ *      the note and estimates from body length. If the note can't be
+ *      fetched, skip refund entirely. This mode over/under-refunds by
+ *      bounded drift if the body changed mid-flow, but only runs when
+ *      no exact value is available.
  */
-export async function refundFlashcardBudget(noteId: string): Promise<void> {
+export async function refundFlashcardBudget(
+  noteId: string,
+  reservation?: { reservedTokens: number; userId: string },
+): Promise<void> {
+  const tokenBudget = makeTokenBudgetLimiter();
+  if (reservation) {
+    await tokenBudget.refund(reservation.userId, reservation.reservedTokens);
+    counter('flashcard.gen.budget_refunded', {
+      note_id: noteId,
+      amount: reservation.reservedTokens,
+      source: 'exact' as const,
+    });
+    return;
+  }
   const supabase = supabaseService();
   const { data: note, error } = await supabase
     .from('notes')
@@ -85,11 +145,11 @@ export async function refundFlashcardBudget(noteId: string): Promise<void> {
   const estimated = estimateFlashcardTokens(
     typeof note.body === 'string' ? note.body.length : 0,
   );
-  const tokenBudget = makeTokenBudgetLimiter();
   await tokenBudget.refund(note.user_id, estimated);
   counter('flashcard.gen.budget_refunded', {
     note_id: noteId,
     amount: estimated,
+    source: 'fallback' as const,
   });
 }
 
@@ -218,16 +278,15 @@ export async function runNoteCreatedFlashcards(
         return result.cards;
       } catch (err) {
         counter('flashcard.gen.failed', { stage: 'generate', note_id });
-        if (err instanceof AiResponseShapeError) {
-          // Parse / validation failure — retrying gives Claude another
-          // chance. Claude sometimes emits slightly-off JSON on first
-          // try; retry is worthwhile.
-          throw err;
-        }
-        if (err instanceof AiRequestTimeoutError) {
-          throw err;
-        }
-        throw err;
+        // Wrap so onFailure can refund the EXACT reserved amount
+        // (council r5 bugs). Preserve original error as cause for
+        // diagnostics + retry classification.
+        throw new ReservationAwareError(
+          estimatedTokens,
+          note.user_id,
+          err instanceof Error ? err.message : String(err),
+          { cause: err },
+        );
       }
     });
 
@@ -255,17 +314,37 @@ export async function runNoteCreatedFlashcards(
         .upsert(rows, { onConflict: 'note_id,question', ignoreDuplicates: true });
       if (error) {
         counter('flashcard.gen.failed', { stage: 'persist', note_id });
-        // Council r3: FK-violation (e.g., user/cohort deleted mid-flow)
-        // is non-retryable; wrap to skip the retry budget.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase error untyped
         const code = (error as any)?.code;
         if (code === PG_FK_VIOLATION) {
+          // Council r3: FK-violation (e.g., user/cohort deleted
+          // mid-flow) is non-retryable. Council r5 bugs: wrap in
+          // ReservationAwareError first so onFailure refunds the exact
+          // reserved amount, then in NonRetriableError to skip the
+          // retry budget. Non-retryable reason counter for observability.
+          counter('flashcard.gen.failed', {
+            stage: 'persist',
+            note_id,
+            reason: 'non_retryable' as const,
+          });
           throw new NonRetriableError(
             `persist failed: FK violation (${code})`,
-            { cause: error },
+            {
+              cause: new ReservationAwareError(
+                estimatedTokens,
+                note.user_id,
+                `FK violation (${code})`,
+                { cause: error },
+              ),
+            },
           );
         }
-        throw error;
+        throw new ReservationAwareError(
+          estimatedTokens,
+          note.user_id,
+          `persist failed`,
+          { cause: error },
+        );
       }
       counter('flashcard.persisted', { note_id, count: rows.length });
     });
@@ -283,22 +362,29 @@ export const noteCreatedFlashcards = inngest.createFunction(
     // zero-cost guard) must not trigger two Claude calls.
     idempotency: 'event.id',
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Inngest onFailure envelope untyped
-    onFailure: async ({ event }: { event: any }) => {
+    onFailure: async ({ event, error: err }: { event: any; error: any }) => {
       const orig = event?.data?.event?.data as { note_id?: string } | undefined;
       if (!orig?.note_id) return;
+      // Council r5 bugs: if the error carries a reservedTokens payload,
+      // refund that exact amount — not a recalculation from a potentially
+      // stale notes row. Falls back to body-length estimation only when
+      // the failure happened before token-budget-reserve ran.
+      const reservation = extractReservation(err);
       try {
-        await refundFlashcardBudget(orig.note_id);
-      } catch (err) {
+        await refundFlashcardBudget(
+          orig.note_id,
+          reservation ?? undefined,
+        );
+      } catch (refundErr) {
         // Refund is best-effort (Tier B budget auto-expires in 1h
         // regardless). But a silent swallow hides operational faults —
         // council r4 security: log the error class so a future log-drain
-        // rule can grep it. No note body / user id beyond what's
-        // already in event data.
+        // rule can grep it.
         // eslint-disable-next-line no-console
         console.error('[flashcard-gen] onFailure refund itself failed', {
           alert: true,
           tier: 'flashcard_gen_onfailure_refund',
-          errorName: err instanceof Error ? err.name : typeof err,
+          errorName: refundErr instanceof Error ? refundErr.name : typeof refundErr,
           note_id: orig.note_id,
         });
       }

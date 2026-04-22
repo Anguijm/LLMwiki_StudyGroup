@@ -132,6 +132,20 @@ describe('generateFlashcards — failure modes', () => {
     ).rejects.toBeInstanceOf(AiResponseShapeError);
   });
 
+  it('throws AiResponseShapeError when a card has answer: null (explicit null) (council r5)', async () => {
+    const json = JSON.stringify([{ question: 'Q', answer: null }]);
+    const client = makeAnthropicClient({
+      apiKey: 'test',
+      sdk: fakeSdk(json),
+    });
+    await expect(
+      client.generateFlashcards({
+        systemPrompt: SYSTEM_PROMPT,
+        noteBody: NOTE_BODY,
+      }),
+    ).rejects.toBeInstanceOf(AiResponseShapeError);
+  });
+
   it('throws AiResponseShapeError when a card is missing the answer field', async () => {
     const json = JSON.stringify([{ question: 'Q' }, { question: 'Q2', answer: 'A2' }]);
     const client = makeAnthropicClient({
