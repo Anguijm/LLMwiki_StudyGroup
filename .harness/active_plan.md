@@ -159,9 +159,16 @@ export const noteCreatedFlashcards = inngest.createFunction(
     // lower bound for English (see token-estimation caveat §D below). A
     // 500k-char note would bust the window outright even under the most
     // generous assumption. Reject fast here rather than waste a budget
-    // reservation + a failed Claude call. v1 work: chunked generation
-    // (split body, generate per chunk, merge + dedup), tracked as a
-    // follow-up issue (filed alongside this PR).
+    // reservation + a failed Claude call.
+    //
+    // **This cap is a STOPGAP.** Product direction (2026-04-23): large
+    // documents should be broken into per-chapter/section notes at
+    // ingest time, so every note naturally fits the 60%-context ceiling
+    // without any downstream cap. Tracked as issue #39. When semantic
+    // chunking ships, this MAX_BODY_CHARS guard becomes unreachable
+    // (every note will be a section, bounded in size) and can be
+    // deleted. For v0 at 4-user scale, the stopgap is acceptable:
+    // study-group notes rarely exceed the cap.
     const MAX_BODY_CHARS = 500_000;
     if (note.body.length > MAX_BODY_CHARS) {
       counter('flashcard.gen.skipped', {
