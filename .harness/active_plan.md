@@ -48,7 +48,7 @@ function mapRedirectError(params: URLSearchParams): ErrorKind | null {
 }
 ```
 
-Call site: immediately after `validateCode`, in the callback handler. If `mapRedirectError` returns non-null, skip the `exchangeCodeForSession` call and go straight to the error redirect.
+Call site: immediately **after the rate-limit gate** and **before `validateCode`**, in the callback handler. Ordering matters — when Supabase redirects with `?error=...` and no `code`, `validateCode(null)` would short-circuit to `invalid_request` before `mapRedirectError` ever ran. Council r1 security flagged this explicitly as a non-negotiable. If `mapRedirectError` returns non-null, skip `validateCode` + `exchangeCodeForSession` entirely and go straight to the error redirect.
 
 ### B. Extend Channel B — regex for additional wordings
 
@@ -180,7 +180,10 @@ Revert the PR. Behavior returns to current state: stale link → `server_error` 
 
 ## Council history
 
-(empty — awaiting r1)
+- **r1** (plan @ `d30f7cf`, 2026-04-22T08:45Z) — PROCEED 9/10/9/10/9/10. Two folds:
+  - Call-site ordering clarified: `mapRedirectError` runs BEFORE `validateCode`, not after (council security non-negotiable). Plan wording was internally inconsistent; fixed.
+  - Diagnostic-logging follow-up filed as an issue before impl begins (council step 5).
+  No scope changes; three-channel approach explicitly accepted over the smaller null-session-only alternative.
 
 ## Approval checklist (CLAUDE.md gate)
 
