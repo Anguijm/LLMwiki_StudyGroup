@@ -25,6 +25,7 @@
 
 import type { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { supabaseForRequest } from '../../../../lib/supabase';
 import {
   makeMagicLinkLimiter,
@@ -160,6 +161,40 @@ export async function POST(req: NextRequest) {
     email,
     options: { emailRedirectTo: `${redirectBase}/auth/callback` },
   });
+
+  // Cookie-write transaction precedence. If the @supabase/ssr setAll
+  // adapter halted mid-stream (e.g. the PKCE code-verifier cookie chunks
+  // were only partially written), the user would later click the magic
+  // link and /auth/callback would fail with "no valid flow state" —
+  // the exact silent-failure class PR #28 closed for /auth/callback
+  // itself. We mirror the callback's precedence rule: cookie_failure
+  // wins over a signInWithOtp error when both fire (cookie halt is the
+  // proximate, actionable cause).
+  //
+  // Issue #31; landed in PR #29 after council r1-r2 insisted on closing
+  // this symmetric gap.
+  const cookieFailure = supabase.getCookieWriteFailure();
+  if (cookieFailure) {
+    console.error('[magic-link] cookie-write halt — rolling back', {
+      errorName: cookieFailure.errorName,
+    });
+    try {
+      const store = await cookies();
+      for (const name of supabase.getWrittenCookieNames()) {
+        store.delete(name);
+      }
+    } catch (rbErr) {
+      console.error('[magic-link] cookie rollback failed', {
+        errorName: rbErr instanceof Error ? rbErr.name : typeof rbErr,
+      });
+      // fall through to 500 below — user-visible result is the same.
+    }
+    return NextResponse.json(
+      { error: "We couldn't save your sign-in. Please request a new link." },
+      { status: 500 },
+    );
+  }
+
   if (error) {
     // Log the original error context server-side for debugging Supabase
     // credential / connectivity issues. The client sees generic copy
