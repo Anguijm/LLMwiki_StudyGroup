@@ -76,3 +76,12 @@ describe('onIngestFailure — double-invocation refund safety', () => {
     expect(deps.__remove).toHaveBeenCalledOnce();
   });
 });
+
+// Note: flashcard-gen's onFailure refund coverage lives in
+// flashcard-gen.test.ts (see the "refundFlashcardBudget" describe block).
+// Kept there rather than here because the two test files use different
+// module-mock topologies — vi.mock hoisting doesn't cleanly compose
+// across files that both mock @llmwiki/db/server and
+// @llmwiki/lib-ratelimit. Council r1 step 7 intent (cover refund
+// behavior on failure) is satisfied there.
+
