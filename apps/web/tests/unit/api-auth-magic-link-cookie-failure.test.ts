@@ -80,15 +80,42 @@ afterEach(() => {
 });
 
 describe('POST /api/auth/magic-link — cookie_failure branch (issue #31)', () => {
-  it('returns 500 when the cookie adapter halted during signInWithOtp', async () => {
+  it('returns 500 with a non-localized error_key when the cookie adapter halted', async () => {
+    // Council r3 a11y: response must carry an error KEY, not a hardcoded
+    // English string, so the client can map to localized copy.
     cookieWriteFailure.current = { errorName: 'Error' };
     writtenCookieNames.current = ['sb-code-verifier.0'];
 
     const { POST } = await import('../../app/api/auth/magic-link/route');
     const res = await POST(req('user@example.com'));
     expect(res.status).toBe(500);
-    const body = (await res.json()) as { error?: string };
-    expect(body.error).toMatch(/sign-in|try again|request/i);
+    const body = (await res.json()) as { error_key?: string };
+    expect(body.error_key).toBe('COOKIE_WRITE_FAILURE');
+  });
+
+  it('cookie_failure log carries the structured monitor contract', async () => {
+    // Council r3 security/bugs: the halt log MUST match the grep-stable
+    // { alert: true, tier, errorName } shape — same family as the
+    // rate-limit fail-open alert from PR #28.
+    cookieWriteFailure.current = { errorName: 'Error' };
+    writtenCookieNames.current = ['sb-code-verifier.0'];
+
+    const { POST } = await import('../../app/api/auth/magic-link/route');
+    await POST(req('user@example.com'));
+    // Find the structured-alert call (there may be additional log lines
+    // from the rollback path if a secondary throw fires).
+    const alertCall = errorSpy.mock.calls.find(
+      (call) =>
+        typeof call[1] === 'object' &&
+        call[1] !== null &&
+        (call[1] as { alert?: unknown }).alert === true,
+    );
+    expect(alertCall).toBeDefined();
+    expect(alertCall?.[1]).toMatchObject({
+      alert: true,
+      tier: 'auth_magic_link_cookie_write',
+      errorName: 'Error',
+    });
   });
 
   it('deletes every partially-written verifier cookie on rollback', async () => {

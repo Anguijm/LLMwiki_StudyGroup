@@ -175,7 +175,13 @@ export async function POST(req: NextRequest) {
   // this symmetric gap.
   const cookieFailure = supabase.getCookieWriteFailure();
   if (cookieFailure) {
+    // Structured monitor alert — matches the rate-limit fail-open contract
+    // from PR #28. Keys `alert`, `tier`, `errorName` are a stable grep
+    // surface for any future log-drain rule (see README ## Monitoring).
+    // Do NOT rename without a coordinated monitoring-config change.
     console.error('[magic-link] cookie-write halt — rolling back', {
+      alert: true,
+      tier: 'auth_magic_link_cookie_write',
       errorName: cookieFailure.errorName,
     });
     try {
@@ -185,12 +191,19 @@ export async function POST(req: NextRequest) {
       }
     } catch (rbErr) {
       console.error('[magic-link] cookie rollback failed', {
+        alert: true,
+        tier: 'auth_magic_link_cookie_rollback',
         errorName: rbErr instanceof Error ? rbErr.name : typeof rbErr,
       });
       // fall through to 500 below — user-visible result is the same.
     }
+    // Non-localized error key (council r3 a11y non-negotiable). Client
+    // maps this to localized copy; raw English strings are never returned
+    // from auth surfaces. Stable allowlist value — additions require a
+    // client-side copy update in /auth/page.tsx's CALLBACK_ERROR_MESSAGES
+    // equivalent for API-route errors.
     return NextResponse.json(
-      { error: "We couldn't save your sign-in. Please request a new link." },
+      { error_key: 'COOKIE_WRITE_FAILURE' },
       { status: 500 },
     );
   }
