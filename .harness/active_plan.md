@@ -154,12 +154,41 @@ export const noteCreatedFlashcards = inngest.createFunction(
       return { ok: true, count: 0, skipped: 'empty_body' as const };
     }
 
+    // Council r2 bugs: oversized body cap. Haiku 4.5's context window is
+    // ~200k tokens; the heuristic body.length / 4 ≈ tokens is a rough
+    // lower bound for English (see token-estimation caveat §D below). A
+    // 500k-char note would bust the window outright even under the most
+    // generous assumption. Reject fast here rather than waste a budget
+    // reservation + a failed Claude call. v1 work: chunked generation
+    // (split body, generate per chunk, merge + dedup), tracked as a
+    // follow-up issue (filed alongside this PR).
+    const MAX_BODY_CHARS = 500_000;
+    if (note.body.length > MAX_BODY_CHARS) {
+      counter('flashcard.gen.skipped', {
+        note_id,
+        reason: 'body_too_long',
+        body_length: note.body.length,
+      });
+      return { ok: true, count: 0, skipped: 'body_too_long' as const };
+    }
+
     // Council r1 bugs: estimate token reservation DYNAMICALLY from note
     // body length. Prior draft hardcoded 2000 — inaccurate for long notes,
     // and invisible-to-ops if the token-per-char ratio shifts. Rough
     // budget: ~1 token per 4 chars of UTF-8 English input + ~1500 tokens
     // for system prompt + output. Minimum floor 1500; no maximum — long
-    // notes get the budget they need, bounded by the Tier B ceiling.
+    // notes get the budget they need, bounded by the Tier B ceiling and
+    // by the MAX_BODY_CHARS cap enforced above.
+    //
+    // Council r2 bugs — token-per-char bias (accepted v0 limitation):
+    // the `body.length / 4` heuristic is English/Latin-accurate. CJK
+    // tokenizes at ~1–1.5 chars per token, so a Japanese note under this
+    // formula would UNDER-reserve by ~3×. Accepted because v0 cohort is
+    // English-language by product design; the multi-language path is v1
+    // work (switch to Claude's count_tokens API OR local tokenizer). If
+    // a non-Latin note ever busts the reservation, the Tier B limiter
+    // fails closed with `RateLimitExceededError` — correct failure mode
+    // (no half-complete generation, no silent over-spend).
     const tokenBudget = makeTokenBudgetLimiter();
     const estimatedTokens = Math.max(1500, Math.ceil(note.body.length / 4) + 1500);
     await step.run('token-budget-reserve', async () => {
@@ -249,6 +278,8 @@ Rate-limit budget kind: reuse `makeTokenBudgetLimiter` (Tier B, 100k tokens/user
 | Note body 500 chars, valid | 5–10 cards inserted, rows match schema |
 | Note body 8000 chars, valid | 8–10 cards (prompt prefers max density for long notes), dynamic token reserve ≈ 3500 |
 | Note body `null` / `''` / `'   '` | Early exit; 0 cards; no Claude call; `flashcard.gen.skipped{reason:'empty_body'}` fires |
+| Note body > 500_000 chars | Early exit; 0 cards; `flashcard.gen.skipped{reason:'body_too_long'}` fires; no Claude call (council r2 bugs — oversized-body strategy) |
+| Note body in non-Latin script within cap | Reserves tokens via English-biased heuristic (known under-estimate for CJK); if reservation proves insufficient, `RateLimitExceededError` fail-closed path runs (council r2 bugs — accepted v0 limitation) |
 | Claude returns non-JSON text | `AiResponseShapeError`, no rows inserted, step fails, Inngest retries (up to 2) |
 | Claude returns valid JSON but `{question, answer}` fields missing | `AiResponseShapeError`, same retry path |
 | Claude returns 15 cards | `AiResponseShapeError('too many cards')` — NOT silently truncated (council r1 bugs/security) |
@@ -301,7 +332,7 @@ Revert the PR. The UNIQUE constraint goes away cleanly (no rows in v0); indexes 
 
 ## Out of scope (explicit)
 
-- **`/review` UI.** Reads `srs_cards` + renders Q/A pairs. Separate PR once this handler lands and cards exist in DB.
+- **`/review` UI.** Reads `srs_cards` + renders Q/A pairs. Separate PR once this handler lands and cards exist in DB. **Filed as P0 issue #38 per council r2 security non-negotiable** — ticket includes the XSS-sanitization requirement on `srs_cards.question` / `answer` (plain-text rendering only; no `dangerouslySetInnerHTML`).
 - **FSRS scoring** (rating + next-review-date advancement). The `review_history` schema exists; wiring it is a separate PR with its own council round.
 - **`note.created.link` wiki-linking handler.** Still a no-op after this PR. Next feature handler.
 - **Opus-based generation.** Flashcard extraction is Haiku-appropriate per CLAUDE.md cost posture.
@@ -330,7 +361,12 @@ Revert the PR. The UNIQUE constraint goes away cleanly (no rows in v0); indexes 
   - `flashcard.gen.latency` histogram added to metrics (§F).
   - Expanded test matrix rows covering empty-body / 15-card reject / `[]` empty array / duplicate event-id / case-variant dedup / FK-violation retry behavior.
   - FK-violation non-retryability noted as an impl-time IMPROVE, not a plan blocker.
-- Awaiting r2.
+- **r2** (plan @ `e3d724d`, 2026-04-22T19:28Z) — REVISE 9/10/7/10/10/9. Bugs recovered 4→7 after r1 folds. Three new asks:
+  - Oversized body cap: `MAX_BODY_CHARS = 500_000` enforced in §D with `flashcard.gen.skipped{reason:'body_too_long'}` counter. Chunked-generation for > cap deferred to v1 (filed as follow-up candidate).
+  - Token-heuristic non-Latin bias: documented as accepted v0 limitation (cohort is English by product design; Tier B fail-closed is the fallback if CJK ever busts the reservation). Multi-language estimation deferred.
+  - `/review` P0 ticket: **filed as issue #38** with XSS sanitization non-negotiable on `question` / `answer` rendering. Promoted from §Out-of-scope note to an explicit dependency.
+  - 10-card reject test: already in §A + test matrix. No change needed (council r2 re-listed as a non-negotiable reminder, not a new ask).
+- Awaiting r3.
 
 ## Approval checklist (CLAUDE.md gate)
 
