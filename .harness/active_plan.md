@@ -72,6 +72,8 @@ const FlashcardDraftSchema = z.object({
 
 Bounded strings are defense against prompt-injection blowouts (Claude instructed to return "1–10 cards" but belt-and-suspenders on input validation at the schema layer).
 
+**Array-length enforcement (council r1 bugs / security):** after successful parse, validate `cards.length <= 10`. If Claude returns 11+ cards, throw `AiResponseShapeError('flashcard-gen', 'too many cards', { count })`. Do NOT silently truncate — a truncation path would let a future prompt regression mask itself as "working but partial." Explicit rejection forces a retry (Inngest will re-call Claude with identical input); if the problem persists across retries, the function fails and `onFailure` refunds the token reservation. Test row locks this: 15-card response → error, not truncated array.
+
 ### B. Prompt — `packages/prompts/src/flashcard-gen/v1.md`
 
 System prompt, ~300 words. Key contents:
@@ -102,6 +104,15 @@ alter table public.srs_cards
 create index if not exists srs_cards_note_id_idx on public.srs_cards (note_id);
 create index if not exists srs_cards_user_due_idx on public.srs_cards (user_id, due_at)
   where due_at is not null;
+
+-- Document provenance so a future /review UI dev knows to sanitize
+-- question/answer before rendering (LLM-generated from user-uploaded
+-- content via /api/ingest → note body → Claude Haiku flashcard-gen).
+-- Council security r1 folded in PR #37.
+comment on column public.srs_cards.question is
+  'LLM-generated from user-uploaded content. MUST be sanitized before rendering.';
+comment on column public.srs_cards.answer is
+  'LLM-generated from user-uploaded content. MUST be sanitized before rendering.';
 ```
 
 **Migration reversibility:** adding a UNIQUE constraint on an empty table is free; adding on a populated table fails if duplicates exist. v0 data is empty so the constraint applies cleanly. The plan notes this explicitly so a future `down.sql` can drop both constraint and indexes with no data-loss risk. CLAUDE.md / CONTRIBUTING note that reversible migrations are a v1-tracking requirement — handled here by the `if not exists` + `add constraint` shape which can be mirrored in a future down.
@@ -114,6 +125,9 @@ export const noteCreatedFlashcards = inngest.createFunction(
     id: 'note-created-flashcards',
     retries: 2,              // was 0; 2 gives cost headroom without runaway
     concurrency: { limit: 2 }, // bound parallel Haiku calls per cohort scale
+    idempotency: 'event.id',   // council r1 bugs: duplicate events from the
+                               // emitter (extremely unlikely but zero-cost
+                               // to guard) must not trigger two Claude calls
   },
   { event: 'note.created.flashcards' },
   async ({ event, step }) => {
@@ -131,8 +145,23 @@ export const noteCreatedFlashcards = inngest.createFunction(
       return data;
     });
 
+    // Council r1 bugs: null / empty / whitespace note body short-circuits
+    // here — no point spending a Claude call or a token-budget reservation
+    // on an empty body. Logs a successful completion with 0 cards so the
+    // ingest pipeline metrics stay coherent.
+    if (!note.body || note.body.trim().length === 0) {
+      counter('flashcard.gen.skipped', { note_id, reason: 'empty_body' });
+      return { ok: true, count: 0, skipped: 'empty_body' as const };
+    }
+
+    // Council r1 bugs: estimate token reservation DYNAMICALLY from note
+    // body length. Prior draft hardcoded 2000 — inaccurate for long notes,
+    // and invisible-to-ops if the token-per-char ratio shifts. Rough
+    // budget: ~1 token per 4 chars of UTF-8 English input + ~1500 tokens
+    // for system prompt + output. Minimum floor 1500; no maximum — long
+    // notes get the budget they need, bounded by the Tier B ceiling.
     const tokenBudget = makeTokenBudgetLimiter();
-    const estimatedTokens = 2000; // ~body tokens + prompt + output bound
+    const estimatedTokens = Math.max(1500, Math.ceil(note.body.length / 4) + 1500);
     await step.run('token-budget-reserve', async () => {
       await tokenBudget.reserve(note.user_id, estimatedTokens);
     });
@@ -175,7 +204,7 @@ export const noteCreatedFlashcards = inngest.createFunction(
 );
 ```
 
-`onFailure` hook refunds the reserved token budget (mirrors `ingest-pdf.ts` pattern — see `inngest/src/functions/on-failure.ts`). New file or extend existing.
+`onFailure` hook refunds the reserved token budget (mirrors `ingest-pdf.ts` pattern — see `inngest/src/functions/on-failure.ts`). Council r1 security / cost escalated this to its own execution step: the hook must exist, must be tested in isolation (mock `tokenBudget.refund` + assert correct `user_id` + token amount), and must run regardless of which step failed. **Known retry-classification gap (not a plan blocker, impl decision):** FK-violation-on-user-delete is non-retryable (retrying won't undelete the user); the handler should detect and short-circuit rather than consume all 2 retries. Tracked in the test matrix below.
 
 Rate-limit budget kind: reuse `makeTokenBudgetLimiter` (Tier B, 100k tokens/user/hour). Flashcard generation is a small fraction of the per-hour budget — a 20-note ingestion burst would consume ~40k tokens, still within budget.
 
@@ -190,17 +219,27 @@ Rate-limit budget kind: reuse `makeTokenBudgetLimiter` (Tier B, 100k tokens/user
 
 **`inngest/src/functions/flashcard-gen.test.ts`** (new):
 - Happy path: mock note fetch + Claude + insert; assert rows inserted with correct shape.
+- **Empty-body skip path** (council r1 bugs): note body `''` / `null` / `'   '` (whitespace only) → function returns `{ ok: true, count: 0, skipped: 'empty_body' }`, no Claude call, no token reservation, `flashcard.gen.skipped` counter fires.
+- **Dynamic token budget** (council r1 bugs): 1000-char note → reserve ~1750 tokens; 8000-char note → reserve ~3500 tokens. Assert exact math matches `Math.max(1500, Math.ceil(body.length / 4) + 1500)`.
 - `NoteNotFoundError` when note fetch returns no row.
-- Token-budget `reserve` rejects with `RateLimitExceededError` → function fails; budget refund path is exercised by on-failure hook (tested separately or in a small integration spin).
+- Token-budget `reserve` rejects with `RateLimitExceededError` → function fails; `onFailure` hook refunds (tested in its own file below).
 - `Claude` returns a parse-able JSON but with duplicate questions in the array → Supabase `insert(..., { onConflict, ignoreDuplicates })` de-duplicates silently; assert final row count matches unique questions.
 - Retry idempotency: simulate the `persist` step running twice (Inngest retry of a failed post-commit observation) — second run produces zero additional rows due to the UNIQUE constraint.
+- **Duplicate event-id short-circuit** (council r1 bugs): two events with same `event.id` fire; assert only one Claude call happens. (Enforced by Inngest's `idempotency: 'event.id'` config; integration-style test via the mock step runner.)
 - All failure paths: `console.error` spy never logs `ANTHROPIC_API_KEY` or note body text (existing leak-guard pattern).
+
+**`inngest/src/functions/on-failure.test.ts` (extend)** — council r1 promoted to its own step:
+- `noteCreatedFlashcards` function fails after `token-budget-reserve` succeeded → `onFailure` hook refunds the exact token amount against the exact `user_id`. Assert `tokenBudget.refund` called once with correct args.
+- Function fails BEFORE `token-budget-reserve` (e.g., `load-note` step threw) → `onFailure` does NOT call `refund` (nothing to refund).
+- `tokenBudget.refund` itself throws → hook swallows and logs (non-fatal; matches existing `on-failure.ts` pattern).
 
 ### F. Metrics + observability
 
 - `flashcard.gen.completed{count, input_tokens, output_tokens}` counter — per successful generation.
 - `flashcard.persisted{note_id, count}` counter — after DB insert.
+- `flashcard.gen.skipped{note_id, reason}` counter — early-exit branches (empty body, future tier gates).
 - `flashcard.gen.failed{stage}` counter — when any `step.run` throws; `stage ∈ {load-note, token-budget-reserve, generate, persist}`.
+- `flashcard.gen.latency` histogram — end-to-end duration from event trigger to successful `persist` step. Council r1 product r1 metric addition; lets future ops spot degradation before user reports surface it.
 - Existing `counter` / `histogram` helpers from `@llmwiki/lib-metrics` — no new infra.
 
 ## Test matrix
@@ -208,14 +247,19 @@ Rate-limit budget kind: reuse `makeTokenBudgetLimiter` (Tier B, 100k tokens/user
 | Scenario | Expected |
 |---|---|
 | Note body 500 chars, valid | 5–10 cards inserted, rows match schema |
-| Note body 8000 chars, valid | 8–10 cards (prompt prefers max density for long notes), input_tokens reasonable |
+| Note body 8000 chars, valid | 8–10 cards (prompt prefers max density for long notes), dynamic token reserve ≈ 3500 |
+| Note body `null` / `''` / `'   '` | Early exit; 0 cards; no Claude call; `flashcard.gen.skipped{reason:'empty_body'}` fires |
 | Claude returns non-JSON text | `AiResponseShapeError`, no rows inserted, step fails, Inngest retries (up to 2) |
 | Claude returns valid JSON but `{question, answer}` fields missing | `AiResponseShapeError`, same retry path |
-| Claude returns 15 cards | plan picks one of: truncate-to-10 or reject; test locks the chosen behavior |
+| Claude returns 15 cards | `AiResponseShapeError('too many cards')` — NOT silently truncated (council r1 bugs/security) |
+| Claude returns `[]` empty array | Happy-path success; 0 cards inserted; `flashcard.persisted{count:0}` |
 | Duplicate questions in Claude output | `insert(..., ignoreDuplicates: true)` silently dedups; final row count < 10 |
+| Case-variant duplicate questions (e.g. "What is X?" vs "what is x?") | Both inserted (DB default collation is case-sensitive). Accepted trade-off per council r1 edge case. |
 | Retry after `persist` succeeded but function crashed | Inngest re-runs `persist`; UNIQUE constraint + `ON CONFLICT DO NOTHING` yields zero additional rows |
+| Duplicate `note.created.flashcards` events same event.id | Inngest `idempotency: 'event.id'` short-circuits second execution; only one Claude call fires |
 | Token budget exceeded | `RateLimitExceededError`; function fails; `onFailure` refunds; no rows inserted |
 | Note not found | `NoteNotFoundError`; function fails immediately; no Claude call |
+| User/cohort deleted mid-flow (FK violation on insert) | Function fails with DB error; retries consume the 2-retry budget; `onFailure` refunds token budget. (Impl note: non-retryable detection is a future IMPROVE; for now the retry is wasted but harmless.) |
 | All failure branches | `console.error` spy sees no `ANTHROPIC_API_KEY` or raw note body in args |
 
 ## Cost
@@ -276,7 +320,17 @@ Revert the PR. The UNIQUE constraint goes away cleanly (no rows in v0); indexes 
 
 ## Council history
 
-(empty — awaiting r1)
+- **r1** (plan @ `e40d8a2`, 2026-04-22T10:58Z) — REVISE 10/10/4/10/10/9. Bugs persona dropped 4; three concrete blockers: idempotency key, null-body handling, hardcoded token estimate. All folded:
+  - `idempotency: 'event.id'` added to Inngest function config (§D).
+  - Empty/whitespace note body short-circuits before Claude call (§D) + dedicated test row.
+  - Dynamic token estimate `Math.max(1500, ceil(body.length / 4) + 1500)` (§D) + test asserting exact math.
+  - 11+ cards → `AiResponseShapeError` (no silent truncation; §A) + test row.
+  - `COMMENT ON COLUMN srs_cards.question/answer` for sanitize-on-render provenance (§C).
+  - `onFailure` hook promoted to its own step + dedicated test file (`on-failure.test.ts` extension) (§D / §E).
+  - `flashcard.gen.latency` histogram added to metrics (§F).
+  - Expanded test matrix rows covering empty-body / 15-card reject / `[]` empty array / duplicate event-id / case-variant dedup / FK-violation retry behavior.
+  - FK-violation non-retryability noted as an impl-time IMPROVE, not a plan blocker.
+- Awaiting r2.
 
 ## Approval checklist (CLAUDE.md gate)
 
