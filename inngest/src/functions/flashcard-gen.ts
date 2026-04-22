@@ -128,7 +128,14 @@ export async function runNoteCreatedFlashcards(
         .select('id, body, user_id, cohort_id')
         .eq('id', note_id)
         .single();
-      if (error || !data) throw new NoteNotFoundError(note_id);
+      if (error || !data) {
+        // Council r4 bugs: a missing note will stay missing across
+        // retries. Wrap in NonRetriableError so Inngest skips the
+        // 2-retry budget and surfaces the failure immediately.
+        throw new NonRetriableError(`note not found: ${note_id}`, {
+          cause: new NoteNotFoundError(note_id),
+        });
+      }
       return data as {
         id: string;
         body: string | null;
@@ -141,6 +148,9 @@ export async function runNoteCreatedFlashcards(
     // tokens or calling Claude (council r1/r2 bugs).
     if (!note.body || note.body.trim().length === 0) {
       counter('flashcard.gen.skipped', { note_id, reason: 'empty_body' });
+      // Council r4 bugs: latency histogram emitted on every success
+      // return path, including skips — consistent observability.
+      histogram('flashcard.gen.latency', Date.now() - startedAt, { note_id });
       return { ok: true, count: 0, skipped: 'empty_body' as const };
     }
     if (note.body.length > MAX_BODY_CHARS) {
@@ -149,6 +159,7 @@ export async function runNoteCreatedFlashcards(
         reason: 'body_too_long',
         body_length: note.body.length,
       });
+      histogram('flashcard.gen.latency', Date.now() - startedAt, { note_id });
       return { ok: true, count: 0, skipped: 'body_too_long' as const };
     }
 
@@ -191,6 +202,19 @@ export async function runNoteCreatedFlashcards(
           input_tokens: result.usage.input_tokens,
           output_tokens: result.usage.output_tokens,
         });
+        // Council r4 metrics: heuristic-accuracy observability. If actual
+        // input_tokens exceeded the reservation, the Tier B budget was
+        // temporarily over-committed. Auto-recovers (sliding window),
+        // but if this counter trends up we have signal that the
+        // heuristic needs tuning (e.g., non-Latin cohort joined).
+        if (result.usage.input_tokens > estimatedTokens) {
+          counter('flashcard.gen.token_estimate_mismatch', {
+            note_id,
+            estimated: estimatedTokens,
+            actual: result.usage.input_tokens,
+            overshoot: result.usage.input_tokens - estimatedTokens,
+          });
+        }
         return result.cards;
       } catch (err) {
         counter('flashcard.gen.failed', { stage: 'generate', note_id });
@@ -264,9 +288,19 @@ export const noteCreatedFlashcards = inngest.createFunction(
       if (!orig?.note_id) return;
       try {
         await refundFlashcardBudget(orig.note_id);
-      } catch {
-        // Refund is best-effort; swallow so onFailure doesn't itself fail.
-        // Budget auto-expires via Tier B's sliding window regardless.
+      } catch (err) {
+        // Refund is best-effort (Tier B budget auto-expires in 1h
+        // regardless). But a silent swallow hides operational faults —
+        // council r4 security: log the error class so a future log-drain
+        // rule can grep it. No note body / user id beyond what's
+        // already in event data.
+        // eslint-disable-next-line no-console
+        console.error('[flashcard-gen] onFailure refund itself failed', {
+          alert: true,
+          tier: 'flashcard_gen_onfailure_refund',
+          errorName: err instanceof Error ? err.name : typeof err,
+          note_id: orig.note_id,
+        });
       }
     },
   },
