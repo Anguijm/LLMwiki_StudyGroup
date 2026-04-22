@@ -25,6 +25,7 @@
 
 import type { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { supabaseForRequest } from '../../../../lib/supabase';
 import {
   makeMagicLinkLimiter,
@@ -160,6 +161,53 @@ export async function POST(req: NextRequest) {
     email,
     options: { emailRedirectTo: `${redirectBase}/auth/callback` },
   });
+
+  // Cookie-write transaction precedence. If the @supabase/ssr setAll
+  // adapter halted mid-stream (e.g. the PKCE code-verifier cookie chunks
+  // were only partially written), the user would later click the magic
+  // link and /auth/callback would fail with "no valid flow state" —
+  // the exact silent-failure class PR #28 closed for /auth/callback
+  // itself. We mirror the callback's precedence rule: cookie_failure
+  // wins over a signInWithOtp error when both fire (cookie halt is the
+  // proximate, actionable cause).
+  //
+  // Issue #31; landed in PR #29 after council r1-r2 insisted on closing
+  // this symmetric gap.
+  const cookieFailure = supabase.getCookieWriteFailure();
+  if (cookieFailure) {
+    // Structured monitor alert — matches the rate-limit fail-open contract
+    // from PR #28. Keys `alert`, `tier`, `errorName` are a stable grep
+    // surface for any future log-drain rule (see README ## Monitoring).
+    // Do NOT rename without a coordinated monitoring-config change.
+    console.error('[magic-link] cookie-write halt — rolling back', {
+      alert: true,
+      tier: 'auth_magic_link_cookie_write',
+      errorName: cookieFailure.errorName,
+    });
+    try {
+      const store = await cookies();
+      for (const name of supabase.getWrittenCookieNames()) {
+        store.delete(name);
+      }
+    } catch (rbErr) {
+      console.error('[magic-link] cookie rollback failed', {
+        alert: true,
+        tier: 'auth_magic_link_cookie_rollback',
+        errorName: rbErr instanceof Error ? rbErr.name : typeof rbErr,
+      });
+      // fall through to 500 below — user-visible result is the same.
+    }
+    // Non-localized error key (council r3 a11y non-negotiable). Client
+    // maps this to localized copy; raw English strings are never returned
+    // from auth surfaces. Stable allowlist value — additions require a
+    // client-side copy update in /auth/page.tsx's CALLBACK_ERROR_MESSAGES
+    // equivalent for API-route errors.
+    return NextResponse.json(
+      { error_key: 'COOKIE_WRITE_FAILURE' },
+      { status: 500 },
+    );
+  }
+
   if (error) {
     // Log the original error context server-side for debugging Supabase
     // credential / connectivity issues. The client sees generic copy
