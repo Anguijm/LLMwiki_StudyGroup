@@ -366,8 +366,15 @@ describe('GET /auth/callback — Supabase error branches', () => {
     assertNoTokenLeaks(errorSpy, VALID_CODE);
   });
 
-  it('maps a 200 OK with data.session: null to ?error=server_error', async () => {
-    // Council bugs r1: an unexpected but not-erroring response shape.
+  it('maps a 200 OK with data.session: null to ?error=token_used (Channel B reclassification, issue #30)', async () => {
+    // PR #28 shipped this branch as `server_error`. PR #35 / issue #30
+    // reclassifies it to `token_used`: in practice the only caller that
+    // produces `{ data: { session: null }, error: null }` is a stale
+    // PKCE code that resolved to no flow_state row (the exact B.2 smoke
+    // test path from PR #27 evidence). The documented trade-off is that
+    // a genuine transient Supabase null-session response is mis-labeled
+    // as token_used — acceptable because the recovery action ("request
+    // a new link") is identical in both cases.
     exchangeCodeForSession.mockResolvedValueOnce({
       data: { session: null },
       error: null,
@@ -375,8 +382,9 @@ describe('GET /auth/callback — Supabase error branches', () => {
     const { GET } = await import('../../app/auth/callback/route');
     const res = await GET(makeReq(`?code=${VALID_CODE}`));
     expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
-      'server_error',
+      'token_used',
     );
+    assertNoTokenLeaks(errorSpy, VALID_CODE);
   });
 
   it('maps a thrown generic Error to ?error=server_error (never 500)', async () => {
@@ -693,5 +701,198 @@ describe('GET /auth/callback — double-click / prefetch (council r1 security mu
     );
     expect(exchangeCodeForSession).toHaveBeenCalledTimes(2);
     assertNoTokenLeaks(errorSpy, VALID_CODE);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #30 / PR #35: Channel A — Supabase redirect-error query params.
+//
+// When Supabase's /auth/v1/verify rejects (e.g. consumed OTP), it can redirect
+// back to our callback with ?error=access_denied&error_code=otp_expired
+// &error_description=... and no `code` param. Our handler must classify the
+// error from those params BEFORE attempting validateCode (which would
+// short-circuit to invalid_request on missing code). The raw error-param
+// value is never interpolated into response copy — classified into the
+// allowlist ErrorKind union only.
+// ---------------------------------------------------------------------------
+describe('GET /auth/callback — redirect error-param classification (issue #30)', () => {
+  it('?error=access_denied&error_description=Email link is invalid or has expired → token_used', async () => {
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(
+      makeReq(
+        '?error=access_denied&error_description=' +
+          encodeURIComponent('Email link is invalid or has expired'),
+      ),
+    );
+    expect(res.status).toBe(307);
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_used',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+    assertNoTokenLeaks(errorSpy, '');
+  });
+
+  it('?error=access_denied&error_code=otp_expired → token_expired (code-field priority)', async () => {
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq('?error=access_denied&error_code=otp_expired'));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_expired',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('?error=access_denied&error_code=flow_state_expired → token_expired', async () => {
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq('?error=access_denied&error_code=flow_state_expired'));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_expired',
+    );
+  });
+
+  it('?error=server_error&error_description=database unavailable → server_error (generic fallback)', async () => {
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(
+      makeReq('?error=server_error&error_description=' + encodeURIComponent('database unavailable')),
+    );
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'server_error',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('?error=unknown_code&error_description=garbage → server_error (allowlist fallback)', async () => {
+    // Defense in depth: the raw `error` param value must NEVER be used as
+    // the output ErrorKind. Unknown values fall through to server_error.
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(
+      makeReq('?error=unknown_code&error_description=' + encodeURIComponent('garbage')),
+    );
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'server_error',
+    );
+  });
+
+  it('empty ?error= value falls through to normal code validation', async () => {
+    // An empty error param should not trigger the redirect-error path.
+    // Without a code either, falls through to invalid_request.
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq('?error='));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'invalid_request',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('?error=... present with a code → redirect-error path wins, exchange NOT called', async () => {
+    // If Supabase ever sends both (it usually doesn't), prefer the error
+    // classification — the error indicates the code is already rejected
+    // upstream, so there's no point spending a round trip.
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(
+      makeReq(
+        `?code=${VALID_CODE}&error=access_denied&error_code=otp_expired`,
+      ),
+    );
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_expired',
+    );
+    expect(exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('redirect-error classification never logs the raw error params (token-leak guard)', async () => {
+    const sensitive = 'a_pkce_code_like_value';
+    const { GET } = await import('../../app/auth/callback/route');
+    await GET(
+      makeReq(
+        `?error=access_denied&error_description=` +
+          encodeURIComponent(`stale ${sensitive} thing`),
+      ),
+    );
+    // The raw description string (which happens to contain the probe)
+    // must not appear in any console.error call argument.
+    for (const call of errorSpy.mock.calls) {
+      for (const arg of call) {
+        const repr = typeof arg === 'string' ? arg : JSON.stringify(arg);
+        expect(repr).not.toContain(sensitive);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #30 / PR #35: Channel B — mapSupabaseError regex extensions.
+//
+// The current regex catches /already used/, /consumed/, /used_otp/,
+// /invalid_grant/, /expired/, /otp_expired/. Real Supabase error messages
+// seen in the wild extend this vocabulary. These tests pin the extended
+// coverage.
+// ---------------------------------------------------------------------------
+describe('GET /auth/callback — mapSupabaseError extended coverage (issue #30)', () => {
+  it('"Email link is invalid or has expired" message → token_used', async () => {
+    // The exact wording Supabase's /verify returns on consumed OTP.
+    // Contains "expired" so the old regex would have matched that to
+    // token_expired, which is *also* fine UX-wise. Extended regex
+    // prefers token_used because the dominant cause is re-click on a
+    // consumed link, not TTL expiry.
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { message: 'Email link is invalid or has expired', status: 403 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_used',
+    );
+  });
+
+  it('"no valid flow state found" message → token_used', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { message: 'no valid flow state found', status: 404 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_used',
+    );
+  });
+
+  it('error object with code: "otp_expired" → token_expired (code-field priority over message)', async () => {
+    // Supabase v2+ exposes a stable `code` field. When present, it's the
+    // authoritative classifier; prefer it over substring matching on
+    // message (which is locale/version-sensitive).
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { code: 'otp_expired', message: '(opaque upstream copy)', status: 400 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_expired',
+    );
+  });
+
+  it('error object with code: "invalid_grant" → token_used', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { code: 'invalid_grant', message: 'whatever', status: 400 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_used',
+    );
+  });
+
+  it('error object with code: "flow_state_expired" → token_expired', async () => {
+    exchangeCodeForSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { code: 'flow_state_expired', message: 'expired', status: 400 },
+    });
+    const { GET } = await import('../../app/auth/callback/route');
+    const res = await GET(makeReq(`?code=${VALID_CODE}`));
+    expect(new URL(res.headers.get('location') ?? '').searchParams.get('error')).toBe(
+      'token_expired',
+    );
   });
 });
