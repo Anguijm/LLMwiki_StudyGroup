@@ -1,175 +1,192 @@
-# Plan: fix magic-link email template (PKCE `ConfirmationURL`, not `TokenHash`)
+# Plan: stale-link classification fix — mapSupabaseError regex + redirect-error channel (issue #30)
 
 **Status:** draft, awaiting council + human approval.
-**Branch:** `claude/plan-session-agenda-DWzNf`.
-**Scope:** auth surface + institutional-knowledge correction — non-negotiable council run required.
-**P0:** without this, no user can complete sign-in on production. PR #22 shipped a half-fix; the template side was wrong.
+**Branch:** `claude/issue-30-stale-link-classification`.
+**Scope:** auth surface — non-negotiable council run required. No `[skip council]`.
+**Priority:** P1 follow-up from PR #27's B.2 smoke test. Non-blocking for any other work but user-visible every time a stale magic link gets re-clicked.
 
 ## Problem
 
-Human smoke test on production (2026-04-21, Android Chrome + Gmail, same-device same-browser) bounces back to `/auth` with the generic "Could not sign you in right now" copy. Two consecutive attempts, both failed identically.
+PR #27 smoke test B.2 (2026-04-22 04:37 UTC) demonstrated: clicking a consumed magic link produces `/auth?error=server_error` with the copy *"Could not sign you in right now. Please try again."* That copy is literally wrong — the PKCE code was consumed, so "try again" (re-click) produces the exact same failure. The correct recovery action is request a NEW link.
 
-Evidence trail:
+Evidence in `.harness/evidence/pr-27/07-smoke-b2-auth-page-error-copy.jpg` and `08-smoke-b2-supabase-auth-logs.jpg`. Supabase Auth log shows `/verify | 403: Email link is ...` at 04:37:55 UTC — the 403 happened upstream of our callback. Our callback received whatever Supabase redirected to and classified the result as `server_error` through one of three possible paths below.
 
-1. Vercel runtime log, `requestPath=/auth/callback`, level=error: `[auth/callback] sign-in failed { kind: 'server_error' }`. No preceding `[auth/callback] unexpected exchange failure` line → the try-block did not throw; `exchangeCodeForSession` returned a `{ error }` shape that fell through `mapSupabaseError`.
-2. Supabase Dashboard Logs → Auth, same attempt: `/token | 404: invalid flow state, no valid flow state found`. This is the upstream error `mapSupabaseError` couldn't classify.
-3. Both attempts produced `server_error`, not `token_used`. If Gmail prefetch had consumed the code the second click would have matched `invalid_grant` → `token_used`. It didn't. The failure is structural, not code-reuse.
+## Root cause (three possible channels; all three should be handled)
 
-## Root cause
+The Supabase `/verify` 403 can land in our callback via at least three routes, and without reproducing the exact request in staging it's unclear which one fired:
 
-PR #22 set both email templates (Confirm signup, Magic Link) to
+### Channel A — error query param, no `code`
+Supabase redirects to `/auth/callback?error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid+or+has+expired`. Our current handler calls `validateCode(null)` → returns `invalid_request` → user sees *"Sign-in link was invalid. Request a new one."*
 
+**Symptom check:** copy would be `invalid_request`, not `server_error`. Not a match for B.2 unless validation logic had a bug we haven't identified.
+
+### Channel B — stale `code` param, exchange throws
+Supabase redirects with a code that doesn't resolve to a flow_state. `exchangeCodeForSession` throws an error whose message includes "Email link is invalid or has expired" or similar. Our `mapSupabaseError` regex (`/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/` → `token_used`, `/expired|otp_expired/` → `token_expired`) should match "expired" and return `token_expired`. **But observed copy was `server_error`, so this path isn't the one either** — OR the error message came through in a different shape (e.g., wrapped in a generic `Error`) that bypassed the regex.
+
+### Channel B' — stale `code` param, exchange returns `{ data: { session: null }, error: null }`
+The most likely actual path. The stale code passes Supabase's server-side checks but resolves to no flow_state row. Supabase returns 200 OK with `data.session = null` and `error = null` — no error object for the regex to match. Our `!data?.session` branch at `apps/web/app/auth/callback/route.ts:203-206` unconditionally maps this to `server_error`. **Matches the observed copy.**
+
+## Fix (belt and suspenders; all three channels handled)
+
+### A. Handle Channel A — redirect error-param classification
+
+Before `validateCode`, check if the URL has an `error` query param. Extract `error`, `error_code`, and `error_description`; classify via a new `mapRedirectError` function that applies the same string-matching rules `mapSupabaseError` uses but on `error_description` instead of an `Error.message`. Fall back to `server_error` if nothing matches. No new ErrorKind values.
+
+```ts
+function mapRedirectError(params: URLSearchParams): ErrorKind | null {
+  const err = params.get('error');
+  if (!err) return null;
+  const code = params.get('error_code') ?? '';
+  const desc = (params.get('error_description') ?? '').toLowerCase();
+  // otp_expired / flow_state_expired / magic_link_expired
+  if (/otp_expired|flow_state_expired|magic.link.expired/.test(code)) return 'token_expired';
+  if (/expired|link.*expired/.test(desc)) return 'token_expired';
+  // access_denied (generic) with "already used" / "consumed" / "invalid"
+  if (/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/.test(desc)) return 'token_used';
+  if (/email.*link.*invalid/.test(desc)) return 'token_used';
+  return 'server_error';
+}
 ```
-{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}
+
+Call site: immediately after `validateCode`, in the callback handler. If `mapRedirectError` returns non-null, skip the `exchangeCodeForSession` call and go straight to the error redirect.
+
+### B. Extend Channel B — regex for additional wordings
+
+Broaden `mapSupabaseError` to cover Supabase PKCE error message variations observed in the wild:
+
+```ts
+function mapSupabaseError(err: { message?: string; status?: number; code?: string } | null): ErrorKind {
+  if (!err) return 'server_error';
+  if (typeof err.status === 'number' && err.status >= 500) return 'server_error';
+  const msg = (err.message ?? '').toLowerCase();
+  const code = (err.code ?? '').toLowerCase(); // NEW: some Supabase versions expose a stable `code` field
+  // Token-used class
+  if (/otp_used|used_otp|invalid_grant/.test(code)) return 'token_used';
+  if (/\balready\b.*\bused\b|consumed|used_otp|invalid_grant/.test(msg)) return 'token_used';
+  if (/email.*link.*invalid|no.*valid.*flow.*state/.test(msg)) return 'token_used';
+  // Token-expired class
+  if (/otp_expired|flow_state_expired/.test(code)) return 'token_expired';
+  if (/\bexpired\b|otp_expired/.test(msg)) return 'token_expired';
+  return 'server_error';
+}
 ```
 
-and documented this pattern as correct for PKCE in `.harness/learnings.md` 2026-04-20 18:20 UTC INSIGHT block and `README.md` §B.6.
+Key additions:
+- `err.code` lookup (when Supabase exposes a stable error code, prefer it over substring matching).
+- `email.*link.*invalid` pattern for the "Email link is invalid or has expired" case — specifically whichever substring the `/token` endpoint returns.
+- `no.*valid.*flow.*state` pattern — the exact string observed in PR #27's smoke test diagnosis when a stale code was passed to `exchangeCodeForSession`.
 
-**That template is the primitive for `supabase.auth.verifyOtp({ token_hash, type })`.** It is NOT the primitive for `supabase.auth.exchangeCodeForSession(code)`, which is what our callback at `apps/web/app/auth/callback/route.ts:159` calls.
+### C. Handle Channel B' — null-session as probable stale link
 
-Concretely:
+Change the `!data?.session` branch from unconditional `server_error` to a best-effort `token_used` classification, scoped narrowly:
 
-- `{{ .TokenHash }}` is a hash of the OTP. No `auth.flow_state` row is keyed by it.
-- `exchangeCodeForSession(code)` looks up a PKCE `flow_state` by the `code` argument. Receiving a `token_hash` instead of a PKCE `code` produces the exact "no valid flow state found" 404 we observed.
+```ts
+} else if (!data?.session) {
+  // Supabase returned 200 OK with no session and no error object. In
+  // practice the dominant cause is a stale PKCE code that resolved to
+  // no flow_state row (exact B.2 smoke test path). Classify as
+  // token_used so the user gets actionable copy ("Request a new one.")
+  // rather than misleading retry copy ("Please try again.").
+  //
+  // Trade-off (documented + expected council review point): the rare
+  // case of a genuine null-session response from Supabase (e.g., a
+  // Supabase bug, a transient issue) would be mis-labeled as
+  // token_used. Acceptable because the recovery action is identical —
+  // request a new link — and the copy "This sign-in link has already
+  // been used" is an honest approximation of "this sign-in link won't
+  // work; get a new one." If the alternative copy is ever deemed
+  // important enough, add a dedicated `stale_link` ErrorKind (not in
+  // this PR).
+  failureKind = 'token_used';
+}
+```
 
-The PR #22 plan → council → merge loop never caught this because nobody clicked a live magic link end-to-end before merge. Dashboard screenshots were attached but no human sign-in smoke test preceded approval. The reflection review (PR #25 r1) caught two other mis-generalizations but did not verify the template claim against Supabase's PKCE docs.
+Documented trade-off. Council will weigh it.
 
-## Fix (Supabase Dashboard + docs + learnings correction — zero Next.js code change)
+### D. Tests (TDD order — failing tests before impl)
 
-The callback already does the right thing; the email link just needs to point at the right primitive. Supabase's default `{{ .ConfirmationURL }}` renders to `https://<project>.supabase.co/auth/v1/verify?token=<hash>&type=<type>&redirect_to=<our_callback>`. Supabase verifies the OTP, creates the PKCE `flow_state`, and redirects to `/auth/callback?code=<real_pkce_code>`. Our existing `exchangeCodeForSession(code)` then exchanges a real PKCE code against a real flow state — which is what the code was written for.
+New / extended rows in `apps/web/tests/unit/auth-callback-route.test.ts`:
 
-### A. Supabase Dashboard (manual, pre-merge)
+Channel A (redirect error-param):
+- `?error=access_denied&error_description=Email+link+is+invalid+or+has+expired` → 307 `/auth?error=token_used`, stub NOT called.
+- `?error=access_denied&error_code=otp_expired` → 307 `/auth?error=token_expired`, stub NOT called.
+- `?error=server_error&error_description=database+unavailable` → 307 `/auth?error=server_error`.
+- `?error=<empty>` → falls through to normal code validation (current behavior).
+- `?error=some_unknown_code&error_description=garbage` → `server_error` fallback.
 
-1. **Auth → Email Templates → Magic Link:** replace the custom `{{ .SiteURL }}/auth/callback?code={{ .TokenHash }}` body link with Supabase's default that uses `{{ .ConfirmationURL }}`. Standard snippet:
-   ```html
-   <a href="{{ .ConfirmationURL }}">Log In</a>
-   ```
-2. **Auth → Email Templates → Confirm signup:** same change. Both templates are independent; both must be edited.
-3. **Auth → URL Configuration → Redirect URLs allowlist:** confirm `https://llmwiki-study-group.vercel.app/auth/callback` + the preview wildcard are still present. `{{ .ConfirmationURL }}` uses `emailRedirectTo` as its `redirect_to`; an allowlist miss would 400 the verify step. No change expected, just verification.
-4. Screenshot each of the three panes; attach to the PR body as pre-merge evidence. Keep the naming scheme PR #22 established.
+Channel B (regex extension):
+- `exchangeCodeForSession` rejects with message containing "Email link is invalid or has expired" → `token_used`.
+- `exchangeCodeForSession` rejects with message containing "no valid flow state found" → `token_used`.
+- `exchangeCodeForSession` returns error with `code: 'otp_expired'` → `token_expired`.
+- `exchangeCodeForSession` returns error with `code: 'invalid_grant'` → `token_used`.
 
-### B. Human smoke test post-dashboard-change, pre-merge
+Channel B' (null-session reclassification):
+- `exchangeCodeForSession` returns `{ data: { session: null }, error: null }` → `token_used` (**behavior change**; previously `server_error`).
+- Regression: existing "maps a 200 OK with data.session: null to ?error=server_error" test must be UPDATED to `token_used` expectation — explicit test-matrix change documented in the commit.
 
-The human performs real end-to-end sign-in scenarios on production. **This is a merge gate, not a post-merge check.** The class of bug this plan exists to fix is specifically the kind that unit tests and dashboard screenshots cannot catch.
+All existing token-leakage guard rows continue to hold. The new redirect-error path must also be spy-checked.
 
-Three scenarios, all required for merge (council bugs r1):
+### E. Optional diagnostic improvement (NOT in this PR)
 
-**B.1 — Happy path, same device, same browser.** Submit the magic-link form and click the link from the same device/browser. Pass criteria:
-
-- `/auth/callback` returns 307 to `/` (not to `/auth?error=...`).
-- Landing on `/` shows the authenticated surface (not a middleware bounce back to `/auth`).
-- Supabase Dashboard → Logs → Auth shows `/token | request completed` with no 404 immediately after.
-
-**B.2 — Stale link.** Submit the magic-link form twice in quick succession (same email). Click the FIRST link. Pass criteria:
-
-- `/auth/callback` returns 307 to `/auth?error=token_used` (or, if Supabase invalidates by time rather than use, `?error=token_expired`).
-- `/auth` renders the allowlisted copy for that kind — "This sign-in link has already been used. Request a new one." or "This sign-in link has expired. Request a new one." — never the raw query param.
-- Supabase Dashboard → Logs → Auth shows the invalidation with an error message that `mapSupabaseError` recognizes (matches `/already.*used|consumed|used_otp|invalid_grant|expired/`).
-
-**B.3 — Cross-device click (known-limitation test, not a pass/fail gate).** Submit the form on device A; click the link on device B with a different browser profile. **Expected outcome: `/auth?error=server_error`**, because PKCE with `@supabase/ssr` stores the code verifier as an `HttpOnly` cookie on device A; device B has no verifier, so `exchangeCodeForSession` fails with "no valid flow state found" — the same upstream error we're fixing for same-device today, just for a structural reason specific to cross-device.
-
-This row is a **document-and-accept** test, not a revert trigger. Record the observed behavior in the PR body so the limitation is explicit. If cross-device sign-in is later deemed required, that's a separate plan (see Out-of-scope §Cross-device sign-in UX below).
-
-**Council bugs r1 rebuttal (cross-device):** the bugs persona's r1 edge-case note expected cross-device to succeed and framed failure as "surprising device-binding." It is not surprising given our architecture — PKCE with cookie-stored verifier is device-bound by design, independently of Fix A. Fix A corrects the template-primitive mismatch; it does not change the verifier storage model. If council r2 persists on cross-device success being a requirement, the correct response is to escalate to a Fix B plan (switch callback to `verifyOtp({ token_hash, type })`, which does not require a device-local verifier) — not to claim Fix A will satisfy it.
-
-If B.1 fails, revert the template changes and re-open the plan. If B.2 fails, the template fix is still valid but the error-kind regex at `callback/route.ts:101-105` needs extending — file a follow-up issue rather than blocking this PR. If B.3 fails in the unexpected direction (cross-device actually succeeds), that's information worth recording but does not block merge.
-
-### C. Runbook correction — `README.md` §B.6
-
-Rewrite the template instructions. Replace the `?code={{ .TokenHash }}` recipe with:
-
-- Default template (`{{ .ConfirmationURL }}`) + `exchangeCodeForSession(code)` in the callback. ← What we do.
-- Alternative (documented, not recommended for this repo): custom `?token_hash=&type=` template + `verifyOtp({ token_hash, type })`. Call out explicitly that the template choice binds the callback primitive — one implies the other, picking the wrong pair is the bug that landed this plan.
-
-Link to Supabase's PKCE flow docs inline so a future operator can verify directly against upstream rather than trusting this file.
-
-### D. Learnings correction — `.harness/learnings.md`
-
-Append a new reflection entry dated today (2026-04-21) with KEEP / IMPROVE / INSIGHT / COUNCIL blocks covering:
-
-- **KEEP:** human smoke test as a merge gate for auth changes. Supabase Dashboard Logs → Auth as a first-look diagnostic path. Plan-first protocol enabling this corrective PR to land through council rather than as a hot-fix.
-- **IMPROVE:** PR #22 merged an auth fix without a live end-to-end sign-in. Dashboard screenshots are not a substitute for a single real click-through. Future auth-surface PRs include a human smoke test row in the test matrix and do not merge until it's checked.
-- **INSIGHT:** the Supabase PKCE email-template choice binds the callback primitive. `{{ .ConfirmationURL }}` ↔ `exchangeCodeForSession(code)`. `?token_hash=&type=` ↔ `verifyOtp({ token_hash, type })`. Mixing pairs produces "no valid flow state found" at the `/token` endpoint with no client-visible diagnostic. Explicitly annotate the prior PR #22 INSIGHT block as superseded — do not silently edit the old entry; leave it visible so the correction trail survives.
-- **COUNCIL:** this plan's rounds.
-
-Also add a ground-truth-drift note: the PR #25 reflection review narrowed two insights against live code, but did not verify the template claim against Supabase docs. Knowledge-content review catches logic mis-generalizations; it doesn't catch upstream-fact errors unless the reviewer is asked to verify against upstream. Future persona reviews on auth content should explicitly instruct a docs cross-check.
-
-### E. Mark prior PR #22 INSIGHT as superseded
-
-In-place note on the 2026-04-20 18:20 UTC INSIGHT bullet about PKCE email templates. One line:
-
-> **SUPERSEDED 2026-04-21:** the `?code={{ .TokenHash }}` template is for `verifyOtp`, not `exchangeCodeForSession`. See 2026-04-21 entry for the correction. Template was the root cause of the observed sign-in failure.
-
-Don't delete the original text. Leaving the wrong claim visible with a correction pointer is how future agents learn the lesson rather than re-discovering it.
-
-### F. Code-to-config anchor on the callback route
-
-Add a top-of-file comment block to `apps/web/app/auth/callback/route.ts` that explicitly names the email-template dependency and points at `README.md` §B.6. Suggested wording (final text at execution time):
-
-> This route assumes the Supabase "Magic Link" and "Confirm signup" email templates use the default `{{ .ConfirmationURL }}` body link. If either template is changed to the `?token_hash=&type=` form, `exchangeCodeForSession` below will fail with "no valid flow state found" and every sign-in will return `?error=server_error`. See `README.md` §B.6 for the template-vs-callback-primitive binding.
-
-Rationale: the code and the dashboard config are tightly coupled; without an in-repo anchor a future maintainer changing the template can't know they're also changing the callback behavior. Council security r1 nice-to-have, elevated to execution step because the PR #22 → PR #27 chain is itself the proof that the coupling matters. One comment, zero runtime change.
-
-## Out of scope for this PR
-
-- **Playwright end-to-end smoke test (issue #20).** The ideal regression guard for this class of bug is a headless run that clicks a real link, but Playwright setup is non-trivial (Supabase test-user provisioning, email-capture fixture, CI secrets). Stays as issue #20; add a reference to this plan in that issue so the motivation survives.
-- **Cross-device sign-in UX.** PKCE with `@supabase/ssr`'s cookie-stored verifier is device-bound by design: the user must click the magic link on the same device/browser that submitted the form. The B.3 smoke test row documents this explicitly. If cross-device sign-in becomes a product requirement, the options are (a) switch the callback to `verifyOtp({ token_hash, type })` with a custom `?token_hash=&type=` template (Fix B in this session's diagnosis — moves to a non-device-bound flow), (b) add a 6-digit OTP code path as an alternative sign-in method, or (c) migrate to a shared server-side verifier store keyed by email. Each is its own plan + council round. File as a new issue if prioritized; not in flight today.
-- **`mapSupabaseError` regex extension** to classify "no valid flow state" as its own kind. Once the template is correct, this path is unreachable for a properly-configured project. If it fires again in prod it's a genuine server_error and the generic copy is correct.
-- **Supabase-hosted `/auth/v1/verify` failure surfaces.** Council bugs r1 noted: if the allowlist is misconfigured or Supabase's verify endpoint 500s, the user lands on a Supabase-branded error page before ever reaching our app, and we have no hook to observe it. Not mitigable in our code without moving the OTP-verification step in-app (that's Fix B). Monitoring via Supabase Auth logs is the existing mitigation; no new instrumentation in this PR.
-- **Issue #26** (transactional setAll + fail-open alerting) remains queued; separate surface, separate PR.
-- **Terraform / Management API for dashboard state.** Council carry-out from PR #22. Would have prevented this regression but is a v1 workstream.
-- Any v1 feature work.
+The IMPROVE line from PR #27's reflection noted: log a sanitized `error.name` + `error.status` + first 80 chars of message when the classification lands on `server_error`, so future incidents surface the actual upstream copy without a Supabase-dashboard round trip. **Deferred to a follow-up diagnostic ticket** to keep this PR focused on UX correction. File after merge.
 
 ## Test matrix
 
-This plan is primarily a configuration + docs change. No new automated tests are added because the callback/route integration tests from PR #22 already cover the code path; the bug is upstream of the code. The smoke test in §B is the acceptance test.
+| Channel | Input | Expected | Notes |
+|---|---|---|---|
+| A | `?error=access_denied&error_description=Email link is invalid or has expired` | 307 `?error=token_used` | stub NOT called |
+| A | `?error=access_denied&error_code=otp_expired` | 307 `?error=token_expired` | stub NOT called |
+| A | `?error=server_error&error_description=database+unavailable` | 307 `?error=server_error` | stub NOT called |
+| A | `?error=` (empty string) | falls through | existing validation applies |
+| A | `?error=unknown_code&error_description=garbage` | 307 `?error=server_error` | stub NOT called |
+| B | exchange rejects with msg containing "Email link is invalid or has expired" | 307 `?error=token_used` | |
+| B | exchange rejects with msg containing "no valid flow state found" | 307 `?error=token_used` | |
+| B | exchange returns error `{ code: 'otp_expired' }` | 307 `?error=token_expired` | new `code` field lookup |
+| B | exchange returns error `{ code: 'invalid_grant' }` | 307 `?error=token_used` | |
+| B' | exchange returns `{ data: { session: null }, error: null }` | 307 `?error=token_used` | **behavior change from server_error** |
+| — | all failure branches | `console.error` spy sees no `code` / `access_token` / `refresh_token` substring | |
 
-| Step | Expected |
-|---|---|
-| Magic Link template rendered with a test send | Link URL starts with `https://<project>.supabase.co/auth/v1/verify?token=...&type=magiclink&redirect_to=...`, NOT `https://llmwiki-study-group.vercel.app/auth/callback?code=...` |
-| Confirm signup template rendered with a test send | Same shape as above, `type=signup` |
-| Click the Magic Link from a real inbox on the same device/browser as the form submission | 307 to `/auth/callback`, callback returns 307 to `/`, landing page shows authenticated surface |
-| Supabase Dashboard Logs → Auth during the click | `/token \| request completed`, no 404 |
-| Vercel runtime log during the click | No `[auth/callback] sign-in failed` line |
-| Redirect URLs allowlist unchanged | Entry `https://llmwiki-study-group.vercel.app/auth/callback` present; preview wildcard present |
+## Non-negotiables (inherited + new)
+
+Inherited from PR #22 / #28 / #29:
+- **No logging** of `code`, `access_token`, or `refresh_token` under any branch. Test suite spy enforces.
+- **`/auth` allowlist rendering** (unchanged) — raw `?error=<value>` never interpolated; unknown values fall through to the generic message.
+- **Hardcoded success redirect** to `/` (unchanged).
+- **RLS unchanged.** Anon key only.
+- **Council required.** No `[skip council]`.
+
+New in this plan:
+- **`!data?.session` reclassification to `token_used`** is a behavior change — explicitly documented trade-off. Council will review.
+- **Query-param error handling** happens BEFORE `validateCode` so a URL with both `?error=...` and `?code=...` prefers the error path (indicates Supabase already rejected; no point calling `exchangeCodeForSession`).
 
 ## Rollback
 
-Revert the template changes in the Supabase Dashboard (restore `?code={{ .TokenHash }}` form). User returns to the observed broken state. Revert the README and learnings commits via `git revert`. No schema, RLS, code, or dependency changes to undo.
+Revert the PR. Behavior returns to current state: stale link → `server_error` copy. No schema / RLS / dependency change.
 
-## Non-negotiables (inherited + this plan)
+## Out of scope
 
-Inherited:
-
-- **RLS unchanged.** Anon key only; no service-role exposure.
-- **No logging** of `code` or session tokens in any branch. The callback at `apps/web/app/auth/callback/route.ts:175-180` already redacts.
-- **Redirect URLs allowlist** unchanged; APP_BASE_URL-only server policy from PR #17 stands.
-- **Error surfacing** on `/auth` — no silent redirect. Unchanged; we're not touching the error rendering surface.
-- **Council required.** No `[skip council]` under any framing. The CLAUDE.md institutional-knowledge clause means `learnings.md` and `README.md` edits route through council even when there is no code diff.
-
-Added by this plan:
-
-- **[product]** Human smoke test is a merge gate for this PR. No merge without the §B pass criteria in the PR body.
-- **[product]** Dashboard screenshots attached pre-merge (both templates + URL configuration).
-- **[institutional knowledge]** Prior PR #22 INSIGHT block annotated as superseded, not deleted. Correction trail survives.
-- **[institutional knowledge]** New reflection entry records the `{{ .ConfirmationURL }}` ↔ `exchangeCodeForSession` / `?token_hash` ↔ `verifyOtp` binding so future sessions can't mix the pairs.
+- Adding a dedicated `stale_link` ErrorKind with copy like *"This sign-in link is no longer valid. Request a new one."* — considered and rejected for this PR. The existing `token_used` copy is an acceptable approximation; adding a kind increases the `/auth` page allowlist surface and the `CALLBACK_ERROR_MESSAGES` map for marginal copy improvement.
+- Logging sanitized upstream error details on `server_error` fallthrough (diagnostic improvement from PR #27 reflection IMPROVE). Deferred — file as follow-up issue after this PR merges.
+- Issue #32 (Set-Cookie rollback header assertion) — separate test-harness upgrade, independent of this fix.
+- i18n of the existing allowlist copy. Explicitly deferred across all auth PRs.
+- Migrating to `verifyOtp` primitive (Fix B architectural change) — would eliminate the `/verify` error-redirect channel entirely but is a full re-architecture, not scope.
 
 ## Success + kill criteria
 
-- **Success metric:** first human sign-in on production completes 302 → `/` with a valid session. Follow-on: the 24h callback-error rate from the shipped logging drops to the Vercel-noise floor (< 1% of attempts).
-- **Failure metric:** same log-derived callback-error rate. If > 5% 24h post-merge, revert the template changes and re-open this plan.
-- **Cost:** $0 marginal. Supabase Auth is MAU-billed; this plan does not change volume.
+- **Success metric:** after merge + smoke-retest, clicking a consumed magic link produces `/auth?error=token_used` with copy *"This sign-in link has already been used. Request a new one."* OR `?error=token_expired` with equivalent copy — NEVER `server_error`.
+- **Failure metric:** count of fresh-link sign-ins (first click) that redirect to `/auth?error=token_used` instead of `/` — should stay at zero. Classification false-positives would indicate the null-session reclassification is too aggressive.
+- **Kill criteria:** revert if fresh-link sign-in success rate drops by >0.1% in the 48h post-merge window. Monitor via Vercel log count of `[auth/callback] sign-in failed { kind: 'token_used' }` against total `/auth/callback` hits.
+- **Cost:** $0 marginal. No new API calls.
 
 ## Council history
 
-- **r1** (PR #27 @ commit `af9c3ba`, 2026-04-20T20:27:50Z) — PROCEED, a11y 9 / arch 10 / bugs 9 / cost 10 / product 10 / security 9. Folded: expanded smoke test matrix (B.1 same-device happy path, B.2 stale-link error copy, B.3 cross-device document-and-accept), §F code-to-config anchor comment on the callback route, new out-of-scope lines for cross-device UX and Supabase `/verify` failure surfaces. Rebutted in plan: bugs persona's r1 cross-device expectation — PKCE with cookie-stored verifier is device-bound by design; Fix A does not change that. Escalation path documented (Fix B / OTP codes) if cross-device becomes required.
-- Awaiting r2.
+(empty — awaiting r1)
 
 ## Approval checklist (CLAUDE.md gate)
 
-Before any implementation work (dashboard edits count as implementation), all three must be true:
+Before writing implementation code, all three must be true:
 
-1. This file is committed on `claude/plan-session-agenda-DWzNf` and pushed to origin.
+1. This file is committed on `claude/issue-30-stale-link-classification` and pushed to origin.
 2. A PR is open against `main`; the latest `<!-- council-report -->` comment from `.github/workflows/council.yml` was posted against a commit SHA ≥ the commit that last modified this plan.
 3. The human has typed an explicit `approved` / `ship it` / `proceed` after seeing (1) and (2).
 
