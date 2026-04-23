@@ -43,6 +43,43 @@ export interface SimplifyBatchInput {
   maxTokensOut?: number;
 }
 
+// -----------------------------------------------------------------------
+// Flashcard generation — see packages/prompts/src/flashcard-gen/v1.md
+// -----------------------------------------------------------------------
+//
+// Cost (callsite documentation, CLAUDE.md non-negotiable):
+//   generateFlashcards — Haiku 4.5, per-call:
+//     ~2k tokens in (note body + prompt), ~800 tokens out (5–10 cards).
+//     Cost: ~$0.005 per call.
+//     Call volume: 1 per successful PDF ingest, 4-user × ~20/mo scale =
+//     ~80 calls/mo (~$0.40/mo).
+
+const FlashcardDraftSchema = z.object({
+  // Length bounds (council r1–r3 PR #37): defense against prompt-injection
+  // blowout + pathological outputs. Questions/answers beyond these bounds
+  // are almost certainly Claude getting confused, not meaningful content.
+  question: z.string().trim().min(1).max(500),
+  answer: z.string().trim().min(1).max(2000),
+});
+
+const MAX_CARDS_PER_RESPONSE = 10;
+
+const FlashcardArraySchema = z.array(FlashcardDraftSchema).max(MAX_CARDS_PER_RESPONSE);
+
+export type FlashcardDraft = z.infer<typeof FlashcardDraftSchema>;
+
+export interface GenerateFlashcardsInput {
+  systemPrompt: string;
+  noteBody: string;
+  /** Max tokens for Claude's response (default 1500 — fits 10 cards at ~150 tokens/card). */
+  maxTokensOut?: number;
+}
+
+export interface GenerateFlashcardsResult {
+  cards: readonly FlashcardDraft[];
+  usage: HaikuUsage;
+}
+
 export interface AnthropicClientDeps {
   apiKey: string;
   timeoutMs?: number;
@@ -88,7 +125,69 @@ export function makeAnthropicClient(deps: AnthropicClientDeps) {
     });
   }
 
-  return { simplifyBatch };
+  async function generateFlashcards(
+    input: GenerateFlashcardsInput,
+  ): Promise<GenerateFlashcardsResult> {
+    return withTimeout('anthropic', timeoutMs, async (signal) => {
+      const raw = await client.messages.create(
+        {
+          model: HAIKU_MODEL,
+          max_tokens: input.maxTokensOut ?? 1500,
+          system: [{ type: 'text', text: input.systemPrompt }],
+          messages: [
+            {
+              role: 'user',
+              // Same <untrusted_content> wrapping pattern as simplifyBatch —
+              // belt-and-suspenders with the prompt's refusal clause.
+              content: `<untrusted_content>\n${input.noteBody}\n</untrusted_content>`,
+            },
+          ],
+        },
+        { signal },
+      );
+
+      const parsedResponse = HaikuResponseSchema.safeParse(raw);
+      if (!parsedResponse.success) {
+        throw new AiResponseShapeError(
+          'anthropic',
+          parsedResponse.error.message,
+          parsedResponse.error,
+        );
+      }
+
+      const text = parsedResponse.data.content.map((b) => b.text).join('\n').trim();
+
+      // Claude is instructed to return bare JSON. Parse + validate shape +
+      // enforce the array-length cap. Any deviation → AiResponseShapeError
+      // so the caller (Inngest step) retries or fails.
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(text);
+      } catch (err) {
+        throw new AiResponseShapeError(
+          'anthropic',
+          'flashcard response is not valid JSON',
+          err,
+        );
+      }
+
+      const cardsResult = FlashcardArraySchema.safeParse(parsedJson);
+      if (!cardsResult.success) {
+        throw new AiResponseShapeError(
+          'anthropic',
+          `flashcard response did not match schema: ${cardsResult.error.message}`,
+          cardsResult.error,
+        );
+      }
+
+      return {
+        cards: cardsResult.data,
+        usage: parsedResponse.data.usage,
+      };
+    });
+  }
+
+  return { simplifyBatch, generateFlashcards };
 }
 
 export type AnthropicClient = ReturnType<typeof makeAnthropicClient>;

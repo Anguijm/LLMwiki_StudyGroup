@@ -7,11 +7,12 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-export type PromptId = 'simplifier/v1' | 'ingest-pdf/v1';
+export type PromptId = 'simplifier/v1' | 'ingest-pdf/v1' | 'flashcard-gen/v1';
 
 const PROMPT_FILES: Record<PromptId, string> = {
   'simplifier/v1': join(here, 'simplifier', 'v1.md'),
   'ingest-pdf/v1': join(here, 'ingest-pdf', 'v1.md'),
+  'flashcard-gen/v1': join(here, 'flashcard-gen', 'v1.md'),
 };
 
 export function loadPrompt(id: PromptId): string {
@@ -23,3 +24,4 @@ export function loadPrompt(id: PromptId): string {
 
 export const SIMPLIFIER_V1 = loadPrompt('simplifier/v1');
 export const INGEST_PDF_V1 = loadPrompt('ingest-pdf/v1');
+export const FLASHCARD_GEN_V1 = loadPrompt('flashcard-gen/v1');
