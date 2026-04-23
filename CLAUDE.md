@@ -96,6 +96,29 @@ The council reads the personas in `.harness/council/` (one per axis, excluding `
 - Per-month: `MONTHLY_CAP` in `.github/workflows/council.yml` (cache-based counter, outside PR blast radius).
 - `[skip council]` in a PR title (case-insensitive) bypasses the PR-triggered run for that push.
 
+## Rebutting council findings (learned 2026-04-23, PR #43)
+
+Raw-critique personas occasionally hallucinate "missing X" claims — six confirmed occurrences across PR #28/#29/#40/#42/#43 against work that was already shipped. The rebuttal protocol:
+
+1. **Grep first.** On any "missing X" claim, grep the diff (or codebase) for X. If X is present, rebut; if absent, fold.
+2. **Cite a test, not just code.** A rebuttal of an automated security or bugs finding MUST cite a specific test file:line that proves the control's effectiveness — not just the implementation file. The cited test must be **consistently passing** (not in a known-flaky suite like `db-tests` per #7, which is `continue-on-error` and would technically satisfy "test exists" without providing real signal) AND must **holistically prove the control is effective under relevant failure conditions**, not just cover a single success path. A test that only verifies the happy case can be cited as evidence of intent but does NOT close a security/bugs rebuttal — the failure-mode coverage is the proof. *Code presence proves intent; happy-path test presence proves the control runs; failure-mode test presence proves the control holds.* If no failure-mode test exists, EITHER write the test as part of the rebuttal OR fold the finding (write the test the council asked for). Citing only the migration / component file gives the next reviewer no proof the control isn't silently broken.
+3. **Keep the rebuttal in-line with the artifact under review.** For reflection PRs, append the rebuttal to the same `.harness/learnings.md` entry. For feature PRs, fold a one-line code comment + a test that documents the rebuttal at the callsite.
+4. **A sustained REVISE on the same finding across rounds is a signal to fold, not to entrench.** PR #29 r1+r2 doubled-down on a procedural objection that was substantively right (issue #31). If the council holds the same finding two rounds in a row, re-examine: is the rebuttal evidence actually compelling, or is the finding pointing at a real gap the rebuttal didn't address?
+
+## Plan-time required content
+
+Every plan in `.harness/active_plan.md` MUST explicitly state the data isolation model for any new (or modified) database table:
+
+- **`per-user`** — RLS policy uses `user_id = auth.uid()`. Rows are private to a single user; cohort members cannot read each other's rows. Examples: `srs_cards`, `review_history`, `note_views`.
+- **`per-cohort`** — RLS policy uses `cohort_id IN (cohort memberships of auth.uid())`. Rows are shared within a cohort; users in different cohorts cannot see each other's rows. Examples: `notes`, `cohorts`.
+- **`shared`** — RLS policy is open to all authenticated users. Reserved for genuinely public content (none yet in this codebase). Requires explicit justification.
+
+These three are **defaults**, not a closed set. A plan MAY propose a hybrid or novel model (e.g., `per-cohort-admin-write, per-cohort-member-read`; `per-cohort-with-public-read`) when the feature genuinely requires it — the rule's intent is that the model is *named and justified*, not that it fits one of three buckets. Any non-default model must be explicitly named and the policy SQL sketched out in the plan so council can verify the impl matches.
+
+Plan must include a one-sentence justification for the chosen model. *Example:* "`srs_cards`: per-user — a study group's flashcards are personal study aids, not cohort-shared content (contrast with `notes` which is per-cohort)."
+
+This rule (added 2026-04-23, PR #43) closes a recurring failure mode: the raw-critique security persona has hallucinated "missing cohort RLS on `srs_cards`" three times because the codebase's top-level security model is "cohort isolation," and the persona's prior assumes every table follows that model. An explicit plan-stated isolation model gives the council the authoritative reference and stops the hallucination chain.
+
 ## Non-negotiables (no council run can override these)
 
 - **RLS on every Supabase table.** No exceptions. Cohort isolation is the security model.
