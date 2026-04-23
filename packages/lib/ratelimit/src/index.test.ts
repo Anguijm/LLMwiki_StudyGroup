@@ -4,10 +4,12 @@ import {
   makeIngestEventLimiter,
   makeMagicLinkLimiter,
   makeAuthCallbackLimiter,
+  makeRatingLimiter,
   RateLimitExceededError,
   RatelimitUnavailableError,
   TOKEN_BUDGET_PER_HOUR,
   AUTH_CALLBACK_PER_IP_PER_MINUTE,
+  RATING_SUBMITS_PER_MINUTE,
 } from './index';
 
 interface PipelineLike {
@@ -262,5 +264,34 @@ describe('auth callback limiter (tier D)', () => {
     const err = new RateLimitExceededError('auth_callback_ip', new Date());
     expect(err.kind).toBe('auth_callback_ip');
     expect(err).toBeInstanceOf(RateLimitExceededError);
+  });
+});
+
+describe('rating limiter (tier E)', () => {
+  it('exports a 30/min constant', () => {
+    expect(RATING_SUBMITS_PER_MINUTE).toBe(30);
+  });
+
+  it('throws RatelimitUnavailable on upstash failure (caller decides fail-open)', async () => {
+    const redis = { eval: async () => { throw new Error('down'); } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeRatingLimiter({ redis: redis as any });
+    await expect(lim.reserve('user-a')).rejects.toBeInstanceOf(
+      RatelimitUnavailableError,
+    );
+  });
+
+  it('makeRatingLimiter returns a limiter with reserve() method', () => {
+    // Smoke test: per-user isolation is a property of @upstash/ratelimit's
+    // SlidingWindow + our `user:${userId}` keying + `rl:rating` prefix.
+    // The keying is identical in shape to Tier A (ingest events) which
+    // is exercised in production. Fully simulating the Upstash protocol
+    // (Lua script, multi-key reads) here would re-test the upstream lib.
+    // Instead: confirm the factory produces a limiter object with the
+    // expected shape; rely on Tier A's parallel test for the eval path.
+    const redis = { eval: async () => [1, Date.now() + 60_000, 30, 29] };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only
+    const lim = makeRatingLimiter({ redis: redis as any });
+    expect(typeof lim.reserve).toBe('function');
   });
 });

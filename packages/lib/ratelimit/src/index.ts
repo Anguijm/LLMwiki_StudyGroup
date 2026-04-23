@@ -22,7 +22,8 @@ export class RateLimitExceededError extends Error {
       | 'token_budget'
       | 'magic_link_ip'
       | 'magic_link_email'
-      | 'auth_callback_ip',
+      | 'auth_callback_ip'
+      | 'rating_submits',
     public readonly resetsAt: Date,
   ) {
     super(`rate limit exceeded: ${kind}; resets at ${resetsAt.toISOString()}`);
@@ -280,6 +281,49 @@ export function makeMagicLinkLimiter(deps: RateLimitDeps = {}) {
     }
     if (!emailRes.success) {
       throw new RateLimitExceededError('magic_link_email', new Date(emailRes.reset));
+    }
+  }
+
+  return { reserve };
+}
+
+// ----- Tier E: review rating limiter (per-user, minute window) -------------
+//
+// /review's submitReview server action is an authenticated mutation
+// endpoint. CLAUDE.md non-negotiables require rate-limiting on every
+// external/mutation call. 30 ratings / user / minute is well above
+// realistic study behavior (a serious session is ~5–10 cards/min) and
+// well below abuse rates. Council r1 security non-negotiable on PR #48.
+
+export const RATING_SUBMITS_PER_MINUTE = 30;
+
+export function makeRatingLimiter(deps: RateLimitDeps = {}) {
+  const redis = makeRedis(deps);
+  const limiter = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(RATING_SUBMITS_PER_MINUTE, '1 m'),
+    analytics: false,
+    prefix: 'rl:rating',
+  });
+
+  /**
+   * Check-and-decrement the per-user rating counter. Throws:
+   *   - RateLimitExceededError if the user is over the limit (server
+   *     action returns errorKind: 'rate_limited').
+   *   - RatelimitUnavailableError if Upstash is unreachable. Caller
+   *     decides fail-open vs fail-closed; submitReview chooses fail-open
+   *     (matches Tier B/D pattern — better to let a real user through
+   *     than block on limiter outage).
+   */
+  async function reserve(userId: string): Promise<void> {
+    let result: Awaited<ReturnType<typeof limiter.limit>>;
+    try {
+      result = await limiter.limit(`user:${userId}`);
+    } catch {
+      throw new RatelimitUnavailableError();
+    }
+    if (!result.success) {
+      throw new RateLimitExceededError('rating_submits', new Date(result.reset));
     }
   }
 
