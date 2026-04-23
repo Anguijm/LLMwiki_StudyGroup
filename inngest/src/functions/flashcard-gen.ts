@@ -376,9 +376,15 @@ export const noteCreatedFlashcards = inngest.createFunction(
     id: 'note-created-flashcards',
     retries: 2,
     concurrency: { limit: 2 },
-    // Council r1 bugs: duplicate events from the emitter (unlikely but
-    // zero-cost guard) must not trigger two Claude calls.
-    idempotency: 'event.id',
+    // Council r1 + r7 bugs: idempotency keyed on the business object
+    // (note_id), NOT event.id. Two distinct events with different
+    // event.id values but the same note_id (e.g., ingest-pdf retry
+    // re-emitting after a partial failure, admin re-enqueue, watchdog
+    // re-fire) would otherwise trigger duplicate Claude calls — the
+    // UNIQUE (note_id, question) constraint would absorb the DB writes
+    // as no-ops, but we'd have already burned the Haiku token spend.
+    // Keyed by note_id within Inngest's default idempotency window.
+    idempotency: 'event.data.note_id',
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Inngest onFailure envelope untyped
     onFailure: async ({ event, error: err }: { event: any; error: any }) => {
       const orig = event?.data?.event?.data as { note_id?: string } | undefined;
