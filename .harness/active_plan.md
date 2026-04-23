@@ -1,6 +1,6 @@
 # Plan: /review UI — render srs_cards with plain-text XSS-safe rendering (issue #38)
 
-**Status:** draft, awaiting council + human approval.
+**Status:** r2 — folding council r1 PROCEED with bugs=6 substantive asks (try/catch + PII-safe error logging + focus management + metrics). Awaiting council r2 + human approval.
 **Branch:** `claude/review-ui`.
 **Scope:** first user-facing surface on the SRS pipeline. Server Component reads `srs_cards` via RLS, Client Component owns the reveal-answer toggle. Plain-text rendering only (no `dangerouslySetInnerHTML`). New unit + a11y tests. **No `[skip council]`.**
 
@@ -29,7 +29,7 @@ Explicitly **not** in scope: FSRS rating buttons, next-review-date scheduling, m
 
 - `apps/web/app/review/page.tsx` — new Server Component. Auth check, RLS read of `srs_cards`, passes initial card list to a client child. `export const dynamic = 'force-dynamic'` (auth-gated, per-user).
 - `apps/web/app/review/ReviewDeck.tsx` — new Client Component (`'use client'`). Owns: which-card-index state, answer-revealed boolean, "next card" handler. Renders `{card.question}` / `{card.answer}` as text nodes — never `dangerouslySetInnerHTML`.
-- `apps/web/lib/i18n.ts` — add 4 keys: `review.heading`, `review.empty`, `review.show_answer`, `review.hide_answer`. Update the `Key` union and `STRINGS` map.
+- `apps/web/lib/i18n.ts` — add 5 keys: `review.heading`, `review.empty`, `review.show_answer`, `review.hide_answer`, `review.load_error`. Update the `Key` union and `STRINGS` map.
 - `apps/web/components/ReviewDeck.test.tsx` — vitest unit test covering: (a) XSS payload renders escaped, (b) reveal toggle flips answer visibility, (c) "next card" advances index and re-hides the answer, (d) empty array renders the empty-state copy.
   - Uses `react-dom/server`'s `renderToStaticMarkup` (already a transitive dep via `react-dom@^19`); no new runtime dep, no jsdom needed (vitest env stays `node` per `apps/web/vitest.config.ts`).
   - Note: `ReviewDeck` is the Client Component, but `'use client'` is a bundler directive — in a pure unit-test context the file imports as a normal React module.
@@ -52,6 +52,7 @@ Explicitly **not** in scope: FSRS rating buttons, next-review-date scheduling, m
 
 ```ts
 import { redirect } from 'next/navigation';
+import { counter } from '@llmwiki/lib-metrics';
 import { supabaseForRequest } from '../../lib/supabase';
 import { ReviewDeck } from './ReviewDeck';
 import { t } from '../../lib/i18n';
@@ -67,11 +68,40 @@ export default async function ReviewPage() {
   if (!user) redirect('/auth');
 
   // /review page-load: 1 supabase select per request, no LLM calls. Free.
-  const { data: cards } = await rls
+  // PII DISCIPLINE: srs_cards.question/answer are LLM output derived from
+  // user PDFs (COMMENT ON COLUMN confirms). NEVER log them on ANY path,
+  // including error paths below — only log error.name + a bounded code.
+  const { data: cards, error } = await rls
     .from('srs_cards')
     .select('id, question, answer, due_at, created_at')
     .order('created_at', { ascending: false })
     .limit(PAGE_SIZE);
+
+  if (error) {
+    // PostgREST error — network, RLS misconfigure, or transient. We
+    // render a user-friendly banner instead of the Next.js default 500.
+    // Logged fields are deliberately narrow: error class name + code +
+    // user_id (for support correlation). No card content. No message —
+    // some Supabase error messages echo the query text which can leak
+    // column names; `error.name` + `error.code` are grep-stable and safe.
+    console.error('[/review] load_failed', {
+      errorName: error.name ?? 'UnknownError',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase error untyped
+      code: (error as any)?.code ?? null,
+      user_id: user.id,
+    });
+    counter('review.page.load_failed', { user_id: user.id });
+    return (
+      <main>
+        <h1 className="text-2xl font-semibold text-brand-900 mb-6">
+          {t('review.heading')}
+        </h1>
+        <p role="alert" className="text-danger">
+          {t('review.load_error')}
+        </p>
+      </main>
+    );
+  }
 
   // Narrow the row shape to what the client component renders. We never
   // hand SrsCard.user_id / cohort_id over the wire — RLS already gated the
@@ -82,6 +112,8 @@ export default async function ReviewPage() {
     question: c.question,
     answer: c.answer,
   }));
+
+  counter('review.page.viewed', { user_id: user.id, card_count: deckCards.length });
 
   return (
     <main>
@@ -94,6 +126,8 @@ export default async function ReviewPage() {
 }
 ```
 
+**Why prefer Supabase's `{ data, error }` branch over `try/catch`:** `supabase-js` wraps PostgREST errors into the tuple rather than throwing. A `try/catch` would only catch network-level failures (fetch throws), leaving the common case — e.g., an RLS misconfigure returning `{ data: null, error: {...} }` — unhandled. Branching on `error` covers both: network errors surface in the `error` field via the client's internal catch. If a new failure mode is found in practice, a top-level `try/catch` is a one-line addition.
+
 **Why server component:** auth check + RLS read happen on the server (matches the dashboard pattern). The cookie-write Proxy from `supabaseForRequest` works in Server Components (read-only path; the no-op cookie writes do not halt — see `apps/web/lib/supabase.ts:96-104` "expected RSC context" branch).
 
 **Why pre-narrow to `DeckCard`:** never serialize `user_id` / `cohort_id` to client props. Server-component → client-component prop boundary is a privilege boundary. RLS already enforces server-side scoping; the client truly only needs `{id, question, answer}`.
@@ -103,7 +137,8 @@ export default async function ReviewPage() {
 ```ts
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { counter } from '@llmwiki/lib-metrics';
 import { t } from '../../lib/i18n';
 
 interface DeckCard {
@@ -120,6 +155,19 @@ interface Props {
 export function ReviewDeck({ cards, emptyCopy }: Props) {
   const [index, setIndex] = useState(0);
   const [revealed, setRevealed] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  // a11y r1 fold: skip the focus-move on the very first render so the
+  // page-load doesn't yank focus from wherever the browser put it. Move
+  // focus only on subsequent index changes (i.e., user clicked "Next").
+  const firstRender = useRef(true);
+
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    headingRef.current?.focus();
+  }, [index]);
 
   if (cards.length === 0) {
     return <p className="text-brand-700">{emptyCopy}</p>;
@@ -128,7 +176,13 @@ export function ReviewDeck({ cards, emptyCopy }: Props) {
   const card = cards[index];
   const atEnd = index >= cards.length - 1;
 
-  const handleReveal = () => setRevealed((r) => !r);
+  const handleReveal = () => {
+    setRevealed((r) => {
+      // Only count REVEAL events (false → true), not hide-toggles.
+      if (!r) counter('review.card.revealed', { card_id: card.id });
+      return !r;
+    });
+  };
   const handleNext = () => {
     if (atEnd) return;
     setIndex((i) => i + 1);
@@ -137,7 +191,10 @@ export function ReviewDeck({ cards, emptyCopy }: Props) {
 
   return (
     <section aria-labelledby="card-heading" className="max-w-xl">
-      <h2 id="card-heading" className="sr-only">
+      {/* tabIndex=-1 makes the heading programmatically focusable so the
+          useEffect above can move focus to it on next-card. The sr-only
+          class keeps it visually hidden; AT users hear "Card N of M". */}
+      <h2 id="card-heading" ref={headingRef} tabIndex={-1} className="sr-only">
         Card {index + 1} of {cards.length}
       </h2>
 
@@ -251,6 +308,7 @@ const STRINGS: Record<Key, string> = {
   'review.empty': 'No flashcards yet. Upload a PDF to generate flashcards.',
   'review.show_answer': 'Show answer',
   'review.hide_answer': 'Hide answer',
+  'review.load_error': "Couldn't load your flashcards. Please refresh in a moment.",
 };
 ```
 
@@ -259,7 +317,8 @@ const STRINGS: Record<Key, string> = {
 - `aria-live="polite"` on the answer container so screen readers announce reveal without interrupting.
 - `aria-pressed` on the reveal button so the toggle state is exposed.
 - `min-h-[44px]` on both buttons matches the existing dashboard pattern (target-size).
-- Card heading (`Card N of M`) is `sr-only` so visual focus stays on the question; positional info reaches AT users.
+- Card heading (`Card N of M`) is `sr-only` AND `tabIndex={-1}` so the `useEffect` can move focus to it on next-card. AT users hear "Card N of M" announced; visual focus is invisible (sr-only, no outline interference).
+- `useEffect` skips the focus move on first render — page-load doesn't yank focus from the browser's default landing spot.
 - Color tokens are existing `brand-*` / `danger` from `globals.css` — already palette-checked by `tests/a11y/smoke.spec.ts` for contrast.
 - `whitespace-pre-wrap` preserves linebreaks Claude emits in long-form answers (mirrors how the prompt was tuned in `packages/prompts/src/flashcard-gen/v1.md`).
 
@@ -271,6 +330,8 @@ Mirrors `auth-callback-route.test.ts` shape:
 - Stub `supabaseForRequest` to return a builder whose `.auth.getUser()` returns `{ data: { user: null } }`; assert `redirect('/auth')` was called.
 - Stub returning a real user; assert the chain `from('srs_cards').select(...).order('created_at',{ascending:false}).limit(20)` was called against the RLS-scoped client (NOT `supabaseService`).
 - Assert no call to `supabaseService` from the page (RLS-only path; service-role would bypass cohort isolation and is forbidden for this read).
+- **Bugs r1 fold:** stub the select to return `{ data: null, error: { name: 'PostgresError', code: '42P01', message: 'card body sample text that MUST NOT be logged' } }`; assert (a) the page renders the `review.load_error` copy, (b) `console.error` is called with `errorName + code + user_id` only — assert the spied call args do NOT contain the substring "card body sample text" or any portion of the error message, (c) `counter('review.page.load_failed', ...)` was called.
+- **Bugs r1 fold:** stub the select to return cards including `{ id, question: '<script>alert(1)</script>', answer: 'x' }`; assert `console.error` was NOT called for any non-error path, AND assert `counter` was called with `review.page.viewed` and `card_count` matching the stubbed array length — but never with the card content (positive assertion: counter labels' values do not include the script payload).
 
 ## Non-negotiables (must hold; council will not override)
 
@@ -280,11 +341,14 @@ Mirrors `auth-callback-route.test.ts` shape:
 - **Plain-text rendering.** No markdown library, no HTML parsing. v0 is text-node-only.
 - **Server → client prop boundary narrows to `{id, question, answer}`.** Never serialize `user_id` / `cohort_id` to the client.
 - **XSS-payload unit test exists and passes.** Acceptance-criteria checkbox in issue #38.
+- **PII discipline on logging (council r1 security non-negotiable):** `srs_cards.question` and `srs_cards.answer` MUST NOT be logged on any path. Error logs include only `errorName`, `code`, and `user_id` — never the message body, since some PostgREST messages echo query text. A test asserts the error-path log args do not contain stubbed message content. Comment at the page-load callsite codifies the rule.
+- **Graceful error UI on query failure (council r1 bugs ask):** `{ error }` branch renders the `review.load_error` banner and increments `review.page.load_failed`; never falls through to the Next.js 500.
+- **Focus management on next-card (council r1 a11y ask):** focus moves to the sr-only card heading on `index` change (not first render), so screen-reader users hear the new card position.
 
 ## Tests
 
-- `apps/web/components/ReviewDeck.test.tsx` — XSS escape (question + answer), empty state, reveal toggle behavior, next-card behavior. Target ≥6 cases.
-- `apps/web/tests/unit/review-page.test.ts` — auth redirect, RLS-only read, no service-role call. Target ≥3 cases.
+- `apps/web/components/ReviewDeck.test.tsx` — XSS escape (question + answer), empty state, reveal toggle behavior, next-card behavior, reveal-counter only fires on false→true (not hide). Target ≥7 cases.
+- `apps/web/tests/unit/review-page.test.ts` — auth redirect, RLS-only read, no service-role call, error-branch renders banner + logs PII-safe shape, view-counter fires on success. Target ≥6 cases.
 - `apps/web/tests/a11y/smoke.spec.ts` — extend with a static-HTML pass that includes a representative card layout (one card div + two buttons + sr-only heading). Verifies palette + target-size for the new surface ahead of the dev-server CI integration.
 
 `npm run lint`, `npm run typecheck`, `npm test` all pass for `apps/web`.
@@ -296,6 +360,19 @@ Mirrors `auth-callback-route.test.ts` shape:
 3. **`due_at` filter omitted in v0.** Cards never become "due-only" in this PR; user sees all of their cards. Acceptable v0 trade — FSRS scoring is the trigger for due-filtering. Add the filter the same week the rating UI lands so the partial index pays off.
 4. **Card text length unbounded.** `whitespace-pre-wrap` + `max-w-xl` handles long cards visually; no explicit truncation. The flashcard prompt (`packages/prompts/src/flashcard-gen/v1.md`) targets concise cards and Claude's output rarely exceeds ~200 chars per side, but a malicious prompt-injected PDF could produce arbitrarily long output. Considered acceptable for v0 — long cards degrade UX, do not crash the page.
 5. **No realtime / optimistic updates.** A user generating new flashcards via PDF upload then visiting `/review` requires a manual refresh. Acceptable v0; Realtime is a separate slice (the dashboard already uses it for `ingestion_jobs` via `IngestionStatusTable`).
+6. **Null `question`/`answer` placeholder rendering — REBUTTED, no fold (council r1 bugs ask).** Council r1 asked for a `[No content]` placeholder when either field is null. The schema at `supabase/migrations/20260417000001_initial_schema.sql:152-153` declares both columns `text not null`; the column-level constraint is enforced at write time by Postgres and at row time by `supabase-js`'s typed inserts. A null arriving at this read would mean the constraint was bypassed (impossible without a manual `ALTER TABLE`) — defensive rendering for a schema-impossible value is dead code. **Action:** none. The plan's TypeScript types (`SrsCard.question: string`, not `string | null` at `packages/db/src/types.ts:92-93`) reflect the schema and the code naturally cannot encounter the null path. If a future migration relaxes `not null`, the type widens and the compiler forces a placeholder decision then — which is the correct moment for it.
+
+## Metrics (council r1 product fold)
+
+Per CLAUDE.md "Cost posture" + the council r1 product persona kill criterion:
+
+- `review.page.viewed{user_id, card_count}` — fired once per successful page load. Powers engagement floor.
+- `review.page.load_failed{user_id}` — fired on the `error`-branch in `ReviewPage`. Should be ≪ 1% of `viewed` if Supabase is healthy.
+- `review.card.revealed{card_id}` — fired only on the false→true transition of the reveal toggle (not on hide). Direct measure of card engagement; the kill criterion below reads off this counter.
+
+**Kill criterion** (per council r1 product): zero `review.card.revealed` events from the active cohort one week post-merge → flashcard-product hypothesis is invalid → revisit prompt + UX before adding FSRS scoring.
+
+`user_id` is included as a label for support correlation; `card_id` is the `srs_cards.id` UUID — neither is PII (they are pseudonyms generated server-side). Card content is NEVER a label.
 
 ## Cost
 
@@ -325,6 +402,10 @@ Per-callsite cost annotation (CLAUDE.md "Cost posture" rule) added at the page-l
 - [ ] `aria-live` region announces show-answer.
 - [ ] `aria-pressed` exposes reveal-button toggle state.
 - [ ] All buttons ≥44px touch target.
+- [ ] Focus moves to card heading on next-card (not on first render).
+- [ ] Error branch renders the `review.load_error` banner; no Next.js 500 page on Supabase failure.
+- [ ] `console.error` on the error path includes `errorName` + `code` + `user_id` only — never card content (test asserts negative).
+- [ ] `review.page.viewed`, `review.page.load_failed`, `review.card.revealed` counters fire on their respective paths.
 - [ ] `npm run lint`, `npm run typecheck`, `npm test` pass.
 - [ ] Council PROCEED on the impl-diff round.
 
