@@ -18,4 +18,11 @@ export default defineConfig({
       'server-only': path.resolve(__dirname, 'tests/__mocks__/server-only.ts'),
     },
   },
+  // tsconfig has `"jsx": "preserve"` for Next's compiler. Vitest uses
+  // esbuild to transform .tsx test fixtures + imported components; tell
+  // esbuild to emit the automatic JSX runtime so React doesn't need to
+  // be in lexical scope at every JSX site (page.tsx, ReviewDeck.tsx).
+  esbuild: {
+    jsx: 'automatic',
+  },
 });
