@@ -199,10 +199,28 @@ export async function runNoteCreatedFlashcards(
       return data as {
         id: string;
         body: string | null;
-        user_id: string;
-        cohort_id: string;
+        user_id: string | null;
+        cohort_id: string | null;
       };
     });
+
+    // Council r6 bugs: defense-in-depth against a null user_id /
+    // cohort_id on a fetched note. The DB schema declares both NOT NULL
+    // with FK to auth.users / public.cohorts, so this path shouldn't fire
+    // in practice — but if it ever does (schema drift, RLS oddity, fetch
+    // corruption), downstream tokenBudget.reserve + upsert would crash
+    // with confusing errors. Fail fast as NonRetriable: nulls won't
+    // become non-null on retry.
+    if (!note.user_id || !note.cohort_id) {
+      throw new NonRetriableError(
+        `note ${note_id} has null user_id or cohort_id`,
+        { cause: new NoteNotFoundError(note_id) },
+      );
+    }
+    // TypeScript flow-narrow via explicit-typed locals so downstream
+    // sites see `string`, not `string | null`.
+    const userId: string = note.user_id;
+    const cohortId: string = note.cohort_id;
 
     // Empty / whitespace / oversized body short-circuits BEFORE reserving
     // tokens or calling Claude (council r1/r2 bugs).
@@ -228,13 +246,13 @@ export async function runNoteCreatedFlashcards(
     await step.run('token-budget-reserve', async () => {
       const tokenBudget = makeTokenBudgetLimiter();
       try {
-        await tokenBudget.reserve(note.user_id, estimatedTokens);
+        await tokenBudget.reserve(userId, estimatedTokens);
       } catch (err) {
         if (err instanceof RateLimitExceededError) {
           // User has exhausted their Tier B budget. Non-retryable: waiting
           // won't change the outcome within the retry window.
           throw new NonRetriableError(
-            `token budget exceeded for user ${note.user_id}`,
+            `token budget exceeded for user ${userId}`,
             { cause: err },
           );
         }
@@ -283,7 +301,7 @@ export async function runNoteCreatedFlashcards(
         // diagnostics + retry classification.
         throw new ReservationAwareError(
           estimatedTokens,
-          note.user_id,
+          userId,
           err instanceof Error ? err.message : String(err),
           { cause: err },
         );
@@ -303,8 +321,8 @@ export async function runNoteCreatedFlashcards(
         note_id: note.id,
         question: c.question,
         answer: c.answer,
-        user_id: note.user_id,
-        cohort_id: note.cohort_id,
+        user_id: userId,
+        cohort_id: cohortId,
       }));
       // upsert + ignoreDuplicates is the PostgREST equivalent of INSERT ...
       // ON CONFLICT DO NOTHING — per-row dedup against the UNIQUE
@@ -332,7 +350,7 @@ export async function runNoteCreatedFlashcards(
             {
               cause: new ReservationAwareError(
                 estimatedTokens,
-                note.user_id,
+                userId,
                 `FK violation (${code})`,
                 { cause: error },
               ),
@@ -341,7 +359,7 @@ export async function runNoteCreatedFlashcards(
         }
         throw new ReservationAwareError(
           estimatedTokens,
-          note.user_id,
+          userId,
           `persist failed`,
           { cause: error },
         );

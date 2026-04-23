@@ -291,6 +291,44 @@ describe('runNoteCreatedFlashcards — skip branches (council r1/r2 bugs)', () =
 });
 
 describe('runNoteCreatedFlashcards — error branches', () => {
+  it('load-note returns null user_id → fails fast with NonRetriableError (council r6 bugs)', async () => {
+    // Defense in depth: DB schema declares user_id NOT NULL, but if a
+    // fetched note ever lands with null (schema drift, RLS hiccup),
+    // tokenBudget.reserve would crash with a confusing error. Fail
+    // explicitly and non-retriably — a null user_id won't become
+    // non-null on retry.
+    mockSupabase.from.mockImplementation(() => ({
+      select: () => ({
+        eq: () => ({
+          single: async () => ({
+            data: { ...noteRow, user_id: null },
+            error: null,
+          }),
+        }),
+      }),
+    }));
+    const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(NonRetriableError);
+    expect(reserveSpy).not.toHaveBeenCalled();
+    expect(generateFlashcardsMock).not.toHaveBeenCalled();
+  });
+
+  it('load-note returns null cohort_id → fails fast with NonRetriableError (council r6 bugs)', async () => {
+    mockSupabase.from.mockImplementation(() => ({
+      select: () => ({
+        eq: () => ({
+          single: async () => ({
+            data: { ...noteRow, cohort_id: null },
+            error: null,
+          }),
+        }),
+      }),
+    }));
+    const err = await runNoteCreatedFlashcards(handlerArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(NonRetriableError);
+    expect(reserveSpy).not.toHaveBeenCalled();
+  });
+
   it('load-note fails → throws NonRetriableError wrapping NoteNotFoundError (council r4 bugs)', async () => {
     // A missing note won't exist on retry. Non-retryable error skips
     // the 2-retry budget; the NoteNotFoundError is preserved as cause
