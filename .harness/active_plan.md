@@ -1,419 +1,523 @@
-# Plan: /review UI — render srs_cards with plain-text XSS-safe rendering (issue #38)
+# Plan: FSRS rating + scheduling on /review (closes the SRS loop)
 
-**Status:** r2 — folding council r1 PROCEED with bugs=6 substantive asks (try/catch + PII-safe error logging + focus management + metrics). Awaiting council r2 + human approval.
-**Branch:** `claude/review-ui`.
-**Scope:** first user-facing surface on the SRS pipeline. Server Component reads `srs_cards` via RLS, Client Component owns the reveal-answer toggle. Plain-text rendering only (no `dangerouslySetInnerHTML`). New unit + a11y tests. **No `[skip council]`.**
+**Status:** draft, awaiting council + human approval.
+**Branch:** `claude/fsrs-scoring`.
+**Scope:** rating UI on `/review` (Again/Hard/Good/Easy) + server action that runs the FSRS algorithm + persists state. New runtime dep (`ts-fsrs`). New typed wrappers around `srs_cards.fsrs_state` and `review_history.{prev,next}_state`. **No `[skip council]`** — new external lib + auth-gated mutation surface + the kind of state-machine math council should scrutinize.
 
 ## Problem
 
-PR #37 (`e52866c`) shipped the flashcard generation handler: when a PDF ingest completes, Claude Haiku produces 5–10 cards and persists them to `srs_cards`. The pipeline is end-to-end functional on the data side, but **the cards are dead on arrival** — there is no `/review` route at `apps/web/app/review/` (verified: directory does not exist). Until this UI ships, no user can see the SRS loop work, and the product has no visible value beyond the upload-and-list dashboard.
-
-Issue #38 was filed during PR #37's council r2 with the XSS sanitization requirement promoted to a non-negotiable: `srs_cards.question` and `srs_cards.answer` are LLM output from user-uploaded PDFs, so a crafted PDF could embed HTML/JS that Claude passes through verbatim. Migration `20260422000001_srs_cards_unique.sql` annotated those columns with `COMMENT ON COLUMN ... IS 'LLM-generated from user-uploaded content. MUST be sanitized before rendering.'` — the canonical record of this requirement. This PR honors that contract.
+PR #42 shipped `/review` as a read-only surface — users see their cards but cannot rate them. Without rating, the entire "spaced repetition" value prop is inert: `srs_cards.fsrs_state` is always `{}`, `srs_cards.due_at` is always `null`, `review_history` is always empty, and the user reviews the same N cards forever in `created_at desc` order. The product persona on PR #43 r5 explicitly: *"`/review` UI without scoring is 'look at the same cards forever'; rating closes the loop and validates the entire ingest → flashcards → review → retention pipeline."*
 
 ## Goal
 
-A `/review` route at `apps/web/app/review/page.tsx` that:
+After this PR ships, a user on `/review` can:
 
-1. Authenticates the request (redirect to `/auth` on unauthenticated, matching `apps/web/app/page.tsx:11-14`).
-2. Fetches the user's cards via the RLS-scoped client (`supabaseForRequest`), bounded to a small page (20).
-3. Renders one card at a time as **plain text** — question shown by default, answer hidden until reveal.
-4. Handles the empty state (no cards yet) with a clear copy directing to upload.
-5. Passes a11y: WCAG AA contrast, ≥44px touch targets, `aria-live` reveal announcement, focus-management on next-card.
-6. Has a unit test that proves a card with `question: '<script>alert(1)</script>'` renders as the literal escaped string and never executes.
+1. Reveal an answer (existing).
+2. Rate the card with one of four buttons: **Again** (forgot completely), **Hard** (recalled with difficulty), **Good** (recalled correctly), **Easy** (trivially correct). Buttons are disabled until the answer is revealed (you can't rate what you haven't tried to recall).
+3. On click, the server runs the FSRS algorithm against the card's current `fsrs_state`, computes a new `(state, due_at)` pair, persists both updates to `srs_cards` AND inserts a `review_history` row in a single transaction.
+4. The client advances to the next card and re-hides the answer.
+5. New cards (with `fsrs_state = {}`) initialize cleanly on first review.
 
-Explicitly **not** in scope: FSRS rating buttons, next-review-date scheduling, markdown rendering, edit/delete UI, keyboard shortcuts, session-based bulk-review. Each is its own follow-up.
+The /review query stays unchanged in this PR — still `order by created_at desc limit 20`. **Due-now filtering** (only show cards where `due_at <= now()`) is explicitly out of scope; this PR's job is to make the FSRS loop *work*, not to reorganize the queue. Due-filtering is a separate ticket once the rating UX is validated.
 
 ## Scope
 
 **In:**
 
-- `apps/web/app/review/page.tsx` — new Server Component. Auth check, RLS read of `srs_cards`, passes initial card list to a client child. `export const dynamic = 'force-dynamic'` (auth-gated, per-user).
-- `apps/web/app/review/ReviewDeck.tsx` — new Client Component (`'use client'`). Owns: which-card-index state, answer-revealed boolean, "next card" handler. Renders `{card.question}` / `{card.answer}` as text nodes — never `dangerouslySetInnerHTML`.
-- `apps/web/lib/i18n.ts` — add 5 keys: `review.heading`, `review.empty`, `review.show_answer`, `review.hide_answer`, `review.load_error`. Update the `Key` union and `STRINGS` map.
-- `apps/web/components/ReviewDeck.test.tsx` — vitest unit test covering: (a) XSS payload renders escaped, (b) reveal toggle flips answer visibility, (c) "next card" advances index and re-hides the answer, (d) empty array renders the empty-state copy.
-  - Uses `react-dom/server`'s `renderToStaticMarkup` (already a transitive dep via `react-dom@^19`); no new runtime dep, no jsdom needed (vitest env stays `node` per `apps/web/vitest.config.ts`).
-  - Note: `ReviewDeck` is the Client Component, but `'use client'` is a bundler directive — in a pure unit-test context the file imports as a normal React module.
-- `apps/web/tests/unit/review-page.test.ts` — route-module integration test mirroring `auth-callback-route.test.ts`'s shape: stubs `supabaseForRequest`, asserts unauthenticated → redirect, asserts `srs_cards` query is RLS-scoped (uses the wrapped client, not `supabaseService`).
-- `apps/web/tests/a11y/smoke.spec.ts` — extend the placeholder to include a `/review` static-HTML axe pass for color-contrast + target-size, modeled on the existing pattern. (Real page.goto stays gated on the dev-server CI todo.)
+- `apps/web/package.json` — add `ts-fsrs` (pinned, exact version). Runtime dep.
+- `packages/lib/srs/` — new tiny package wrapping `ts-fsrs` with our domain types + a single `nextState(currentState, rating)` pure function. Reasons for a wrapper package:
+  1. Keeps `ts-fsrs` import surface narrow — only one file imports it.
+  2. Lets us swap the underlying lib later without touching app code.
+  3. Provides a single test-target for the algorithm contract (failure-mode tests live here per the new rebuttal-protocol rule).
+- `apps/web/app/review/actions.ts` — new server action `submitReview(cardId, rating)`. RLS-scoped via `supabaseForRequest`; runs `nextState`; persists via a Postgres function (`fn_review_card`) called via Supabase RPC for atomicity.
+- `supabase/migrations/20260424000001_fn_review_card.sql` — new SQL function `fn_review_card(p_card_id uuid, p_rating smallint, p_next_state jsonb, p_due_at timestamptz, p_prev_state jsonb)` that updates `srs_cards.fsrs_state` + `due_at` AND inserts `review_history` in a single transaction. RLS via `security invoker` (so the caller's `auth.uid()` is checked against `srs_cards_own` + `review_history_own`).
+- `apps/web/app/review/ReviewDeck.tsx` — extend with rating buttons (4 buttons after answer reveal, hidden before reveal); wire to the server action; on success, call existing `handleNext`.
+- `apps/web/lib/i18n.ts` — 6 new keys: `review.rating.again`, `review.rating.hard`, `review.rating.good`, `review.rating.easy`, `review.rating_error`, `review.rating_pending`.
+- Tests:
+  - `packages/lib/srs/src/index.test.ts` — algorithm contract, failure-mode coverage (see §Tests).
+  - `apps/web/app/review/actions.test.ts` — server-action behavior, RLS enforcement, transaction atomicity stub, PII-safe logging, rating validation.
+  - `apps/web/components/ReviewDeck.test.tsx` — rating buttons disabled before reveal, enabled after, fire on click, advance card on success.
+  - `supabase/tests/fn_review_card.sql` — pgTAP test for the SQL function (acknowledged-flaky per #7; written but not load-bearing for the rebuttal protocol).
 
 **Out (explicit):**
 
-- FSRS scoring / rating buttons / `review_history` writes — separate follow-up; the schema is ready (`packages/db/src/types.ts:101` `ReviewHistory`) but the algorithm + UI pattern need their own plan.
-- Markdown rendering for cards — issue #38 mandates plain text for v0. If a future need emerges, route through `react-markdown + rehype-sanitize` like `/note/[slug]` does, with allowlist explicitly tightened.
-- Card edit / delete UI.
-- "Due-now" filtering via `due_at` — the partial index `srs_cards_user_due_idx` is in place (`supabase/migrations/20260422000001_srs_cards_unique.sql:17-19`) but v0 just shows all of the user's cards by `created_at desc`. Due filtering arrives with FSRS scoring.
-- Pagination beyond a 20-card page. v0 cap is fine — the user has at most ~10 cards per ingested note in the early path.
-- Keyboard shortcuts (Space to reveal, J/K to navigate). Nice-to-have; trivial follow-up once the core flow is reviewed.
-- Realtime subscription for newly-generated cards. Static page-load fetch is fine for v0; user can refresh.
+- **Due-now filtering on `/review`'s initial query** — separate ticket once rating UX is validated.
+- **Per-user FSRS parameter tuning** (advanced FSRS feature for personalized intervals) — defaults are fine for v1.
+- **Anki-style multi-deck management** — single global deck per user.
+- **Review session boundaries** ("review 20 cards then stop") — cards are rated as they come up; user closes the tab to end.
+- **Heatmap / streak tracking** — separate analytics surface.
+- **Undo last review** — accept the rating once submitted; the lapse counter handles "I clicked wrong" via the next-review's Again rating.
+- **Mobile gesture support** (swipe to rate) — keyboard + click only for v1.
+- **Keyboard shortcuts** (1/2/3/4 to rate) — nice-to-have follow-up.
+
+## Data isolation model (per CLAUDE.md §"Plan-time required content")
+
+Two tables touched by this PR; neither is new:
+
+- **`srs_cards`** — **per-user** (already shipped at `supabase/migrations/20260417000002_rls_policies.sql:118-121`). Justification: a study group's flashcards are personal study aids — only the owning user reviews their own cards. This PR mutates the row's `fsrs_state` + `due_at`, which are the per-user review state.
+- **`review_history`** — **per-user** (already shipped at `supabase/migrations/20260417000002_rls_policies.sql:125-128`). Justification: a user's review history is a personal study log — only the owning user reads/writes their own entries. This PR inserts new rows.
+
+The new SQL function `fn_review_card` runs as `security invoker` so `auth.uid()` flows through to the RLS check on both tables. **No new tables introduced; no new RLS policies needed.**
 
 ## Design
 
-### A. Server Component — `apps/web/app/review/page.tsx`
+### A. FSRS wrapper package — `packages/lib/srs/`
 
 ```ts
+// packages/lib/srs/src/index.ts
+import { FSRS, generatorParameters, Rating, type Card } from 'ts-fsrs';
+
+export const RATING_AGAIN = 1;
+export const RATING_HARD = 2;
+export const RATING_GOOD = 3;
+export const RATING_EASY = 4;
+export type RatingValue = 1 | 2 | 3 | 4;
+
+export function isValidRating(r: unknown): r is RatingValue {
+  return r === 1 || r === 2 || r === 3 || r === 4;
+}
+
+/**
+ * Our wire shape for srs_cards.fsrs_state and review_history.{prev,next}_state.
+ * Matches ts-fsrs's Card serialization 1:1; explicit interface so a future
+ * lib swap can target a stable contract.
+ */
+export interface FsrsCardState {
+  due: string;             // ISO timestamp
+  stability: number;
+  difficulty: number;
+  elapsed_days: number;
+  scheduled_days: number;
+  reps: number;
+  lapses: number;
+  state: 0 | 1 | 2 | 3;    // 0=new, 1=learning, 2=review, 3=relearning
+  last_review?: string;    // ISO timestamp; undefined for never-reviewed
+}
+
+/**
+ * Initial state for a never-reviewed card. Matches ts-fsrs's createEmptyCard()
+ * output but spelled out so the contract is readable.
+ */
+export function emptyFsrsState(now: Date = new Date()): FsrsCardState {
+  return {
+    due: now.toISOString(),
+    stability: 0,
+    difficulty: 0,
+    elapsed_days: 0,
+    scheduled_days: 0,
+    reps: 0,
+    lapses: 0,
+    state: 0,
+  };
+}
+
+const fsrs = new FSRS(generatorParameters({ enable_fuzz: true }));
+
+/**
+ * Pure function: given the current state + a rating + "now", compute the
+ * next state and the next due date. Throws on invalid rating (caller must
+ * validate first via isValidRating).
+ *
+ * "Pure" with one caveat: ts-fsrs's enable_fuzz=true adds randomness to the
+ * scheduled interval (anti-clustering on cards reviewed in batches). Tests
+ * that assert exact intervals must seed Math.random or disable fuzz; tests
+ * that assert ordering ("Easy interval > Good interval > Hard interval >
+ * Again interval") are fuzz-stable.
+ */
+export function nextState(
+  current: FsrsCardState,
+  rating: RatingValue,
+  now: Date = new Date(),
+): { state: FsrsCardState; due: Date } {
+  // Convert FsrsCardState (our wire) → ts-fsrs Card (their internal).
+  const card: Card = {
+    due: new Date(current.due),
+    stability: current.stability,
+    difficulty: current.difficulty,
+    elapsed_days: current.elapsed_days,
+    scheduled_days: current.scheduled_days,
+    reps: current.reps,
+    lapses: current.lapses,
+    state: current.state as Card['state'],
+    last_review: current.last_review ? new Date(current.last_review) : undefined,
+  };
+
+  const result = fsrs.next(card, now, rating as Rating);
+  const next = result.card;
+
+  return {
+    state: {
+      due: next.due.toISOString(),
+      stability: next.stability,
+      difficulty: next.difficulty,
+      elapsed_days: next.elapsed_days,
+      scheduled_days: next.scheduled_days,
+      reps: next.reps,
+      lapses: next.lapses,
+      state: next.state as FsrsCardState['state'],
+      last_review: next.last_review?.toISOString(),
+    },
+    due: next.due,
+  };
+}
+```
+
+**Why a wrapper package:** keeps `ts-fsrs` imports localized to one file. If we later swap to `super-memo` or roll our own, only this file changes. Council can audit the algorithm contract (the test suite below) without combing through call-sites.
+
+**Why `ts-fsrs` over rolling our own:** the FSRS-5 algorithm has subtle math (logarithmic stability decay, retrievability formulas, difficulty drift). `ts-fsrs` is the canonical TypeScript port maintained by the FSRS spec authors; ~10kb min+gz. The cost of getting it wrong (silently scheduling cards incorrectly) is much higher than the dep cost. Council can push back; documented fold path: write a minimal FSRS-5 impl in `packages/lib/srs/src/algorithm.ts` (~200 LOC of pure math) and skip the dep.
+
+### B. SQL function — `supabase/migrations/20260424000001_fn_review_card.sql`
+
+```sql
+-- Atomic update: srs_cards.fsrs_state + due_at AND insert review_history,
+-- in one transaction. Avoids the "card updated but history insert failed"
+-- split-brain that two separate Supabase client calls could produce.
+--
+-- security invoker: caller's auth.uid() flows through to RLS checks on
+-- srs_cards_own + review_history_own. A user can only review their own
+-- cards.
+create or replace function public.fn_review_card(
+  p_card_id uuid,
+  p_rating smallint,
+  p_next_state jsonb,
+  p_due_at timestamptz,
+  p_prev_state jsonb
+) returns void
+language plpgsql
+security invoker
+as $$
+declare
+  v_user_id uuid;
+begin
+  -- Validate rating range here (defense in depth — server action also checks).
+  if p_rating not in (1, 2, 3, 4) then
+    raise exception 'invalid rating: %', p_rating using errcode = '22023';
+  end if;
+
+  -- Read user_id from the card row, scoped by RLS. If the row is invisible
+  -- (RLS blocks: not the user's card) OR doesn't exist, this returns 0 rows
+  -- and the subsequent update is a no-op — but the insert below would fail
+  -- on the FK constraint. So fail loudly here instead.
+  select user_id into v_user_id
+    from public.srs_cards
+    where id = p_card_id;
+  if v_user_id is null then
+    raise exception 'card not found or not accessible: %', p_card_id
+      using errcode = '42501'; -- insufficient_privilege
+  end if;
+
+  -- Update the card's state. RLS check is on `using` (read) + `with check`
+  -- (write); both pass since v_user_id = auth.uid() (we just selected it
+  -- under RLS).
+  update public.srs_cards
+    set fsrs_state = p_next_state,
+        due_at = p_due_at
+    where id = p_card_id;
+
+  -- Insert the review log. RLS `with check` enforces user_id = auth.uid().
+  insert into public.review_history (card_id, user_id, rating, prev_state, next_state)
+    values (p_card_id, v_user_id, p_rating, p_prev_state, p_next_state);
+end;
+$$;
+
+comment on function public.fn_review_card(uuid, smallint, jsonb, timestamptz, jsonb) is
+  'Atomic review: update srs_cards.fsrs_state + due_at AND insert review_history. RLS-scoped via security invoker. Argument order is positional: (card_id, rating, next_state, due_at, prev_state).';
+
+-- Grant exec to authenticated users; RLS does the per-row gating.
+revoke all on function public.fn_review_card(uuid, smallint, jsonb, timestamptz, jsonb) from public;
+grant execute on function public.fn_review_card(uuid, smallint, jsonb, timestamptz, jsonb) to authenticated;
+```
+
+**Why a SQL function instead of two sequential Supabase client calls:** atomicity. Two client calls = network-level non-atomicity = a partial state where the card's `fsrs_state` advanced but no `review_history` row exists. That's debt: the audit trail is broken, and re-rating the card would compute from the new state without remembering it was just reviewed. A single transaction inside Postgres is the correct boundary.
+
+**Why `security invoker` not `security definer`:** definer would bypass RLS using the function-owner's permissions — defeats the entire RLS model. Invoker means `auth.uid()` is the calling user, and the existing per-user RLS policies on both tables enforce ownership.
+
+### C. Server action — `apps/web/app/review/actions.ts`
+
+```ts
+'use server';
+
 import { redirect } from 'next/navigation';
 import { counter } from '@llmwiki/lib-metrics';
+import {
+  isValidRating,
+  emptyFsrsState,
+  nextState,
+  type FsrsCardState,
+  type RatingValue,
+} from '@llmwiki/lib-srs';
 import { supabaseForRequest } from '../../lib/supabase';
-import { ReviewDeck } from './ReviewDeck';
-import { t } from '../../lib/i18n';
-import type { SrsCard } from '@llmwiki/db/types';
 
-export const dynamic = 'force-dynamic';
+export interface SubmitReviewResult {
+  ok: boolean;
+  errorKind?: 'invalid_rating' | 'card_not_found' | 'persist_failed' | 'unauthenticated';
+}
 
-const PAGE_SIZE = 20;
+export async function submitReview(cardId: string, rating: number): Promise<SubmitReviewResult> {
+  // Reject malformed ratings BEFORE any DB call (defense in depth — fn also checks).
+  if (!isValidRating(rating)) {
+    counter('review.rating.rejected', { reason: 'invalid_rating' });
+    return { ok: false, errorKind: 'invalid_rating' };
+  }
+  // UUID v4 shape check — Supabase will reject non-UUIDs with a 22P02 anyway,
+  // but cheap to short-circuit + avoid leaking PostgresError noise into logs.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cardId)) {
+    counter('review.rating.rejected', { reason: 'invalid_card_id' });
+    return { ok: false, errorKind: 'invalid_rating' };
+  }
 
-export default async function ReviewPage() {
   const rls = await supabaseForRequest();
   const { data: { user } } = await rls.auth.getUser();
-  if (!user) redirect('/auth');
-
-  // /review page-load: 1 supabase select per request, no LLM calls. Free.
-  // PII DISCIPLINE: srs_cards.question/answer are LLM output derived from
-  // user PDFs (COMMENT ON COLUMN confirms). NEVER log them on ANY path,
-  // including error paths below — only log error.name + a bounded code.
-  const { data: cards, error } = await rls
-    .from('srs_cards')
-    .select('id, question, answer, due_at, created_at')
-    .order('created_at', { ascending: false })
-    .limit(PAGE_SIZE);
-
-  if (error) {
-    // PostgREST error — network, RLS misconfigure, or transient. We
-    // render a user-friendly banner instead of the Next.js default 500.
-    // Logged fields are deliberately narrow: error class name + code +
-    // user_id (for support correlation). No card content. No message —
-    // some Supabase error messages echo the query text which can leak
-    // column names; `error.name` + `error.code` are grep-stable and safe.
-    console.error('[/review] load_failed', {
-      errorName: error.name ?? 'UnknownError',
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase error untyped
-      code: (error as any)?.code ?? null,
-      user_id: user.id,
-    });
-    counter('review.page.load_failed', { user_id: user.id });
-    return (
-      <main>
-        <h1 className="text-2xl font-semibold text-brand-900 mb-6">
-          {t('review.heading')}
-        </h1>
-        <p role="alert" className="text-danger">
-          {t('review.load_error')}
-        </p>
-      </main>
-    );
+  if (!user) {
+    // Don't redirect from a server action — return so the client can navigate.
+    return { ok: false, errorKind: 'unauthenticated' };
   }
 
-  // Narrow the row shape to what the client component renders. We never
-  // hand SrsCard.user_id / cohort_id over the wire — RLS already gated the
-  // read, and the client doesn't need them.
-  type DeckCard = Pick<SrsCard, 'id' | 'question' | 'answer'>;
-  const deckCards: DeckCard[] = (cards ?? []).map((c) => ({
-    id: c.id,
-    question: c.question,
-    answer: c.answer,
-  }));
+  // Load the card's current state (RLS-scoped). If the user doesn't own it
+  // OR it doesn't exist, the select returns null/error → card_not_found.
+  const { data: card, error: loadErr } = await rls
+    .from('srs_cards')
+    .select('id, fsrs_state')
+    .eq('id', cardId)
+    .single();
+  if (loadErr || !card) {
+    console.error('[/review submitReview] card_load_failed', {
+      errorName: loadErr?.name ?? 'NotFound',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase error untyped
+      code: (loadErr as any)?.code ?? null,
+      user_id: user.id,
+      card_id: cardId,
+    });
+    counter('review.rating.failed', { reason: 'card_not_found' });
+    return { ok: false, errorKind: 'card_not_found' };
+  }
 
-  counter('review.page.viewed', { user_id: user.id, card_count: deckCards.length });
+  // Compute next state. fsrs_state may be {} for a never-reviewed card —
+  // emptyFsrsState() initializes the FSRS-5 starting point.
+  const currentState =
+    Object.keys(card.fsrs_state ?? {}).length === 0
+      ? emptyFsrsState()
+      : (card.fsrs_state as FsrsCardState);
 
-  return (
-    <main>
-      <h1 className="text-2xl font-semibold text-brand-900 mb-6">
-        {t('review.heading')}
-      </h1>
-      <ReviewDeck cards={deckCards} emptyCopy={t('review.empty')} />
-    </main>
-  );
+  const { state: next, due } = nextState(currentState, rating as RatingValue);
+
+  // Persist atomically via the SQL function.
+  const { error: rpcErr } = await rls.rpc('fn_review_card', {
+    p_card_id: cardId,
+    p_rating: rating,
+    p_next_state: next,
+    p_due_at: due.toISOString(),
+    p_prev_state: currentState,
+  });
+  if (rpcErr) {
+    console.error('[/review submitReview] persist_failed', {
+      errorName: rpcErr.name ?? 'UnknownError',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase error untyped
+      code: (rpcErr as any)?.code ?? null,
+      user_id: user.id,
+      card_id: cardId,
+    });
+    counter('review.rating.failed', { reason: 'persist_failed' });
+    return { ok: false, errorKind: 'persist_failed' };
+  }
+
+  counter('review.rating.submitted', {
+    user_id: user.id,
+    rating: String(rating),
+    is_new_card: currentState.state === 0 ? 'true' : 'false',
+  });
+  return { ok: true };
 }
 ```
 
-**Why prefer Supabase's `{ data, error }` branch over `try/catch`:** `supabase-js` wraps PostgREST errors into the tuple rather than throwing. A `try/catch` would only catch network-level failures (fetch throws), leaving the common case — e.g., an RLS misconfigure returning `{ data: null, error: {...} }` — unhandled. Branching on `error` covers both: network errors surface in the `error` field via the client's internal catch. If a new failure mode is found in practice, a top-level `try/catch` is a one-line addition.
+**PII discipline (per CLAUDE.md non-negotiables + the new rebuttal protocol):** error logs include `errorName` + `code` + `user_id` + `card_id` only — never card content, never `error.message` (which can echo query/row text). Counter labels: `user_id`, `card_id` (UUIDs, pseudonyms not PII), `rating` (small int), `is_new_card` (boolean). Card content is NEVER a label.
 
-**Why server component:** auth check + RLS read happen on the server (matches the dashboard pattern). The cookie-write Proxy from `supabaseForRequest` works in Server Components (read-only path; the no-op cookie writes do not halt — see `apps/web/lib/supabase.ts:96-104` "expected RSC context" branch).
+### D. Client wiring — `apps/web/app/review/ReviewDeck.tsx` extension
 
-**Why pre-narrow to `DeckCard`:** never serialize `user_id` / `cohort_id` to client props. Server-component → client-component prop boundary is a privilege boundary. RLS already enforces server-side scoping; the client truly only needs `{id, question, answer}`.
-
-### B. Client Component — `apps/web/app/review/ReviewDeck.tsx`
+Add 4 rating buttons after the existing reveal button. They render only when `revealed === true` and `pendingRating === false`. On click, fire the server action; on success, advance via existing `handleNext`; on failure, surface a toast/alert via the existing `aria-live` region.
 
 ```ts
-'use client';
+// Inside ReviewDeck component, after existing state:
+const [pendingRating, setPendingRating] = useState(false);
+const [ratingError, setRatingError] = useState<string | null>(null);
 
-import { useEffect, useRef, useState } from 'react';
-import { counter } from '@llmwiki/lib-metrics';
-import { t } from '../../lib/i18n';
-
-interface DeckCard {
-  id: string;
-  question: string;
-  answer: string;
-}
-
-interface Props {
-  cards: ReadonlyArray<DeckCard>;
-  emptyCopy: string;
-}
-
-export function ReviewDeck({ cards, emptyCopy }: Props) {
-  const [index, setIndex] = useState(0);
-  const [revealed, setRevealed] = useState(false);
-  const headingRef = useRef<HTMLHeadingElement>(null);
-  // a11y r1 fold: skip the focus-move on the very first render so the
-  // page-load doesn't yank focus from wherever the browser put it. Move
-  // focus only on subsequent index changes (i.e., user clicked "Next").
-  const firstRender = useRef(true);
-
-  useEffect(() => {
-    if (firstRender.current) {
-      firstRender.current = false;
+const handleRate = async (rating: 1 | 2 | 3 | 4) => {
+  if (pendingRating) return; // Double-click guard.
+  setPendingRating(true);
+  setRatingError(null);
+  try {
+    const result = await submitReview(card.id, rating);
+    if (!result.ok) {
+      setRatingError(t('review.rating_error'));
+      setPendingRating(false);
       return;
     }
-    headingRef.current?.focus();
-  }, [index]);
-
-  if (cards.length === 0) {
-    return <p className="text-brand-700">{emptyCopy}</p>;
+    counter('review.card.rated', { rating: String(rating) });
+    handleNext(); // Advances + re-hides answer.
+    setPendingRating(false);
+  } catch {
+    // Server action threw (network, etc.). Don't log error.message — could
+    // contain serialized server state.
+    setRatingError(t('review.rating_error'));
+    setPendingRating(false);
   }
-
-  const card = cards[index];
-  const atEnd = index >= cards.length - 1;
-
-  const handleReveal = () => {
-    setRevealed((r) => {
-      // Only count REVEAL events (false → true), not hide-toggles.
-      if (!r) counter('review.card.revealed', { card_id: card.id });
-      return !r;
-    });
-  };
-  const handleNext = () => {
-    if (atEnd) return;
-    setIndex((i) => i + 1);
-    setRevealed(false);
-  };
-
-  return (
-    <section aria-labelledby="card-heading" className="max-w-xl">
-      {/* tabIndex=-1 makes the heading programmatically focusable so the
-          useEffect above can move focus to it on next-card. The sr-only
-          class keeps it visually hidden; AT users hear "Card N of M". */}
-      <h2 id="card-heading" ref={headingRef} tabIndex={-1} className="sr-only">
-        Card {index + 1} of {cards.length}
-      </h2>
-
-      <div className="border border-brand-100 rounded-md p-6 bg-white">
-        {/* Plain-text node: React escapes HTML by default. NEVER use
-            dangerouslySetInnerHTML on these fields — see issue #38 +
-            COMMENT ON COLUMN srs_cards.question. */}
-        <p className="text-brand-900 text-lg mb-4 whitespace-pre-wrap">
-          {card.question}
-        </p>
-
-        <div aria-live="polite" aria-atomic="true">
-          {revealed && (
-            <p className="text-brand-900 mt-4 pt-4 border-t border-brand-100 whitespace-pre-wrap">
-              {/* Same plain-text guarantee. */}
-              {card.answer}
-            </p>
-          )}
-        </div>
-      </div>
-
-      <div className="mt-4 flex gap-2">
-        <button
-          type="button"
-          onClick={handleReveal}
-          aria-pressed={revealed}
-          className="bg-brand-900 text-white px-4 py-2 rounded-md min-h-[44px]"
-        >
-          {revealed ? t('review.hide_answer') : t('review.show_answer')}
-        </button>
-        <button
-          type="button"
-          onClick={handleNext}
-          disabled={atEnd}
-          className="bg-white text-brand-900 border border-brand-100 px-4 py-2 rounded-md min-h-[44px] disabled:bg-brand-50 disabled:cursor-not-allowed"
-        >
-          Next card
-        </button>
-      </div>
-
-      <p className="mt-2 text-sm text-brand-700">
-        {index + 1} / {cards.length}
-      </p>
-    </section>
-  );
-}
-```
-
-### C. XSS-safety test pattern
-
-```ts
-// apps/web/components/ReviewDeck.test.tsx
-import { describe, it, expect } from 'vitest';
-import { renderToStaticMarkup } from 'react-dom/server';
-import { ReviewDeck } from '../app/review/ReviewDeck';
-
-describe('ReviewDeck XSS safety (issue #38)', () => {
-  it('escapes a script-tag payload in question', () => {
-    const html = renderToStaticMarkup(
-      <ReviewDeck
-        cards={[{ id: '1', question: '<script>alert(1)</script>', answer: 'x' }]}
-        emptyCopy="empty"
-      />,
-    );
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-    expect(html).not.toContain('<script>alert(1)</script>');
-  });
-
-  it('does not leak the answer markup before reveal', () => {
-    const html = renderToStaticMarkup(
-      <ReviewDeck
-        cards={[{ id: '1', question: 'q', answer: '<script>alert(2)</script>' }]}
-        emptyCopy="empty"
-      />,
-    );
-    // Answer block only renders when revealed=true; default state is
-    // unrevealed, so neither the raw nor the escaped payload should appear.
-    expect(html).not.toContain('<script>alert(2)</script>');
-    expect(html).not.toContain('alert(2)');
-  });
-
-  // Interaction tests (reveal toggle, next-card index, empty state) use
-  // the same renderToStaticMarkup pattern with a small <ReviewDeck>
-  // wrapper that pre-seeds state via initial props passed through a
-  // `__testInitial` prop guarded with a one-line justification, OR
-  // alternatively re-renders after a useState mutation by testing the
-  // pure handler functions extracted from the component body. Pick one
-  // approach in implementation; council can flag preference.
-});
-```
-
-**Why `renderToStaticMarkup` instead of `@testing-library/react`:** vitest env is `node` (`apps/web/vitest.config.ts:8`); jsdom is not configured. Adding jsdom + testing-library is a 2-package new-runtime-dep change that needs its own justification. `renderToStaticMarkup` exists in `react-dom/server` (`react-dom@^19` is already in `apps/web/package.json`). Sufficient to verify the XSS non-negotiable: React's text-node default escapes the payload at server-render time. The same escaping applies on the client — React's renderer uses the same text-escaping path.
-
-**Council may push back on this and require jsdom + testing-library for stronger interaction-level tests.** That's a fair ask; if so, fold by adding `jsdom` + `@testing-library/react` + `@testing-library/jest-dom` and rewriting the interaction tests with `render()` + `userEvent`. New runtime deps trigger the standard cost-posture check (none — dev-only). Open question for council: is the `renderToStaticMarkup` proof of XSS-safety sufficient, or does the interaction surface (toggle / next-card) need DOM-level assertion?
-
-### D. i18n keys
-
-Add to `apps/web/lib/i18n.ts`:
-
-```ts
-type Key =
-  | ...existing...
-  | 'review.heading'
-  | 'review.empty'
-  | 'review.show_answer'
-  | 'review.hide_answer';
-
-const STRINGS: Record<Key, string> = {
-  ...,
-  'review.heading': 'Review',
-  'review.empty': 'No flashcards yet. Upload a PDF to generate flashcards.',
-  'review.show_answer': 'Show answer',
-  'review.hide_answer': 'Hide answer',
-  'review.load_error': "Couldn't load your flashcards. Please refresh in a moment.",
 };
 ```
 
-### E. Accessibility
+```tsx
+// JSX additions, rendered only when revealed:
+{revealed && (
+  <div className="mt-4 flex gap-2 flex-wrap" role="group" aria-label="Rate this card">
+    <button type="button" onClick={() => handleRate(1)} disabled={pendingRating}
+      className="bg-danger text-white px-4 py-2 rounded-md min-h-[44px]">
+      {t('review.rating.again')}
+    </button>
+    <button type="button" onClick={() => handleRate(2)} disabled={pendingRating}
+      className="bg-warning text-brand-900 px-4 py-2 rounded-md min-h-[44px]">
+      {t('review.rating.hard')}
+    </button>
+    <button type="button" onClick={() => handleRate(3)} disabled={pendingRating}
+      className="bg-success text-white px-4 py-2 rounded-md min-h-[44px]">
+      {t('review.rating.good')}
+    </button>
+    <button type="button" onClick={() => handleRate(4)} disabled={pendingRating}
+      className="bg-brand-900 text-white px-4 py-2 rounded-md min-h-[44px]">
+      {t('review.rating.easy')}
+    </button>
+  </div>
+)}
+{ratingError && (
+  <p role="alert" className="mt-2 text-danger text-sm">{ratingError}</p>
+)}
+```
 
-- `aria-live="polite"` on the answer container so screen readers announce reveal without interrupting.
-- `aria-pressed` on the reveal button so the toggle state is exposed.
-- `min-h-[44px]` on both buttons matches the existing dashboard pattern (target-size).
-- Card heading (`Card N of M`) is `sr-only` AND `tabIndex={-1}` so the `useEffect` can move focus to it on next-card. AT users hear "Card N of M" announced; visual focus is invisible (sr-only, no outline interference).
-- `useEffect` skips the focus move on first render — page-load doesn't yank focus from the browser's default landing spot.
-- Color tokens are existing `brand-*` / `danger` from `globals.css` — already palette-checked by `tests/a11y/smoke.spec.ts` for contrast.
-- `whitespace-pre-wrap` preserves linebreaks Claude emits in long-form answers (mirrors how the prompt was tuned in `packages/prompts/src/flashcard-gen/v1.md`).
+**a11y:**
+- `role="group"` + `aria-label="Rate this card"` so screen readers announce the rating cluster as a unit.
+- `disabled={pendingRating}` prevents double-submit and conveys state to AT.
+- `min-h-[44px]` on every rating button (touch target).
+- Color tokens: `bg-danger` (Again), `bg-warning` (Hard), `bg-success` (Good), `bg-brand-900` (Easy). All exist in `globals.css`; contrast verified by the existing `axe-core` smoke test (extend the smoke spec to include the rating chrome).
+- The "Next card" button is REPLACED by the 4 rating buttons during the rated phase — once a card is rated, we auto-advance, so a separate "Next" is unnecessary in the rated state. The existing "Next card" button remains visible WHEN NOT REVEALED (lets the user skip a card without rating it).
 
-### F. Route-level test (`apps/web/tests/unit/review-page.test.ts`)
+### E. i18n keys
 
-Mirrors `auth-callback-route.test.ts` shape:
-
-- Stub `next/navigation`'s `redirect` with `vi.fn()` that throws (Next's actual behavior).
-- Stub `supabaseForRequest` to return a builder whose `.auth.getUser()` returns `{ data: { user: null } }`; assert `redirect('/auth')` was called.
-- Stub returning a real user; assert the chain `from('srs_cards').select(...).order('created_at',{ascending:false}).limit(20)` was called against the RLS-scoped client (NOT `supabaseService`).
-- Assert no call to `supabaseService` from the page (RLS-only path; service-role would bypass cohort isolation and is forbidden for this read).
-- **Bugs r1 fold:** stub the select to return `{ data: null, error: { name: 'PostgresError', code: '42P01', message: 'card body sample text that MUST NOT be logged' } }`; assert (a) the page renders the `review.load_error` copy, (b) `console.error` is called with `errorName + code + user_id` only — assert the spied call args do NOT contain the substring "card body sample text" or any portion of the error message, (c) `counter('review.page.load_failed', ...)` was called.
-- **Bugs r1 fold:** stub the select to return cards including `{ id, question: '<script>alert(1)</script>', answer: 'x' }`; assert `console.error` was NOT called for any non-error path, AND assert `counter` was called with `review.page.viewed` and `card_count` matching the stubbed array length — but never with the card content (positive assertion: counter labels' values do not include the script payload).
+```ts
+'review.rating.again': 'Again',
+'review.rating.hard': 'Hard',
+'review.rating.good': 'Good',
+'review.rating.easy': 'Easy',
+'review.rating_error': "Couldn't save your rating. Please try again.",
+'review.rating_pending': 'Saving…',
+```
 
 ## Non-negotiables (must hold; council will not override)
 
-- **No `dangerouslySetInnerHTML` on `srs_cards.question` or `srs_cards.answer`.** XSS surface; mandated by issue #38 + the migration's `COMMENT ON COLUMN`.
-- **RLS-only read.** Use `supabaseForRequest`, never `supabaseService`. The `/review` page is a per-user surface; service-role would bypass `srs_cards_own` policy at `supabase/migrations/20260417000002_rls_policies.sql:118-121`.
-- **Auth redirect on unauthenticated.** Match `apps/web/app/page.tsx:11-14` exactly; do not render an empty page or a "please sign in" message in-place (existing UX contract).
-- **Plain-text rendering.** No markdown library, no HTML parsing. v0 is text-node-only.
-- **Server → client prop boundary narrows to `{id, question, answer}`.** Never serialize `user_id` / `cohort_id` to the client.
-- **XSS-payload unit test exists and passes.** Acceptance-criteria checkbox in issue #38.
-- **PII discipline on logging (council r1 security non-negotiable):** `srs_cards.question` and `srs_cards.answer` MUST NOT be logged on any path. Error logs include only `errorName`, `code`, and `user_id` — never the message body, since some PostgREST messages echo query text. A test asserts the error-path log args do not contain stubbed message content. Comment at the page-load callsite codifies the rule.
-- **Graceful error UI on query failure (council r1 bugs ask):** `{ error }` branch renders the `review.load_error` banner and increments `review.page.load_failed`; never falls through to the Next.js 500.
-- **Focus management on next-card (council r1 a11y ask):** focus moves to the sr-only card heading on `index` change (not first render), so screen-reader users hear the new card position.
+- **Atomicity:** card state update + review_history insert MUST be in a single Postgres transaction. The `fn_review_card` SQL function is the boundary.
+- **`security invoker` on `fn_review_card`:** never `security definer`; `auth.uid()` must flow through to RLS.
+- **Rating validation BEFORE DB call:** server action rejects non-`{1,2,3,4}` ratings + non-UUID `cardId` shapes before any Supabase call. Defense in depth: SQL function also rejects, but the server-action rejection is the cheap-and-loud path.
+- **PII discipline on logging:** server action error logs include `errorName` + `code` + `user_id` + `card_id` only; never `error.message`, never card content. ErrorBoundary log shape preserved.
+- **No service-role client in the rating path:** all reads + the RPC call go through `supabaseForRequest`. RLS is the security model.
+- **`fsrs_state = {}` is treated as "new card" and initialized via `emptyFsrsState()`:** never passed directly to `nextState()` (would crash on missing fields).
+- **Auth gate:** unauthenticated server action calls return `{ok: false, errorKind: 'unauthenticated'}`; client navigates to `/auth`. NEVER mutate without an authenticated `user.id`.
 
-## Tests
+## Tests (per the new rebuttal-protocol failure-mode requirement)
 
-- `apps/web/components/ReviewDeck.test.tsx` — XSS escape (question + answer), empty state, reveal toggle behavior, next-card behavior, reveal-counter only fires on false→true (not hide). Target ≥7 cases.
-- `apps/web/tests/unit/review-page.test.ts` — auth redirect, RLS-only read, no service-role call, error-branch renders banner + logs PII-safe shape, view-counter fires on success. Target ≥6 cases.
-- `apps/web/tests/a11y/smoke.spec.ts` — extend with a static-HTML pass that includes a representative card layout (one card div + two buttons + sr-only heading). Verifies palette + target-size for the new surface ahead of the dev-server CI integration.
+Each component has BOTH happy-path AND failure-mode coverage. Failure-mode coverage is the proof per `CLAUDE.md` §"Rebutting council findings" rule #2.
 
-`npm run lint`, `npm run typecheck`, `npm test` all pass for `apps/web`.
+### `packages/lib/srs/src/index.test.ts` (algorithm contract; ~12 tests)
+
+- **Happy path:**
+  - `emptyFsrsState()` produces a state with `state: 0, reps: 0, lapses: 0`.
+  - `nextState(empty, RATING_GOOD)` advances `reps` to 1 and sets `due` in the future.
+- **Failure modes:**
+  - `nextState(empty, RATING_AGAIN)` keeps `reps` low + sets `due` very soon (< 1 day).
+  - `nextState(reviewed, RATING_AGAIN)` increments `lapses` (the algorithm's lapse counter).
+  - **Ordering invariant:** for any state, `due(EASY) > due(GOOD) > due(HARD) > due(AGAIN)`. Property test across 20 random states. **This is the failure-mode proof for the algorithm: if the math breaks, ordering breaks.**
+  - `isValidRating(0)`, `isValidRating(5)`, `isValidRating('3')`, `isValidRating(null)`, `isValidRating(undefined)` all return false. `isValidRating(1..4)` all return true.
+  - `nextState(state, 5 as RatingValue)` — passing an invalid rating that's been (incorrectly) cast — does NOT silently produce a result; either throws or returns a sentinel. (ts-fsrs behavior TBD; test pins the contract whichever way it goes.)
+  - `nextState` is determinism-tolerant: re-calling with same args + same `now` produces the same `state` shape, same `reps`/`lapses`/`state`. Fuzz-on may vary `due` by ±a small fraction; test asserts ordering, not exact value.
+
+### `apps/web/app/review/actions.test.ts` (server-action behavior; ~10 tests)
+
+- **Happy path:**
+  - `submitReview(validId, 3)` with authed user + valid card → `{ok: true}` + `fn_review_card` RPC called with correct args + `review.rating.submitted` counter fired.
+  - `submitReview` on a never-reviewed card (`fsrs_state = {}`) → `nextState` is called with `emptyFsrsState()`, not `{}` directly.
+- **Failure modes (the rebuttal-protocol failure-mode proof for this surface):**
+  - `submitReview(validId, 0)` → `{ok: false, errorKind: 'invalid_rating'}` + `review.rating.rejected` counter + NO Supabase calls made.
+  - `submitReview(validId, 5)` → same.
+  - `submitReview('not-a-uuid', 3)` → `{ok: false, errorKind: 'invalid_rating'}` + counter + no Supabase calls.
+  - `submitReview(validId, 3)` with no auth user → `{ok: false, errorKind: 'unauthenticated'}` + no `from('srs_cards')` call.
+  - Card not owned by user (RLS blocks the select → returns null) → `{ok: false, errorKind: 'card_not_found'}` + log shape verified PII-safe (negative-assert sentinel string).
+  - `fn_review_card` RPC returns error → `{ok: false, errorKind: 'persist_failed'}` + log shape PII-safe + `review.rating.failed` counter with `reason: 'persist_failed'`.
+  - **PII negative assertion:** stub the RPC to return an error with `message: 'CARDCONTENT_SECRET_DO_NOT_LOG: relation x'` — assert `JSON.stringify(spy.mock.calls)` does NOT contain the sentinel.
+  - Counter labels never include card content (negative assert).
+
+### `apps/web/components/ReviewDeck.test.tsx` (UI integration; ~6 new tests)
+
+- Rating buttons NOT rendered when `revealed === false` (assert markup absence).
+- Rating buttons rendered when `revealed === true`.
+- Rating buttons have `min-h-[44px]` + `role="group"` + `aria-label`.
+- Clicking Again/Hard/Good/Easy fires `submitReview` with the right rating value (mock the action).
+- On `{ok: false}`, error banner renders with `role="alert"`.
+- On `{ok: true}`, advances to next card (index increments + answer re-hides).
+- **Failure-mode:** double-click on a rating button doesn't fire `submitReview` twice (`pendingRating` guard).
+
+### `supabase/tests/fn_review_card.sql` (pgTAP; non-load-bearing per #7)
+
+- Function signature exists.
+- User A cannot review User B's card (returns RLS error).
+- Invalid rating raises `22023`.
+- Atomicity: when called inside a savepoint that we then roll back, neither table changes (proves the function is participating in the transaction).
+
+**Note per the new rebuttal-protocol rule:** the pgTAP suite is `continue-on-error` and known-flaky (#7). It cannot be cited as the proof for the RLS rebuttal protocol. The `supabaseForRequest` server-action tests above ARE the consistently-passing failure-mode proof for the `card_not_found` (RLS-blocked) path.
 
 ## Risks
 
-1. **`renderToStaticMarkup` may not satisfy council's "interaction tests" bar.** Fold path: add `jsdom` + `@testing-library/react` + `@testing-library/jest-dom` (dev-deps only; no runtime cost), switch test environment to `jsdom` for `*.test.tsx` only (`environmentMatchGlobs` in vitest config), rewrite interaction tests with `render()` + `userEvent`. Defer until council asks.
-2. **Server Component cookie-write Proxy in `/review` page context.** The `supabaseForRequest` Proxy logs nothing on its own (`apps/web/lib/supabase.ts:65-72`); SC context throws are swallowed silently per the "expected RSC context" branch. No new behavior needed. Tested at `supabase.test.ts`.
-3. **`due_at` filter omitted in v0.** Cards never become "due-only" in this PR; user sees all of their cards. Acceptable v0 trade — FSRS scoring is the trigger for due-filtering. Add the filter the same week the rating UI lands so the partial index pays off.
-4. **Card text length unbounded.** `whitespace-pre-wrap` + `max-w-xl` handles long cards visually; no explicit truncation. The flashcard prompt (`packages/prompts/src/flashcard-gen/v1.md`) targets concise cards and Claude's output rarely exceeds ~200 chars per side, but a malicious prompt-injected PDF could produce arbitrarily long output. Considered acceptable for v0 — long cards degrade UX, do not crash the page.
-5. **No realtime / optimistic updates.** A user generating new flashcards via PDF upload then visiting `/review` requires a manual refresh. Acceptable v0; Realtime is a separate slice (the dashboard already uses it for `ingestion_jobs` via `IngestionStatusTable`).
-6. **Null `question`/`answer` placeholder rendering — REBUTTED, no fold (council r1 bugs ask).** Council r1 asked for a `[No content]` placeholder when either field is null. The schema at `supabase/migrations/20260417000001_initial_schema.sql:152-153` declares both columns `text not null`; the column-level constraint is enforced at write time by Postgres and at row time by `supabase-js`'s typed inserts. A null arriving at this read would mean the constraint was bypassed (impossible without a manual `ALTER TABLE`) — defensive rendering for a schema-impossible value is dead code. **Action:** none. The plan's TypeScript types (`SrsCard.question: string`, not `string | null` at `packages/db/src/types.ts:92-93`) reflect the schema and the code naturally cannot encounter the null path. If a future migration relaxes `not null`, the type widens and the compiler forces a placeholder decision then — which is the correct moment for it.
-
-## Metrics (council r1 product fold)
-
-Per CLAUDE.md "Cost posture" + the council r1 product persona kill criterion:
-
-- `review.page.viewed{user_id, card_count}` — fired once per successful page load. Powers engagement floor.
-- `review.page.load_failed{user_id}` — fired on the `error`-branch in `ReviewPage`. Should be ≪ 1% of `viewed` if Supabase is healthy.
-- `review.card.revealed{card_id}` — fired only on the false→true transition of the reveal toggle (not on hide). Direct measure of card engagement; the kill criterion below reads off this counter.
-
-**Kill criterion** (per council r1 product): zero `review.card.revealed` events from the active cohort one week post-merge → flashcard-product hypothesis is invalid → revisit prompt + UX before adding FSRS scoring.
-
-`user_id` is included as a label for support correlation; `card_id` is the `srs_cards.id` UUID — neither is PII (they are pseudonyms generated server-side). Card content is NEVER a label.
+1. **`ts-fsrs` runtime dep adds bundle size.** ~10kb min+gz. The lib is server-side only (the algorithm runs in the server action), so the client bundle is unaffected. `ts-fsrs` only needs to be installed in the workspace package that imports it (`packages/lib/srs/`). Confirm via bundle-analyzer post-merge.
+2. **Algorithm-correctness risk if `ts-fsrs` has bugs.** Mitigated by the ordering-invariant property test in §Tests (if math breaks, ordering breaks). FSRS-5 is a well-published spec; lib is the canonical TypeScript port.
+3. **`security invoker` + RLS interaction subtleties.** The function's `select user_id into v_user_id` runs under the caller's auth context — if RLS blocks the select, `v_user_id` is null and we raise `42501`. Tested via the `card_not_found` server-action test path (consistently passing).
+4. **Rapid-rating race conditions.** User clicks Again then immediately Good for the same card before the first server action returns. Mitigated by `pendingRating` state in the client + `useState` updater discipline. Tested.
+5. **`ts-fsrs` API stability.** Pin to an exact version in `package.json`; document in a comment that bumps need a council round (algorithm changes between FSRS-4 and FSRS-5 mattered; future bumps could too).
+6. **Migration ordering.** New migration `20260424000001` runs after the existing `20260422000001_srs_cards_unique.sql`. Idempotent (uses `create or replace function`). Safe to re-run.
+7. **No "undo" for an accidental rating.** Acknowledged out-of-scope; the lapse counter recovers from one wrong click via the next review's Again rating. Real undo is a UX feature for v2.
 
 ## Cost
 
-Zero net cost. No new external API calls, no new model usage, no new runtime dependencies. The route is a single Postgres `select` per page-load (RLS-scoped, indexed on `(user_id, due_at)` partial — though this query doesn't use that index since `due_at` filter is omitted; falls back to `srs_cards_note_id_idx` + table scan within the user's cards subset, which is fine at v0 cardinality).
+Zero net runtime cost. The `submitReview` server action makes 1 Supabase select + 1 RPC per rating click. The FSRS algorithm runs in the server action (no LLM call). Estimate per active user: ~50 ratings/week × 4 ops/rating × $0 (covered by Supabase base fee) = $0/user/month.
 
-Per-callsite cost annotation (CLAUDE.md "Cost posture" rule) added at the page-load query: `// /review page-load: 1 supabase select per request, no LLM calls. Free.`
+`ts-fsrs` is a one-time dep cost (no per-call cost). Bundle size: server-side only, no impact on client.
 
 ## Out of scope (for the avoidance of doubt)
 
-- FSRS scoring + `review_history` writes.
-- Due-now filter.
-- Markdown rendering.
-- Card edit / delete.
-- Keyboard shortcuts.
-- Realtime subscription.
-- Bulk-review session.
-- Mobile gesture support beyond the 44px-target buttons.
+- Due-now filter on `/review` initial query (separate ticket; comes after rating UX is validated).
+- Per-user FSRS parameter tuning.
+- Multi-deck management / Anki-style organization.
+- Review session boundaries.
+- Heatmap / streak tracking.
+- Undo last review.
+- Mobile gesture rating (swipe).
+- Keyboard shortcuts (1/2/3/4) — small follow-up.
 
-## Acceptance criteria (from issue #38, expanded)
+## Acceptance criteria
 
-- [ ] Route exists at `/review`.
-- [ ] Authenticated user sees own cards; unauthenticated user redirects to `/auth`.
-- [ ] Empty state copy renders for zero cards.
-- [ ] No `dangerouslySetInnerHTML` on `question` or `answer` (grep-verifiable).
-- [ ] XSS unit test with `<script>alert(1)</script>` payload passes (escaped output).
-- [ ] WCAG AA contrast on the card surface (existing `brand-*` palette; smoke test extended).
-- [ ] `aria-live` region announces show-answer.
-- [ ] `aria-pressed` exposes reveal-button toggle state.
-- [ ] All buttons ≥44px touch target.
-- [ ] Focus moves to card heading on next-card (not on first render).
-- [ ] Error branch renders the `review.load_error` banner; no Next.js 500 page on Supabase failure.
-- [ ] `console.error` on the error path includes `errorName` + `code` + `user_id` only — never card content (test asserts negative).
-- [ ] `review.page.viewed`, `review.page.load_failed`, `review.card.revealed` counters fire on their respective paths.
+- [ ] User can click Again/Hard/Good/Easy after revealing an answer; click is disabled when answer is hidden.
+- [ ] Click triggers `submitReview` server action; response advances to next card on success.
+- [ ] `srs_cards.fsrs_state` + `srs_cards.due_at` updated atomically with `review_history` insert.
+- [ ] Never-reviewed card (`fsrs_state = {}`) initializes via `emptyFsrsState()` on first review.
+- [ ] Unauthenticated rating attempts return `unauthenticated` error kind, no DB writes.
+- [ ] User cannot review another user's card (RLS blocks via `security invoker`).
+- [ ] Invalid rating values rejected before any DB call.
+- [ ] Server-action error logs are PII-safe (failure-mode test asserts negatively against sentinel).
+- [ ] Counter labels never include card content (failure-mode test asserts negatively).
+- [ ] `ordering invariant` property test passes for FSRS algorithm contract.
+- [ ] All buttons ≥44px touch target, `role="group"` on rating cluster, `aria-label` present.
 - [ ] `npm run lint`, `npm run typecheck`, `npm test` pass.
 - [ ] Council PROCEED on the impl-diff round.
 
 ## Council prompts (anticipated axes)
 
-- **Security:** XSS; service-role leakage; client-prop boundary; RLS coverage.
-- **Bugs:** empty array, single-card boundary (no "next" enabled), reveal-toggle interaction with next-card transitions, screen-reader announcement timing.
-- **Accessibility:** target size, contrast, `aria-live` politeness, focus management on next-card (we don't move focus today; council may ask we do).
-- **Architecture:** Server/Client split, prop-boundary narrowing, force-dynamic on auth-gated route.
-- **Cost:** zero — should sail.
-- **Product:** is plain-text-only the right v0 (vs markdown)? Issue #38 says yes; council can flag for a future revisit.
+- **Security:** `security invoker` choice (not definer); RLS coverage on `fn_review_card`; PII-safe logging; rating validation before DB call.
+- **Bugs:** atomicity boundary (single SQL function vs two client calls); `fsrs_state = {}` new-card branch; double-click guard; rating range validation; concurrent-rating race.
+- **Architecture:** wrapper-package pattern for `ts-fsrs`; server-action vs route-handler choice; SQL-function-as-transaction-boundary pattern.
+- **Cost:** zero runtime — should sail. New runtime dep — council scrutiny on `ts-fsrs` choice vs minimal in-house.
+- **Product:** Again/Hard/Good/Easy is the canonical FSRS rating set; closes the loop.
+- **a11y:** rating button cluster `role="group"` + `aria-label`; pending state announced via `disabled` + `aria-busy`; focus-management when card auto-advances after rating.
