@@ -127,6 +127,7 @@ This rule (added 2026-04-23, PR #43) closes a recurring failure mode: the raw-cr
 - **No untrusted ingested content in `dangerouslySetInnerHTML`.** Sanitize or render as text.
 - **No PII or API keys in logs.** Redact before logging.
 - **Rate-limit every Claude/Gemini/embedding/transcription call.** Budget is $75–110/mo total.
+- **Rate limiters on state-changing endpoints (mutations, RPC writes, server actions) MUST fail-closed.** When the limiter service (Upstash) is unavailable, the action returns an error and skips the mutation; it does NOT proceed unguarded. **Fail-open is the documented exception, currently used only for Tier D (auth-callback click-through, where the alternative would block legitimate magic-link sign-ins during a transient outage and Supabase's own project-level rate limits provide the backstop).** Any new fail-open rate-limiter must be explicitly justified in the plan + endorsed by council. Audit at `docs/security/rate-limiter-audit.md`. Rule added 2026-04-25 (PR #50 r3 fold) after PR #48 shipped Tier E fail-open under a misread of "Tier B/D pattern" (Tier B is fail-closed; only D is open). Hot-fixed in PR #51.
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`). See `CONTRIBUTING.md`.
 - **TypeScript strict mode.** No `any` without a one-line justification comment.
 
