@@ -28,7 +28,14 @@ type Key =
   | 'review.hide_answer'
   | 'review.next_card'
   | 'review.load_error'
-  | 'review.render_error';
+  | 'review.render_error'
+  | 'review.rating.again'
+  | 'review.rating.hard'
+  | 'review.rating.good'
+  | 'review.rating.easy'
+  | 'review.rating_error'
+  | 'review.rating_rate_limit_error'
+  | 'review.rating_pending';
 
 const STRINGS: Record<Key, string> = {
   'app.name': 'LLM Wiki · Study Group',
@@ -59,6 +66,14 @@ const STRINGS: Record<Key, string> = {
   'review.load_error': "Couldn't load your flashcards. Please refresh in a moment.",
   'review.render_error':
     "Something went wrong rendering this card. Refresh to try again.",
+  'review.rating.again': 'Again',
+  'review.rating.hard': 'Hard',
+  'review.rating.good': 'Good',
+  'review.rating.easy': 'Easy',
+  'review.rating_error': "Couldn't save your rating. Please try again.",
+  'review.rating_rate_limit_error':
+    "You're rating too quickly. Please wait a moment.",
+  'review.rating_pending': 'Saving…',
 };
 
 export function t(key: Key): string {

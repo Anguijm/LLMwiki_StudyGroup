@@ -34,6 +34,45 @@ test.describe('a11y smoke', () => {
     expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
   });
 
+  test('/review rating cluster — PR #48 chrome (color-contrast on rating buttons)', async ({ page }) => {
+    // Council r1 a11y fold (PR #48): verify bg-warning + text-brand-900
+    // (the Hard button) passes WCAG AA 3:1 for UI components. axe-core's
+    // color-contrast rule fails the test if the chosen amber is too
+    // light against the dark text. Re-uses the static-HTML pattern + the
+    // same 4 brand tokens (danger / warning / success / brand-900) the
+    // ReviewDeck buttons use.
+    await page.setContent(`
+      <!doctype html>
+      <html lang="en"><head><title>review-rating</title></head>
+      <body style="background:#fff;color:#0f172a;font-family:sans-serif;padding:1rem">
+        <main>
+          <h1 style="font-size:1.5rem;color:#0f172a">Review</h1>
+          <section aria-labelledby="card-heading" style="max-width:36rem">
+            <h2 id="card-heading" tabindex="-1"
+                style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0">
+              Card 1 of 1
+            </h2>
+            <div style="border:1px solid #cbd5e1;border-radius:0.375rem;padding:1.5rem;background:#fff">
+              <p style="color:#0f172a;font-size:1.125rem;margin:0">Sample question text</p>
+              <div aria-live="polite" aria-atomic="true">
+                <p style="color:#0f172a;margin-top:1rem;padding-top:1rem;border-top:1px solid #e2e8f0">Sample answer text</p>
+              </div>
+            </div>
+            <div role="group" aria-label="Rate this card" style="margin-top:1rem;display:flex;gap:0.5rem;flex-wrap:wrap">
+              <button type="button" style="background:#b91c1c;color:#fff;padding:0.5rem 1rem;border-radius:0.375rem;min-height:44px;border:none">Again</button>
+              <button type="button" style="background:#f59e0b;color:#0f172a;padding:0.5rem 1rem;border-radius:0.375rem;min-height:44px;border:none">Hard</button>
+              <button type="button" style="background:#15803d;color:#fff;padding:0.5rem 1rem;border-radius:0.375rem;min-height:44px;border:none">Good</button>
+              <button type="button" style="background:#0f172a;color:#fff;padding:0.5rem 1rem;border-radius:0.375rem;min-height:44px;border:none">Easy</button>
+            </div>
+          </section>
+        </main>
+      </body></html>`);
+    const results = await new AxeBuilder({ page })
+      .withRules(['color-contrast', 'target-size'])
+      .analyze();
+    expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
+  });
+
   test('/review surface placeholder — issue #38 chrome', async ({ page }) => {
     // Mirrors what /review renders: page heading, sr-only card heading
     // (programmatically focusable), one card surface with question +

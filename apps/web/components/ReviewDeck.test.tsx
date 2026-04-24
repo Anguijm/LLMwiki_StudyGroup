@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { ReviewDeck, nextIndex } from '../app/review/ReviewDeck';
+import {
+  ReviewDeck,
+  nextIndex,
+  generateIdempotencyKey,
+} from '../app/review/ReviewDeck';
 
 // Vitest env is `node` (apps/web/vitest.config.ts) — no jsdom. Static
 // render coverage uses `react-dom/server`. Dynamic interaction (reveal
@@ -163,5 +167,81 @@ describe('nextIndex helper (council r2 double-click safety)', () => {
     nextIndex(1, 5);
     expect(consoleSpy).not.toHaveBeenCalled();
     consoleSpy.mockRestore();
+  });
+});
+
+// ===== PR #48 — FSRS rating ===========================================
+//
+// renderToStaticMarkup gives us the initial-render markup (revealed=false).
+// The rating cluster only renders after answer reveal, which requires
+// state mutation that vitest-node can't drive. Interaction tests for the
+// reveal→rate→advance flow live in:
+//   - actions.test.ts (server-action contract; load-bearing per the
+//     rebuttal-protocol failure-mode rule)
+//   - tests/a11y/smoke.spec.ts (rating cluster static markup verification)
+//   - future: a Playwright spec once the dev-server CI gate exists
+// What we CAN test here without jsdom is the pure helper +
+// initial-render shape:
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+describe('generateIdempotencyKey', () => {
+  it('returns a UUIDv4-shaped string when crypto.randomUUID is available', () => {
+    const key = generateIdempotencyKey();
+    expect(key).toMatch(UUID_RE);
+  });
+
+  it('successive calls produce distinct keys (no accidental reuse)', () => {
+    const a = generateIdempotencyKey();
+    const b = generateIdempotencyKey();
+    const c = generateIdempotencyKey();
+    expect(a).not.toBe(b);
+    expect(b).not.toBe(c);
+    expect(a).not.toBe(c);
+  });
+
+  it('returns empty string when crypto.randomUUID is unavailable (council r2 fold)', () => {
+    // globalThis.crypto is a getter on Node 25 — direct assignment
+    // throws. vi.stubGlobal handles the restore + assignment.
+    const originalCrypto = globalThis.crypto;
+    vi.stubGlobal('crypto', { ...originalCrypto, randomUUID: undefined });
+    try {
+      expect(generateIdempotencyKey()).toBe('');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('ReviewDeck rating cluster (initial-render markup)', () => {
+  it('does NOT render rating buttons when answer is hidden (default state)', () => {
+    const html = renderToStaticMarkup(
+      <ReviewDeck
+        cards={[{ id: '1', question: 'q', answer: 'a' }]}
+        emptyCopy="empty"
+      />,
+    );
+    // Rating button labels must not appear in the unrevealed state.
+    expect(html).not.toContain('Again');
+    expect(html).not.toContain('Hard');
+    expect(html).not.toContain('Good');
+    expect(html).not.toContain('Easy');
+    // Rating cluster's role/label also absent.
+    expect(html).not.toContain('Rate this card');
+  });
+
+  it('keeps the Show answer + Next card buttons visible in the unrevealed state', () => {
+    const html = renderToStaticMarkup(
+      <ReviewDeck
+        cards={[
+          { id: '1', question: 'q1', answer: 'a1' },
+          { id: '2', question: 'q2', answer: 'a2' },
+        ]}
+        emptyCopy="empty"
+      />,
+    );
+    expect(html).toContain('Show answer');
+    expect(html).toContain('Next card');
   });
 });

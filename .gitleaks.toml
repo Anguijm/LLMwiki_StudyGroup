@@ -31,6 +31,12 @@ paths = [
   '''\.harness/last_council\.md''',
   '''\.harness/active_plan\.md''',
   '''\.harness/learnings\.md''',
+  # pgTAP tests use synthetic JWT-claim strings — e.g.,
+  # `set local request.jwt.claims = '{"sub":"<uuid>","role":"authenticated"}'`
+  # — to simulate authenticated users. The generic-api-key rule reads
+  # them as JWT-shaped tokens. Test fixtures only; real secrets would
+  # never intentionally land in pgTAP.
+  '''supabase/tests/.*\.sql''',
 ]
 # Placeholder strings used in examples and docs.
 regexes = [
