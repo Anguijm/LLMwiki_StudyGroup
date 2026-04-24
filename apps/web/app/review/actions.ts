@@ -37,6 +37,7 @@ export interface SubmitReviewResult {
     | 'invalid_state'
     | 'concurrent_update'
     | 'rate_limited'
+    | 'limiter_unavailable'
     | 'unauthenticated'
     | 'unhandled';
 }
@@ -102,9 +103,12 @@ async function submitReviewImpl(
     return { ok: false, errorKind: 'unauthenticated' };
   }
 
-  // Per-user rate limit (Tier E, 30/min). Fail-closed on quota exceeded;
-  // fail-open on limiter unavailable (matches Tier B/D pattern — better
-  // to let a real user through than block on Upstash outage).
+  // Per-user rate limit (Tier E, 30/min). Fail-CLOSED on both quota
+  // exceeded AND limiter unavailable — matches Tier A/B/C pattern; only
+  // Tier D fails open as a documented exception for time-boxed click-
+  // through auth. A server-action mutation must not run unguarded
+  // during an Upstash outage (DoS exposure on fn_review_card).
+  // Council PR #50 r2 fold + PR #51 hot-fix.
   try {
     await getRatingLimiter().reserve(user.id);
   } catch (err) {
@@ -116,11 +120,17 @@ async function submitReviewImpl(
       return { ok: false, errorKind: 'rate_limited' };
     }
     if (err instanceof RatelimitUnavailableError) {
-      // Fail-open: continue. The limiter's own monitoring path logs the
-      // alert (Tier B/D pattern shipped in PR #28).
-    } else {
-      throw err;
+      console.error('[/review submitReview] limiter_unavailable', {
+        errorName: 'RatelimitUnavailableError',
+        user_id: user.id,
+      });
+      counter('review.rating.failed', {
+        reason: 'limiter_unavailable',
+        user_id: user.id,
+      });
+      return { ok: false, errorKind: 'limiter_unavailable' };
     }
+    throw err;
   }
 
   // Load the card's current state (RLS-scoped). If the user doesn't own

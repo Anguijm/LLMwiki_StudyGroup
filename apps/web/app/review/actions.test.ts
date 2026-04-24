@@ -156,17 +156,74 @@ describe('/review submitReview server action', () => {
     });
   });
 
-  it('fail-open on RatelimitUnavailableError: continues to DB', async () => {
+  it('limiter_unavailable: RatelimitUnavailableError → no DB call + distinct errorKind (PR #51 fail-CLOSED hot-fix)', async () => {
     getUserMock.mockResolvedValue({ data: { user: TEST_USER } });
     const { RatelimitUnavailableError } = await import('@llmwiki/lib-ratelimit');
     reserveMock.mockRejectedValueOnce(new RatelimitUnavailableError());
-    setSelectSuccess(emptyCardRow());
-    rpcMock.mockResolvedValue({ error: null });
 
     const { submitReview } = await import('./actions');
     const result = await submitReview(TEST_CARD_ID, 3, VALID_KEY);
-    expect(result.ok).toBe(true);
-    expect(fromMock).toHaveBeenCalledWith('srs_cards');
+
+    // The load-bearing assertion (council r1 non-negotiable on PR #51):
+    // no DB call when limiter is unavailable.
+    expect(result).toEqual({ ok: false, errorKind: 'limiter_unavailable' });
+    expect(fromMock).not.toHaveBeenCalled();
+    expect(rpcMock).not.toHaveBeenCalled();
+
+    // Counter fires with the new reason.
+    expect(counterMock).toHaveBeenCalledWith('review.rating.failed', {
+      reason: 'limiter_unavailable',
+      user_id: TEST_USER.id,
+    });
+
+    // PII-safe log shape: errorName + user_id only.
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '[/review submitReview] limiter_unavailable',
+      { errorName: 'RatelimitUnavailableError', user_id: TEST_USER.id },
+    );
+  });
+
+  it('generic error from limiter → top-level catch handles it as unhandled', async () => {
+    // Council r1 nice-to-have on PR #51: prove that if the limiter
+    // throws an unknown error type (not RateLimitExceededError, not
+    // RatelimitUnavailableError), it bubbles to the top-level try/catch
+    // and returns 'unhandled' rather than crashing.
+    getUserMock.mockResolvedValue({ data: { user: TEST_USER } });
+    reserveMock.mockRejectedValueOnce(new Error('surprise — unknown error type'));
+
+    const { submitReview } = await import('./actions');
+    const result = await submitReview(TEST_CARD_ID, 3, VALID_KEY);
+    expect(result).toEqual({ ok: false, errorKind: 'unhandled' });
+    expect(fromMock).not.toHaveBeenCalled();
+    expect(rpcMock).not.toHaveBeenCalled();
+  });
+
+  it('counter NOT polluted with limiter_unavailable when limiter throws an unknown type', async () => {
+    // Council r1 nice-to-have on PR #51: metrics integrity. Only
+    // recognized error types fire their specific counter; unknown types
+    // fire the unhandled counter via the top-level catch.
+    getUserMock.mockResolvedValue({ data: { user: TEST_USER } });
+    reserveMock.mockRejectedValueOnce(new Error('not a rate-limit error'));
+
+    const { submitReview } = await import('./actions');
+    await submitReview(TEST_CARD_ID, 3, VALID_KEY);
+
+    // No `limiter_unavailable` or `rate_limited` counter from the
+    // unknown-error path — those are reserved for typed failures.
+    const callsWithLimiterUnavailable = counterMock.mock.calls.filter(
+      ([_name, labels]) =>
+        (labels as { reason?: string })?.reason === 'limiter_unavailable',
+    );
+    const callsWithRateLimited = counterMock.mock.calls.filter(
+      ([_name, labels]) =>
+        (labels as { reason?: string })?.reason === 'rate_limited',
+    );
+    expect(callsWithLimiterUnavailable.length).toBe(0);
+    expect(callsWithRateLimited.length).toBe(0);
+    // The top-level catch fires its own counter.
+    expect(counterMock).toHaveBeenCalledWith('review.rating.failed', {
+      reason: 'unhandled',
+    });
   });
 
   // ===== RLS-blocked (council r1 security non-negotiable) ============
