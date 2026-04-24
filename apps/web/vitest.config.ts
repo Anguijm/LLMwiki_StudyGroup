@@ -11,6 +11,12 @@ export default defineConfig({
       'lib/**/*.test.ts',
       'components/**/*.test.ts?(x)',
       'tests/unit/**/*.test.ts',
+      // Discovered during PR #51 (hot-fix Tier E): app/**/*.test.ts was
+      // never matched by the prior pattern set, so the 16 actions.test.ts
+      // tests shipped in PR #48 were silently skipped. The "consistently
+      // passing" rule from CLAUDE.md was never verifiable for them. This
+      // pattern picks up co-located server-action test files.
+      'app/**/*.test.ts?(x)',
     ],
   },
   resolve: {

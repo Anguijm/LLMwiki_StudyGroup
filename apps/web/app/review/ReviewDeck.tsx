@@ -126,11 +126,16 @@ export function ReviewDeck({ cards, emptyCopy }: Props) {
       return;
     }
     if (!result.ok) {
-      // Distinct copy for rate-limit so user knows to slow down vs retry.
+      // Distinct copy for rate-limit AND limiter-unavailable so user
+      // knows whether to slow down (rate_limited) vs retry shortly
+      // (limiter_unavailable, transient outage). Hot-fix PR #51 (council
+      // PR #50 r2 fold) added the limiter_unavailable branch.
       const copyKey =
         result.errorKind === 'rate_limited'
           ? 'review.rating_rate_limit_error'
-          : 'review.rating_error';
+          : result.errorKind === 'limiter_unavailable'
+            ? 'review.rating_limiter_unavailable_error'
+            : 'review.rating_error';
       setRatingError(t(copyKey));
       // Council nice-to-have: PII-safe debug log of bounded enum.
       console.error('[ReviewDeck] rating_failed', { errorKind: result.errorKind });

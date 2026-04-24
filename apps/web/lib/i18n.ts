@@ -35,6 +35,7 @@ type Key =
   | 'review.rating.easy'
   | 'review.rating_error'
   | 'review.rating_rate_limit_error'
+  | 'review.rating_limiter_unavailable_error'
   | 'review.rating_pending';
 
 const STRINGS: Record<Key, string> = {
@@ -73,6 +74,8 @@ const STRINGS: Record<Key, string> = {
   'review.rating_error': "Couldn't save your rating. Please try again.",
   'review.rating_rate_limit_error':
     "You're rating too quickly. Please wait a moment.",
+  'review.rating_limiter_unavailable_error':
+    'Rating service is briefly unavailable. Please try again in a moment.',
   'review.rating_pending': 'Saving…',
 };
 
