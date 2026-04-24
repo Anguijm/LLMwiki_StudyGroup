@@ -707,3 +707,33 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
   2. **Defer-as-issue**: real work but separate scope (CI guardrails, monitoring, broader infrastructure). File the issue; don't fold into the current PR.
   3. **Rebut**: hallucinations, fabricated paths, claims grep-able to file:line as already-shipped. Cite tests where the §Rebutting-council-findings rule applies.
   The dispositions are NOT mutually exclusive within a single round — PR #50 r3 had all three categories.
+
+## 2026-04-25 — session-end handoff (window: 2026-04-23 to 2026-04-25)
+
+### KEEP
+
+- **Session shipped 4 PRs** (#48 FSRS, #49 gitignore orphan, #50 reflection, #51 hot-fix) and closed the SRS loop end-to-end. Per-PR reflections already in this file capture the substantive lessons; this entry is purely a forward-handoff pointer.
+- **The §"Rebutting council findings" rule #4 fired correctly for the first time in production (PR #50 r2 → fold, not rebut).** This is the load-bearing protocol moment of the session — the rule distinguished a real design error from a hallucination chain. Working hypothesis confirmed: structural rules from PR #43 work for plan/impl rounds; reflection PRs can still hallucinate but rule #4 is the correct disposition switch.
+
+### IMPROVE
+
+- **Test-config silent-skips are a class of bug worth a CI guardrail** (#52). PR #48 shipped 16 server-action tests that never ran for ~24 hours before PR #51 caught it. The "consistently passing test" requirement from CLAUDE.md was technically violated but invisibly — `npm test` reported passing because the file didn't appear in the output. Filed; awaits #52 impl in next session.
+- **Read external dep `.d.ts` BEFORE writing the wrapper.** PR #48's ts-fsrs v5 `learning_steps` field surprise cost a typecheck round-trip + 4 test fixture edits. Already documented in PR #48 reflection; carrying forward as a standing rule.
+
+### INSIGHT
+
+- **Three-disposition working model for council asks** (codified in PR #50 r3): **fold-now** (small permanent codification, e.g. CLAUDE.md additions), **defer-as-issue** (real but separate scope), **rebut** (file:line citations for hallucinations). A single round can have all three. PR #50 r3 exercised all three and produced a clean r4 PROCEED.
+- **The protocol's success signal is monotonic up-trend across plan→impl rounds.** PR #48 (r1→r2→r3 = 6/9/3 → 10/10/10 → 10/10/10) and PR #51 (r1→r2→r3 = 10/10/9 → 10/10/9 → 10/10/10) both displayed this. When trajectory is monotonic, the plan-first protocol is producing implementations that match the planned contract — that's the win condition.
+
+### COUNCIL
+
+- This entry's source PR (the session-end handoff) is council-required per CLAUDE.md (reflection content, regardless of diff size). Expected to clear in 1-2 rounds given the tightness of the additions; merge against "ready for human approval" gate per the PR #43 product-persona-r5 lesson.
+
+### Next-session pointer
+
+User's priority order at session close (2026-04-25):
+1. **#39 semantic chunking** — biggest v1 unlock for downstream handlers.
+2. **#52 CI guardrail for vitest-include coverage** — protects the "consistently passing test" rule.
+3. **Deploy-readiness validation** — apply the new migrations on the live Supabase project.
+
+See `.harness/active_plan.md` for the session-start checklist.
