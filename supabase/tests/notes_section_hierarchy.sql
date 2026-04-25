@@ -13,7 +13,7 @@
 -- Written so when #7 is fixed the suite is ready to load-bear.
 
 begin;
-select plan(14);
+select plan(15);
 
 -- ===== Fixtures =========================================================
 
@@ -233,6 +233,24 @@ select throws_ok(
   'P0001',
   null,
   'UPDATE parent.cohort_id when children exist raises section_note_parent_cohort_mutation'
+);
+
+-- ===== 13b) RPC null-resilience: missing title/slug default to '' =======
+-- Council r4 step 1 fold: payload omits 'title' and 'slug'; RPC
+-- coalesces to empty strings so the insert succeeds rather than
+-- crashing on column NOT NULL.
+select lives_ok(
+  $$select insert_note_with_sections(
+      jsonb_build_object(
+        'id', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaa013',
+        'body_md', 'just body',
+        'tier', 'active',
+        'author_id', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39',
+        'cohort_id', '11111111-1111-1111-1111-111111111139'
+      ),
+      jsonb_build_array()
+    )$$,
+  'RPC tolerates payload missing title + slug keys (defaults to empty strings)'
 );
 
 -- ===== 14) notes_no_self_parent CHECK constraint exists (declarative) ==

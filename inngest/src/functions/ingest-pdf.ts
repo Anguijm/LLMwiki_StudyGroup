@@ -2,21 +2,41 @@
 //
 // Steps, each step.run + idempotent by ingestion_jobs.id:
 //   1. parse: magic-byte check + parser call; zero-text -> pdf_no_text_content
-//   2. chunk: heading-aware; exceeding MAX_CHUNKS -> pdf_too_many_chunks
+//   2. chunk: heading-aware; exceeding MAX_SECTIONS -> pdf_too_many_chunks
 //   3. token_budget_reserve: idempotent via ingestion_jobs.reserved_tokens
-//   4. simplify: batched Haiku with <untrusted_content> framing
-//   5. embed: Voyage-3; over-budget -> embed_input_too_long
-//   6. persist: app-side UUID + slug collision retry; unique index on
-//      source_ingestion_id makes retries no-op
-//   7. post-ingest.enqueue: emits link + flashcard stubs
+//   4a. SECTIONED path (chunks.length >= 2):
+//        simplify-sections (per-section Haiku) ->
+//        embed-sections (per-section Voyage with retry) ->
+//        persist-sectioned (atomic insert_note_with_sections RPC) ->
+//        fan out post-ingest events PER section.
+//   4b. SINGLE-NOTE path (chunks.length <= 1, today's behavior):
+//        simplify (batched) -> embed -> persist single notes row ->
+//        fan out one event.
+//   5. mark-completed
 //
 // Function-level onFailure hook runs onIngestFailure() for atomic token
 // refund + storage cleanup on any terminal failure, including watchdog.
+//
+// #39 phase 3b refactor:
+//   - Extracted simplifySections / embedSections /
+//     callInsertNoteWithSectionsRpc as exported helpers so the persist
+//     fan-out + idempotency + cohort-mismatch handling are unit-testable
+//     without an Inngest envelope. These are the load-bearing tests
+//     council r4 declared non-negotiable (TS-side cohort + PII proofs
+//     since db-tests is continue-on-error).
+//   - Single-note path preserved verbatim for backwards compat: a
+//     1-section chunker output flows through the original simplify ->
+//     embed -> persist -> fan-out chain unchanged.
 import { createHash } from 'node:crypto';
 import slugify from 'slugify';
 import { inngest } from '../client';
 import { chunkParsed, TooManyChunksError } from './chunker';
 import { onIngestFailure } from './on-failure';
+import {
+  simplifySections,
+  embedSections,
+  callInsertNoteWithSectionsRpc,
+} from './ingest-pdf-persist';
 import { counter, histogram, withDuration, errorMetric } from '@llmwiki/lib-metrics';
 import { supabaseService } from '@llmwiki/db/server';
 import { sanitizeNoteTitle } from '@llmwiki/db/sanitize';
@@ -28,6 +48,7 @@ import {
   resolvePdfParser,
   AiResponseShapeError,
   AiRequestTimeoutError,
+  AiUpstreamError,
 } from '@llmwiki/lib-ai';
 import { requireEnv } from '@llmwiki/lib-utils/env';
 import {
@@ -39,6 +60,7 @@ import { SIMPLIFIER_V1 } from '@llmwiki/prompts';
 
 const VOYAGE_MAX_EMBED_CHARS = 30_000;
 const SIMPLIFY_BATCH_SIZE = 8;
+const SECTION_PATH_RPC_THRESHOLD = 2;
 
 async function markFailed(
   supabase: ReturnType<typeof supabaseService>,
@@ -57,6 +79,12 @@ async function markFailed(
     .eq('id', jobId);
   errorMetric('ingestion.jobs.failed', 1, { kind, step });
 }
+
+// Sectioned-persist helpers live in ./ingest-pdf-persist so the test
+// file (load-bearing per council r4) can import them without dragging
+// the server-only supabaseService transitive dep in.
+
+// ----- the Inngest function ----------------------------------------------
 
 export const ingestPdf = inngest.createFunction(
   {
@@ -184,7 +212,7 @@ export const ingestPdf = inngest.createFunction(
       if (error) throw error;
       if (data.reserved_tokens !== null) return; // already reserved on a prior attempt
 
-      // Rough estimate: each chunk ~ 1.2k in + 1.2k out + embed.
+      // Rough estimate: each section ~ in + out + embed.
       const estimate =
         chunks.reduce((s, c) => s + c.estimatedTokens * 2, 0) + chunks.length * 50;
 
@@ -217,7 +245,103 @@ export const ingestPdf = inngest.createFunction(
         .eq('id', job_id);
     });
 
-    // ----- simplify ------------------------------------------------------
+    // ----- branch: sectioned (N>=2) vs single-note (N<=1) --------------
+
+    if (chunks.length >= SECTION_PATH_RPC_THRESHOLD) {
+      // ===== SECTIONED PATH =============================================
+      const anthropic = makeAnthropicClient({ apiKey: requireEnv('ANTHROPIC_API_KEY') });
+      const voyage = makeVoyageClient({ apiKey: requireEnv('VOYAGE_API_KEY') });
+
+      const simplifications = await step.run('simplify-sections', async () => {
+        counter('ingestion.funnel', { job_id, stage: 'simplify' });
+        return simplifySections({ anthropic }, chunks, SIMPLIFIER_V1);
+      }).catch(async (e) => {
+        const msg = String(e);
+        if (e instanceof AiRequestTimeoutError) {
+          await markFailed(supabase, job_id, 'ai_request_timeout_error', msg, 'simplify');
+        } else if (e instanceof AiResponseShapeError) {
+          await markFailed(supabase, job_id, 'ai_response_shape_error', msg, 'simplify');
+        }
+        throw e;
+      });
+
+      // If every section simplified to empty, treat as no-text-content.
+      if (simplifications.every((t) => t.length === 0)) {
+        await markFailed(
+          supabase,
+          job_id,
+          'pdf_no_text_content',
+          'all sections simplified to empty content',
+          'simplify',
+        );
+        throw new Error('pdf_no_text_content');
+      }
+
+      const embeddings = await step.run('embed-sections', async () => {
+        counter('ingestion.funnel', { job_id, stage: 'embed' });
+        return embedSections({ voyage }, simplifications);
+      }).catch(async (e) => {
+        const msg = String(e);
+        if (e instanceof AiUpstreamError) {
+          await markFailed(supabase, job_id, 'embed_upstream_5xx' as IngestionErrorKind, msg, 'embed');
+        } else if (e instanceof AiRequestTimeoutError) {
+          await markFailed(supabase, job_id, 'ai_request_timeout_error', msg, 'embed');
+        }
+        throw e;
+      });
+
+      const result = await step.run('persist-sectioned', async () => {
+        counter('ingestion.funnel', { job_id, stage: 'persist' });
+        return callInsertNoteWithSectionsRpc(
+          { supabase },
+          {
+            jobId: job_id,
+            ownerId: owner_id,
+            cohortId: cohort_id,
+            title,
+            sections: chunks,
+            simplifications,
+            embeddings,
+          },
+        );
+      });
+
+      await step.run('mark-completed', async () => {
+        await supabase
+          .from('ingestion_jobs')
+          .update({ status: 'completed' })
+          .eq('id', job_id);
+        counter('ingestion.jobs.completed', { job_id });
+        counter('notes.created.count', {
+          user_id: owner_id,
+          count: 1 + result.sectionIds.length,
+        });
+      });
+
+      // Fan out per section. Each gets its own link + flashcards events.
+      // flashcard-gen idempotency keys on event.data.note_id, so each
+      // section fires once even on event double-delivery.
+      for (const sid of result.sectionIds) {
+        await step.sendEvent(`post-ingest-link-${sid}`, {
+          name: 'note.created.link',
+          data: { note_id: sid },
+        });
+        await step.sendEvent(`post-ingest-flashcards-${sid}`, {
+          name: 'note.created.flashcards',
+          data: { note_id: sid },
+        });
+      }
+
+      histogram('ingestion.upload.file_size_bytes', chunks.length, { job_id });
+      return {
+        note_id: result.parentId,
+        section_ids: result.sectionIds,
+        idempotency_hit: result.idempotencyHit,
+      };
+    }
+
+    // ===== SINGLE-NOTE PATH (preserved verbatim from pre-#39) ===========
+
     const simplified = await step.run('simplify', async () => {
       counter('ingestion.funnel', { job_id, stage: 'simplify' });
       const anthropic = makeAnthropicClient({ apiKey: requireEnv('ANTHROPIC_API_KEY') });
@@ -266,7 +390,6 @@ export const ingestPdf = inngest.createFunction(
       throw e;
     });
 
-    // ----- embed ---------------------------------------------------------
     if (simplified.length > VOYAGE_MAX_EMBED_CHARS) {
       await markFailed(
         supabase,
@@ -287,7 +410,6 @@ export const ingestPdf = inngest.createFunction(
       );
     });
 
-    // ----- persist -------------------------------------------------------
     const noteId = await step.run('persist', async () => {
       counter('ingestion.funnel', { job_id, stage: 'persist' });
       const sanitizedTitle = sanitizeNoteTitle(title);
@@ -299,14 +421,12 @@ export const ingestPdf = inngest.createFunction(
         try {
           base = slugify(sanitizedTitle, { lower: true, strict: true, locale: 'en' });
         } catch {
-          base = ''; // fall back to hash-only if slugify throws on malformed unicode
+          base = '';
         }
         const suffix = hash.slice(0, hashLen);
         return base.length > 0 ? `${base}-${suffix}` : `-${suffix}`;
       };
 
-      // Primary: insert with 6-char hash; catch unique_violation and retry
-      // with 12-char; final fallback is full UUID.
       const insert = async (slug: string) =>
         supabase
           .from('notes')
@@ -324,10 +444,11 @@ export const ingestPdf = inngest.createFunction(
           .select('id')
           .single();
 
-      // First try the idempotent retry case — if persist has already run,
-      // the unique index on source_ingestion_id fires and we return that id.
       let attempt = await insert(makeSlug(6));
-      if (attempt.error?.code === '23505' && attempt.error.message.includes('source_ingestion_id')) {
+      if (
+        attempt.error?.code === '23505' &&
+        attempt.error.message.includes('source_ingestion_id')
+      ) {
         const existing = await supabase
           .from('notes')
           .select('id')
@@ -335,7 +456,6 @@ export const ingestPdf = inngest.createFunction(
           .single();
         if (existing.data) return existing.data.id as string;
       }
-      // Slug collision path.
       if (attempt.error?.code === '23505' && attempt.error.message.includes('notes_slug_key')) {
         attempt = await insert(makeSlug(12));
         if (attempt.error?.code === '23505') {
@@ -346,7 +466,6 @@ export const ingestPdf = inngest.createFunction(
       return attempt.data.id as string;
     });
 
-    // ----- mark completed + emit post-ingest stubs ----------------------
     await step.run('mark-completed', async () => {
       await supabase
         .from('ingestion_jobs')

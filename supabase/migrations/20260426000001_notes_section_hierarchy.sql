@@ -165,14 +165,18 @@ begin
   end if;
 
   -- Insert parent (parent_note_id + section_path explicitly null).
+  -- coalesce(... , '') on title/slug/body_md is defense against partial
+  -- payloads — council r4 step 1: the RPC should not crash on missing
+  -- keys. Caller is expected to provide them; defaulting to empty
+  -- strings produces a recoverable persisted row instead of a hard error.
   insert into public.notes (
     id, slug, title, body_md, tier,
     author_id, cohort_id, embedding, source_ingestion_id,
     parent_note_id, section_path
   ) values (
     (parent->>'id')::uuid,
-    parent->>'slug',
-    parent->>'title',
+    coalesce(parent->>'slug', ''),
+    coalesce(parent->>'title', ''),
     coalesce(parent->>'body_md', ''),
     coalesce((parent->>'tier')::tier_enum, 'active'),
     (parent->>'author_id')::uuid,
@@ -196,8 +200,8 @@ begin
         parent_note_id, section_path
       ) values (
         (s->>'id')::uuid,
-        s->>'slug',
-        s->>'title',
+        coalesce(s->>'slug', ''),
+        coalesce(s->>'title', ''),
         coalesce(s->>'body_md', ''),
         coalesce((s->>'tier')::tier_enum, 'active'),
         (s->>'author_id')::uuid,
