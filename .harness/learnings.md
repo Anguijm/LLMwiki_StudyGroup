@@ -707,3 +707,58 @@ Keep each bullet tight. The goal is fast recall for the next session, not a blog
   2. **Defer-as-issue**: real work but separate scope (CI guardrails, monitoring, broader infrastructure). File the issue; don't fold into the current PR.
   3. **Rebut**: hallucinations, fabricated paths, claims grep-able to file:line as already-shipped. Cite tests where the §Rebutting-council-findings rule applies.
   The dispositions are NOT mutually exclusive within a single round — PR #50 r3 had all three categories.
+
+## 2026-04-25 — session-end handoff (window: 2026-04-23 to 2026-04-25)
+
+### KEEP
+
+- **Session shipped 4 PRs** (#48 FSRS, #49 gitignore orphan, #50 reflection, #51 hot-fix) and closed the SRS loop end-to-end. Per-PR reflections already in this file capture the substantive lessons; this entry is purely a forward-handoff pointer.
+- **The §"Rebutting council findings" rule #4 fired correctly for the first time in production (PR #50 r2 → fold, not rebut).** This is the load-bearing protocol moment of the session — the rule distinguished a real design error from a hallucination chain. Working hypothesis confirmed: structural rules from PR #43 work for plan/impl rounds; reflection PRs can still hallucinate but rule #4 is the correct disposition switch.
+
+### IMPROVE
+
+- **Test-config silent-skips are a class of bug worth a CI guardrail** (#52). PR #48 shipped 16 server-action tests that never ran for ~24 hours before PR #51 caught it. The "consistently passing test" requirement from CLAUDE.md was technically violated but invisibly — `npm test` reported passing because the file didn't appear in the output. Filed; awaits #52 impl in next session.
+- **Read external dep `.d.ts` BEFORE writing the wrapper.** PR #48's ts-fsrs v5 `learning_steps` field surprise cost a typecheck round-trip + 4 test fixture edits. Already documented in PR #48 reflection; carrying forward as a standing rule.
+
+### INSIGHT
+
+- **Three-disposition working model for council asks** (codified in PR #50 r3): **fold-now** (small permanent codification, e.g. CLAUDE.md additions), **defer-as-issue** (real but separate scope), **rebut** (file:line citations for hallucinations). A single round can have all three. PR #50 r3 exercised all three and produced a clean r4 PROCEED.
+- **The protocol's success signal is monotonic up-trend across plan→impl rounds.** PR #48 (r1→r2→r3 = 6/9/3 → 10/10/10 → 10/10/10) and PR #51 (r1→r2→r3 = 10/10/9 → 10/10/9 → 10/10/10) both displayed this. When trajectory is monotonic, the plan-first protocol is producing implementations that match the planned contract — that's the win condition.
+
+### COUNCIL
+
+- This entry's source PR (the session-end handoff) is council-required per CLAUDE.md (reflection content, regardless of diff size). Expected to clear in 1-2 rounds given the tightness of the additions; merge against "ready for human approval" gate per the PR #43 product-persona-r5 lesson.
+
+### Next-session pointer
+
+User's priority order at session close (2026-04-25):
+1. **#39 semantic chunking** — biggest v1 unlock for downstream handlers.
+2. **#52 CI guardrail for vitest-include coverage** — protects the "consistently passing test" rule.
+3. **Deploy-readiness validation** — apply the new migrations on the live Supabase project.
+
+See `.harness/active_plan.md` for the session-start checklist.
+- **r1 (PR #53 handoff @ `7c685a0`, 2026-04-24T23:38:35Z) — REVISE 10/10/3/10/10/10. Hybrid: rebutted 2 bugs hallucinations (documentation-vs-code category error); folded 1 security nice-to-have (prompt-injection reminder in #39 stub).**
+  - **Rebutted:** bugs persona treated the "session-start checklist" in `.harness/active_plan.md` as if it were executable code, demanding a `.harness.lock` semaphore for "concurrent execution" + I/O error handling for "parsing state files." **The artifact is a markdown checklist for a human or AI agent at session boot** — not a CLI process, not a parser, not a service. Each session-start is initiated by the human starting Claude Code in this directory. There's no concurrent process to lock against; there's no parsing code (the checklist instructs the agent to read files via Read/Bash tools at runtime). Same documentation-vs-code category error as PR #50 r1's fabricated file paths. Not actions.
+  - **Folded:** security persona's nice-to-have — added `**NOTE: plan must explicitly address prompt injection**` to the #39 stub in `active_plan.md` with reference to the existing `<untrusted_content>` wrapping pattern + `.harness/scripts/security_checklist.md`. Useful priming for next session's plan-drafting.
+  - **Pattern observation: ninth confirmation of the council reading documentation as if it were code.** Same surface as PR #50 r1 (fabricated file paths) and PR #43 r2 (over-engineering reflection prose). The bugs persona at 3 here is the same scoring artifact as PR #50 r4's bugs-at-6 — the persona scores based on "presence of imagined bug class" rather than "presence of actual bug in the actual artifact." The §Rebutting-council-findings rule's "grep first" step is the correct disposition: when the grep returns "this is documentation, not code," rebut.
+- **r2 (PR #53 handoff @ `defbf14`, 2026-04-25T00:04:49Z) — REVISE 10/10/7/2/10/10. Cost dropped to 2 with veto on undefined #39 future-work cost. Synthesis itself flagged the self-contradiction in its approval gate: *"Does the Cost reviewer's veto, based on the undefined cost of the next session's work (#39), apply to this session-handoff documentation change?"* Security persona explicitly: "None. This change is purely to planning and process documents and introduces no direct security risk." The synthesis lifted forward-looking concerns into non-negotiables despite three personas (security, accessibility, product) explicitly framing them as future-work concerns.**
+  - **Folded** (small useful additions to the #39 stub, matching the r1 pattern of teeing up next-session plan-drafting):
+    - **Cost note**: use Haiku per CLAUDE.md cost rules; cache chunks permanently in Supabase; per-document budget ceiling + token-cap shutoff matching Tier B pattern.
+    - **Idempotency note**: Inngest function must be idempotent on `note_id` (use `event.data.note_id` per PR #37 convention, not `event.id`).
+  - **Rebutted**: cost-persona-veto-on-undefined-future-work is the synthesis's own self-contradiction (its approval gate asked the question explicitly); session-start-checklist-as-code is the same r1 hallucination already documented.
+  - **10th confirmation of the council reading future or documentation work as if it's this PR's diff.** This time the synthesis explicitly self-aware about the contradiction (asking whether a cost veto on future work applies to documentation). The persona-mechanism still produced the veto despite the synthesis's awareness — so the structural fix isn't at the synthesis layer; it's at the persona-prompt layer (#45).
+  - **Each round produces useful #39-stub-additions even though the bare verdict is REVISE.** r1 added the prompt-injection note; r2 added cost + idempotency notes. Net effect: the #39 stub is now a much-better-primed plan-drafting starter than it was at PR creation. **Treat the council's persona-driven future-work veto as free plan-input refinement, not as a block** — the productive disposition is fold-the-substance + rebut-the-block-framing.
+- **r3 (PR #53 handoff @ `c226fa9`, 2026-04-25T05:36:28Z) — REVISE 10/10/3/10/9/8. Same future-work-as-this-PR pattern, 11th confirmation. Security persona this round was crystal explicit: *"This diff only updates planning and process documents; it introduces no production code... The following 'must-dos' apply to the *plan for #39*, not this specific commit."* — yet synthesis still escalated to "Revise" with #39-future-plan asks in the non-negotiables list. Persona-vs-synthesis dissociation now well-documented across PR #43 r3+r5, PR #50 r3+r4, and now PR #53 r2+r3 (5 distinct rounds).**
+  - **Folded** (only items tied to existing CLAUDE.md rules; impl-detail asks left for #39's actual plan):
+    - **Cohort RLS for new `chunks` table** — direct hit on §"Plan-time required content" rule from PR #43; explicit isolation-model statement required in any plan with new tables.
+    - **Per-user rate limit on chunking-job triggers** — different axis from per-job token budget; Tier A-style event-rate limit per CLAUDE.md rate-limiting non-negotiable.
+    - **PII logging discipline reminder** — re-states CLAUDE.md no-PII-in-logs non-negotiable for the new chunking surface.
+  - **Skipped** (impl-detail asks belonging in #39's actual plan, not the stub):
+    - Stale-chunks transactional behavior (`delete-then-insert` atomicity) — impl detail.
+    - Concurrency lock per `note_id` — impl detail (Inngest function design).
+    - LLM response Zod validation — impl detail (input validation pattern from PR #48).
+    - Retry/dead-letter policy — impl detail.
+    - `ON DELETE CASCADE` on `chunks.note_id` FK — impl detail.
+  - **Where to draw the line**: the stub absorbs items tied to existing structural rules (CLAUDE.md non-negotiables + §Plan-time required content). Impl-detail asks belong in #39's actual plan where the surveying agent has full context to design them properly. Adding every concrete-bug-class flag to the stub would make the stub a defacto plan and constrain next-session's drafting.
+  - **Meta-cap firing**: PR #53 is now at r3 of REVISE-with-future-work-non-negotiables. The pattern is fully established and documented. Each round produces useful #39-stub-additions (r1: prompt-injection; r2: cost + idempotency; r3: cohort RLS + trigger-rate-limit + PII-logging). After r4, if the bare verdict is still REVISE on more impl-detail asks (which the persona pattern suggests it will be), merge against the "ready for human approval" gate per the meta-cap heuristic. Productive yield is asymptoting; further rounds risk turning the stub into a defacto plan.
+- **r4 (PR #53 handoff @ `c836483`, 2026-04-25T05:42:46Z) — PROCEED 7/10/7/10/10/10. First non-Revise verdict on this PR.** Synthesis: *"This plan is ready for human approval."* Synthesis self-contradiction pattern broke this round — decision matched approval gate. Single small a11y non-negotiable folded as one more NOTE block (downstream UI from chunking needs a11y consideration). Pattern observation: by r4, the persona-vs-synthesis dissociation had asymptoted; the "no production code" framing finally took precedence over the future-work-as-this-PR pattern. **Productive yield across 4 rounds**: 7 NOTE blocks now in the #39 stub priming next session's plan-drafting (prompt-injection, cost posture, idempotency, cohort RLS, trigger rate-limit, PII logging, downstream UI a11y). The stub absorbed every rule-codified concern the council could articulate.
