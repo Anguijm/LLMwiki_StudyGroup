@@ -79,20 +79,59 @@ Migration: `supabase/migrations/<YYYYMMDD>000001_notes_section_hierarchy.sql`.
 ```sql
 alter table public.notes
   add column parent_note_id uuid references public.notes(id) on delete restrict,
-  add column section_path text;
+  add column section_path jsonb;
+  -- jsonb array of titles, e.g. '["Chapter 4", "4.3 Pyruvate Oxidation"]'.
+  -- Why jsonb (not text): heading text can contain '/', '\', '"', emoji, etc.
+  -- A text breadcrumb with a separator forces escape rules that are easy to
+  -- get wrong on render. Folded from council r1 [bugs] encoding/escaping.
 
 -- Sibling-section lookup index (parent → ordered children).
 create index notes_parent_note_id_idx on public.notes (parent_note_id)
   where parent_note_id is not null;
 
 -- Cohort-integrity trigger (mirrors concept_links pattern).
+-- Fires on INSERT *and* UPDATE — the UPDATE path prevents re-parenting a
+-- note to a parent in a different cohort post-creation (council r1
+-- security must-do #2).
 create or replace function public.check_section_note_cohort_integrity() ...;
 create trigger notes_section_cohort_integrity
   before insert or update on public.notes
   for each row execute function public.check_section_note_cohort_integrity();
+
+-- Atomic parent + sections insert. SECURITY DEFINER so service-role
+-- ingest can call it; cohort-integrity trigger still fires per row.
+-- Folded from council r1 [bugs] async/race + [security] data-integrity
+-- must-do #1: parent + N children must commit or roll back as one.
+create or replace function public.insert_note_with_sections(
+  parent jsonb,                  -- single notes row payload
+  sections jsonb                 -- array of section notes payloads
+)
+returns table (parent_id uuid, section_ids uuid[])
+language plpgsql security definer set search_path = public as $$
+declare
+  v_parent_id uuid;
+  v_section_ids uuid[] := array[]::uuid[];
+  v_section jsonb;
+  v_section_id uuid;
+begin
+  insert into public.notes select * from jsonb_populate_record(null::public.notes, parent)
+    returning id into v_parent_id;
+  for v_section in select * from jsonb_array_elements(sections) loop
+    insert into public.notes
+      select * from jsonb_populate_record(
+        null::public.notes,
+        v_section || jsonb_build_object('parent_note_id', v_parent_id)
+      )
+      returning id into v_section_id;
+    v_section_ids := array_append(v_section_ids, v_section_id);
+  end loop;
+  return query select v_parent_id, v_section_ids;
+end $$;
+revoke all on function public.insert_note_with_sections(jsonb, jsonb) from public;
+grant execute on function public.insert_note_with_sections(jsonb, jsonb) to service_role;
 ```
 
-**Rollback:** `supabase/migrations/<YYYYMMDD>000002_notes_section_hierarchy_down.sql` drops the trigger, function, index, and columns. Safe to run as long as no production rows have `parent_note_id is not null` — i.e., before any new ingests run on the new schema. Document this prerequisite in the rollback file's header comment.
+**Rollback:** `supabase/migrations/<YYYYMMDD>000002_notes_section_hierarchy_down.sql` drops the RPC, trigger, function, index, and columns. Safe to run as long as no production rows have `parent_note_id is not null` — i.e., before any new ingests run on the new schema. Document this prerequisite in the rollback file's header comment.
 
 **Why `on delete restrict`** (not `cascade`): consistent with every other FK in `notes`. A user deleting a parent document should explicitly delete its sections first (or the app deletes them in a single transaction). Cascade hides intent and bypasses RLS in subtle ways.
 
@@ -107,12 +146,16 @@ New behavior: same walk, but emits **`Section[]`** with structural metadata so t
 ```ts
 export interface Section {
   index: number;          // 0..N-1 ordering within the parent doc
-  title: string | null;   // heading text, or null for "untitled section N"
-  path: string;           // breadcrumb, e.g. "Chapter 4 / 4.3 Pyruvate Oxidation"
+  title: string | null;   // heading text (raw), or null for "untitled section N"
+  path: string[];         // jsonb array of ancestor titles, e.g.
+                          // ["Chapter 4", "4.3 Pyruvate Oxidation"].
+                          // Renderer joins with whatever separator it likes.
   text: string;           // body_md content for this section
   estimatedTokens: number;
 }
 ```
+
+**Heading text is preserved verbatim**: no escaping, no `/`-stripping, no truncation. The renderer is responsible for whatever display escaping it needs (HTML-escape for breadcrumbs, etc.). Storing as `string[]` (jsonb) means downstream consumers never have to parse a separator.
 
 Boundary detection (priority order, picks the first that yields > 1 section):
 
@@ -130,10 +173,15 @@ Two changes:
 
 1. **`chunk` step now returns `Section[]`** instead of `Chunk[]`. Token-budget reservation already iterates the array with `chunks.reduce((s, c) => s + c.estimatedTokens * 2, 0)` — works unchanged.
 
-2. **`persist` step** becomes a transaction-style insert of (parent + sections) all at once:
-   - Single section: behaves exactly like today (1 notes row, `parent_note_id = null`, `section_path = null`). No regression for small PDFs.
-   - Multiple sections: insert parent first (TOC-summary or empty body, no embedding), then bulk-insert children with `parent_note_id = parent.id` and inherited `cohort_id`. Children get their own embeddings (computed in a new `embed-sections` step paralleling the existing `embed`).
-   - All inserts share the same `source_ingestion_id` semantics: parent gets the original `job_id`; children get `null` (so the unique constraint on `source_ingestion_id` doesn't fire on them). Idempotency for the parent stays intact.
+2. **`persist` step** becomes an **atomic** insert of (parent + N children) via the new `insert_note_with_sections` RPC defined in §"Schema changes":
+   - **Zero sections (chunker returned an empty array):** persist as a single notes row with `body_md = simplified` and `parent_note_id = null` and `section_path = null`. This is today's behavior; the chunker's empty-sections case is treated as "this document has no detectable structure, store it whole." Folded from council r1 [bugs] null/missing.
+   - **One section:** behaves exactly like zero — one notes row, no parent/path. No reason to introduce a parent for a single-child hierarchy. No regression for small PDFs.
+   - **N ≥ 2 sections:** call `insert_note_with_sections(parent_payload, sections_array)`. The RPC inserts the parent + all children in a single transaction; partial failure rolls back everything. Each child carries inherited `cohort_id` (validated by the integrity trigger). Per-section embeddings are computed *before* the persist call (so a Voyage failure doesn't leave a half-persisted document) — see §"Embedding strategy".
+   - **Idempotency model** (rewritten from r0; the r0 model had a silent-data-loss flaw caught by council r1 [bugs] async/race):
+     - The parent is keyed by `source_ingestion_id` (existing unique index).
+     - On retry, the persist step first checks `select id from notes where source_ingestion_id = $1`. If found, the parent already committed — which (because the RPC is atomic) means *all children* also committed. Short-circuit safely. If not found, run the RPC fresh.
+     - This works only because the RPC is atomic. Without atomicity, the prior r0 model would short-circuit on a parent-only commit and silently leave a section-less document. **The atomicity of the RPC is what makes the idempotency check sound** — call this out explicitly in the persist-step code comment.
+   - Children's `source_ingestion_id` is `null` (the unique constraint applies only to parents, so it doesn't fire on children).
 
 3. **Post-ingest events fan out per section, not per document:**
    ```ts
@@ -148,9 +196,10 @@ Two changes:
 
 ### Embedding strategy
 
-- **Each section gets its own Voyage-3 embedding** (one call per section, batched if Voyage supports batch — TBD; if not, sequential within the existing `embed` step's loop).
+- **Each section gets its own Voyage-3 embedding** (one call per section, batched if Voyage supports batch — TBD; if not, sequential within the existing `embed` step's loop). Computed **before** the persist RPC so that a Voyage failure cannot leave a half-persisted document.
 - **Parent doc embedding:** computed only if `simplified.length <= VOYAGE_MAX_EMBED_CHARS = 30_000`. Otherwise skip — parent is a navigation node, not a search target. Search hits the section embeddings; parent surfaces via `parent_note_id` lookup.
 - This change increases per-document embedding cost from 1 call to N calls — acknowledged in the cost section below.
+- **Retry policy** (folded from council r1 [bugs] external-API flakiness): each per-section Voyage call is wrapped in exponential-backoff retry — 3 attempts at 1s / 2s / 4s, retried on 5xx and network errors only (4xx is non-retryable, surface immediately). Implemented in `packages/lib/voyage/src/index.ts` as a wrapper around the existing client (or extend the existing one). After 3 failures the step throws `embed_input_too_long`-equivalent kind `embed_upstream_5xx`, marked failed via the existing `markFailed` path, refunds the Tier B reservation via the existing `onFailure` hook. Test: mock Voyage returns 5xx twice then success → step completes in 1 attempt-of-3; mock returns 5xx three times → step fails with `embed_upstream_5xx`.
 
 ## Cost posture (per CLAUDE.md §"Cost posture")
 
@@ -183,8 +232,16 @@ Existing pattern from `flashcard-gen.ts:408-413`: structured logs with `{alert: 
 The new `embed-sections` step + the persist fan-out logic MUST follow this pattern. Specifically:
 
 - Log `note_id`, `parent_note_id`, `cohort_id`, `errorName`, `step` only.
-- **Never** log `section.text`, `section.title`, `section_path`, or `body_md` content.
-- A failing test in `ingest-pdf.test.ts` will assert this: `expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ body: expect.anything() }))` (extending the existing PII-safety test pattern from `apps/web/components/ErrorBoundary.test.tsx:42-62`).
+- **Never** log `section.text`, `section.title`, `section_path`, or `body_md` content. (Council r1 security must-do #3: explicit assertion on `section.title` and `section.path` in addition to body content — folded.)
+- A failing test in `ingest-pdf.test.ts` will assert this with explicit negative assertions on each PII field:
+  ```ts
+  expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ body: expect.anything() }));
+  expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ body_md: expect.anything() }));
+  expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ section_path: expect.anything() }));
+  expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ title: expect.anything() }));
+  expect(logSpy).not.toHaveBeenCalledWith(expect.objectContaining({ text: expect.anything() }));
+  ```
+  Pattern extended from `apps/web/components/ErrorBoundary.test.tsx:42-62`. Sentinel-string negative assertion (test fixture uses titles/paths containing a known string and asserts that string never appears in any log call's serialised payload) provides additional defense-in-depth against future field renames.
 
 ## a11y for downstream UI surfaces (a11y non-negotiable)
 
@@ -208,16 +265,21 @@ New tests (location → assertion):
    - Per-section cap `MAX_SECTION_TOKENS = 50_000` → throws `SectionTooLargeError`.
 
 2. `inngest/src/functions/ingest-pdf.test.ts` (extend) — fan-out behavior:
+   - 0-section chunker result → 1 notes row with full body, no parent/path. (Folded from council r1 [bugs] null/missing.)
    - 1-section result → 1 notes row, no `parent_note_id`, no regression vs. today.
-   - N-section result → 1 parent + N children with correct `cohort_id` inheritance, `parent_note_id` set, `section_path` populated.
-   - Cohort-integrity trigger fires on a service-role insert with mismatched `cohort_id`.
-   - Idempotency: re-running the same `job_id` finds the existing parent + does not re-insert sections.
-   - PII-safety: `console.error` mock asserts no body content / no section_path values in error logs.
+   - N-section result → 1 parent + N children with correct `cohort_id` inheritance, `parent_note_id` set, `section_path` populated as jsonb array.
+   - **Atomic-persist: parent-only commit is impossible.** Mock the persist RPC to fail mid-children; assert that on the next retry, NO parent row exists from the failed attempt (transaction rolled back). This is the test the council r1 [bugs] async/race blocker explicitly asked for: *"on retry after partial failure, creates missing section notes"* — with the atomic RPC, the test shape is "on retry, the partial-attempt left no orphaned parent, so retry runs cleanly".
+   - Idempotency: re-running the same `job_id` after a *successful* persist finds the existing parent + does not re-call the RPC. (Distinct from the partial-failure case above.)
+   - Cohort-integrity trigger fires on a service-role direct insert (bypassing RPC) with mismatched `cohort_id`.
+   - Voyage retry: mock 5xx twice then success → embed step completes; mock 5xx three times → embed step fails with `embed_upstream_5xx` and refund happens via existing `onFailure`.
+   - PII-safety: `console.error` mock asserts the explicit negative assertions enumerated in §"PII logging discipline".
 
 3. `supabase/tests/notes_section_hierarchy.sql` (pgTAP) — RLS + cohort-integrity at the database boundary:
    - User in cohort A reads parent + sections in cohort A. ✓
    - User in cohort B reads neither. ✓
-   - Service-role insert with mismatched cohort_id raises `section_note_cohort_mismatch`. ✓
+   - Service-role **INSERT** with mismatched cohort_id raises `section_note_cohort_mismatch`. ✓
+   - Service-role **UPDATE** that re-parents a section to a parent in a different cohort raises `section_note_cohort_mismatch`. ✓ (Folded from council r1 security must-do #2.)
+   - `insert_note_with_sections` RPC: rolls back fully if any child insert fails (simulate by inserting a child with mismatched cohort_id; assert the parent is not present after the failed call).
    - Note: `db-tests` is `continue-on-error` (#7) — these tests are evidence-of-intent but per §"Rebutting council findings" rule #2 a security rebuttal must cite a *consistently passing* test. The TS-level cohort-integrity test in `ingest-pdf.test.ts` is the load-bearing assertion; pgTAP is corroboration.
 
 4. `apps/web` test suite — verify no regression to existing flashcard / review flows. Section notes look identical to document notes; existing tests should pass unchanged.
@@ -251,6 +313,11 @@ Pre-emptively addressing common raw-critique hallucinations:
 - **"Missing token budget"** — Tier B already covers it; section-level granularity doesn't change the total. Cited file: `packages/lib/ratelimit/src/index.ts:86-141`.
 - **"PII in logs"** — followed `flashcard-gen.ts` structured-log pattern; new test in `ingest-pdf.test.ts` asserts no body content in error logs.
 - **"Backwards-incompat for existing notes rows"** — new columns are nullable, no backfill required, existing reads return `null` for `parent_note_id` / `section_path`. No code path treats null specially as an error.
+- **"Persist is not atomic / partial failure leaves orphaned parent"** — folded in r1. Persist now runs through the `insert_note_with_sections` RPC which wraps parent + N children in a single transaction. Cited test: §"Test strategy" #2 atomic-persist test + pgTAP RPC rollback test.
+- **"section_path encoding could break on `/` in headings"** — folded in r1. `section_path` is `jsonb` (array of titles), not `text` with a separator. No escaping required at storage; rendering escapes per-element.
+- **"Voyage flakiness on N-call fan-out fails the document"** — folded in r1. Per-section calls have 3-attempt exponential backoff; 4xx is non-retryable, 5xx + network errors retry. Cited test: §"Test strategy" #2 Voyage-retry case.
+- **"UPDATE on cohort-integrity trigger isn't tested"** — folded in r1. Trigger fires on `before insert or update`; pgTAP covers the re-parenting-into-different-cohort UPDATE case.
+- **"Empty chunker output undefined"** — folded in r1. 0-section chunker output → single notes row with full simplified body, parent/path null. Test in §"Test strategy" #2.
 
 ## Open questions for council
 
@@ -260,12 +327,34 @@ Pre-emptively addressing common raw-critique hallucinations:
 
 These are flagged for council to weigh in, NOT to block the plan. Defaults are conservative (retain existing behavior where possible); council is welcome to push back.
 
+## Council round 1 fold (2026-04-26)
+
+Council r1 verdict: **REVISE**. Scores a11y 10 / arch 10 / **bugs 5** / cost 10 / product 10 / security 9. All findings substantive (none hallucinated). Folded all blockers + must-dos:
+
+| Council finding | Severity | Resolution |
+|---|---|---|
+| [bugs] Idempotency silent-data-loss on parent-only commit | blocker | Combined fix with [security] must-do #1 → `insert_note_with_sections` RPC wraps parent + children in atomic transaction. r0 idempotency model (find existing parent + short-circuit) is now sound *because* the parent's existence implies children's existence. Documented at the persist callsite. |
+| [bugs] `section_path` encoding on `/` in headings | blocker | Changed `section_path` from `text` to `jsonb` (array of titles). No separator collisions possible. |
+| [bugs] Empty-sections case undefined | blocker | Spec'd: 0 → single notes row with full body. Test added to §"Test strategy". |
+| [bugs] Voyage external-API flakiness | blocker | Added 3-attempt exponential backoff (1s/2s/4s) on 5xx + network errors only. 4xx is non-retryable. Embedding now happens *before* the persist RPC so a Voyage failure doesn't leave a half-persisted document. Test cases added. |
+| [security] Persist must be atomic | must-do | `insert_note_with_sections` RPC (combined with bugs blocker #1). |
+| [security] pgTAP must cover UPDATE | must-do | Trigger already fires on `before insert or update`; added explicit UPDATE test case (re-parent to different cohort). |
+| [security] PII test must assert section.path + section.title | must-do | Made the assertions explicit in §"PII logging discipline" with per-field negative assertions + a sentinel-string defense-in-depth check. |
+
+**Deferred (council r1 nice-to-haves, not blocking, file as follow-ups):**
+
+- Anthropic prompt caching (1h TTL) on `simplify` and `flashcard-gen` handlers (cost optimization). Out of scope for #39; separate cost-tuning ticket.
+- Application-level metric: average sections-per-document gauge (early-warning for chunking heuristic drift). Add to issue #39 follow-up tickets.
+- `delete_note_with_sections(note_id)` Postgres function (already deferred per plan §Out-of-scope; council confirms). File as follow-up when the delete UI ships.
+
+**No rebuttals filed.** All r1 findings were substantive; per CLAUDE.md §"Rebutting council findings" rule #1 (grep first, rebut only if claim is false) and rule #4 (sustained REVISE = fold, not entrench), folding was the right call.
+
 ## Approval gate
 
-Per CLAUDE.md §"What counts as approval": this plan is committed to `.harness/active_plan.md` on a feature branch. PR will trigger `.github/workflows/council.yml`. Implementation does NOT begin until:
+Per CLAUDE.md §"What counts as approval": this plan is committed to `.harness/active_plan.md` on a feature branch. PR #54 triggered `.github/workflows/council.yml` r1 (REVISE). Plan revised on 2026-04-26 to fold all r1 blockers + must-dos. Push of this revision will trigger council r2. Implementation does NOT begin until:
 
 1. ✅ Plan committed and tracked.
-2. ⏳ Council `<!-- council-report -->` comment posted at-or-ahead-of the plan SHA.
-3. ⏳ Human types `approved` / `ship it` / `proceed` after seeing the synthesis.
+2. ⏳ Council `<!-- council-report -->` comment posted at-or-ahead-of the *revised* plan SHA with PROCEED verdict (or REVISE → another fold round).
+3. ⏳ Human types `approved` / `ship it` / `proceed` after seeing the r2+ synthesis.
 
-Last council: 2026-04-24T22:51:27+00:00 (PR #50 r4 PROCEED 9/10/6/10/10/9). Last commit: `e2b63d4` (session-end handoff). Branch for this plan: `claude/issue-39-semantic-chunking` (created on push).
+Last council: 2026-04-25T06:13:49+00:00 (PR #54 r1 REVISE 10/10/5/10/10/9). Branch: `claude/issue-39-semantic-chunking`. PR: #54.
