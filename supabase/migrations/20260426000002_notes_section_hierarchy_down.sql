@@ -15,5 +15,6 @@ drop function if exists public.check_section_note_cohort_integrity();
 drop index if exists notes_parent_note_id_idx;
 
 alter table public.notes
+  drop constraint if exists notes_no_self_parent,
   drop column if exists section_path,
   drop column if exists parent_note_id;

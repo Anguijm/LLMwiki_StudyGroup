@@ -13,7 +13,7 @@
 -- Written so when #7 is fixed the suite is ready to load-bear.
 
 begin;
-select plan(12);
+select plan(14);
 
 -- ===== Fixtures =========================================================
 
@@ -220,6 +220,34 @@ select is(
     where id = 'ffffffff-ffff-ffff-ffff-fffffffff011'),
   0,
   'Atomicity: failed RPC left no orphaned parent row'
+);
+
+-- ===== 13) Parent cohort_id mutation blocked when children exist ========
+-- Council r3 [bugs] fold: the parent of the RPC-inserted hierarchy
+-- (test 7) has 2 children. Attempting to flip its cohort_id would
+-- orphan them in a different cohort — must be blocked.
+select throws_ok(
+  $$update public.notes
+    set cohort_id = '22222222-2222-2222-2222-222222222239'
+    where id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeee007'$$,
+  'P0001',
+  null,
+  'UPDATE parent.cohort_id when children exist raises section_note_parent_cohort_mutation'
+);
+
+-- ===== 14) notes_no_self_parent CHECK constraint exists (declarative) ==
+-- Council r3 §4 explicit suggestion: belt-and-suspenders against
+-- self-parent. Trigger already rejects (test 2 covers behavior); this
+-- assertion locks in the constraint's *existence* so a future migration
+-- can't silently drop the declarative guard. The BEFORE trigger fires
+-- before CHECK so its 'P0001' code wins on actual self-parent attempts —
+-- that's why we verify the constraint via catalog rather than via the
+-- failing INSERT shape.
+select is(
+  (select conname::text from pg_constraint
+    where conname = 'notes_no_self_parent' and contype = 'c'),
+  'notes_no_self_parent',
+  'notes_no_self_parent CHECK constraint exists in pg_constraint catalog'
 );
 
 select * from finish();

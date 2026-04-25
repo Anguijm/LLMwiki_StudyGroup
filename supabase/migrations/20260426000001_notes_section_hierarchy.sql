@@ -20,33 +20,82 @@ alter table public.notes
   add column if not exists parent_note_id uuid references public.notes(id) on delete restrict,
   add column if not exists section_path jsonb;
 
+-- Declarative belt-and-suspenders against self-parenting (council r3
+-- §4 explicit suggestion). The trigger below also catches this, but a
+-- CHECK constraint runs even if the trigger is dropped or disabled,
+-- and surfaces the violation with a clearer error class.
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'notes_no_self_parent'
+  ) then
+    alter table public.notes
+      add constraint notes_no_self_parent
+      check (parent_note_id is null or parent_note_id <> id);
+  end if;
+end $$;
+
 -- Partial index for sibling-section lookup (parent → ordered children).
 create index if not exists notes_parent_note_id_idx
   on public.notes (parent_note_id)
   where parent_note_id is not null;
+
+-- KNOWN LIMITATION (filed as follow-up): multi-row cycles (A→B→A) are
+-- not detected by the CHECK constraint or the trigger below. The risk
+-- is low in practice — no app surface re-parents existing notes; the
+-- ingest pipeline only inserts fresh hierarchies via the atomic RPC.
+-- A recursive-CTE cycle check on every UPDATE would add nontrivial
+-- write-path cost; deferring until a real abuse surface emerges.
 
 -- ----- cohort-integrity trigger -----------------------------------------
 
 -- Mirrors check_concept_link_cohort_integrity. RLS guards reads;
 -- this trigger guards writes against service-role / buggy internal callers
 -- that could otherwise create a section in a different cohort than its
--- parent. Fires on INSERT and UPDATE — the UPDATE branch blocks
--- re-parenting attacks (council r1 security must-do #2).
+-- parent. Fires on INSERT and UPDATE.
+--
+-- Three branches:
+--   (a) Section-side: NEW.parent_note_id is set → its cohort_id MUST
+--       match the parent's. Closes the cross-cohort INSERT and the
+--       re-parenting UPDATE attacks (council r1 security must-do #2).
+--   (b) Parent-side mutation: NEW row has children AND its cohort_id
+--       changed → block, otherwise the children are orphaned in a
+--       different cohort. Folded from council r3 [bugs] async/race.
+--   (c) Self-parent: caught here in addition to the CHECK constraint
+--       above for defense-in-depth on UPDATE.
 create or replace function public.check_section_note_cohort_integrity()
 returns trigger language plpgsql as $$
 declare
   parent_cohort uuid;
+  v_orphan_count int;
 begin
-  -- Root documents (no parent) are unconstrained by this trigger.
+  -- (b) Parent-side mutation guard. On UPDATE only — INSERT cannot
+  -- have prior children. If this row already has children AND its
+  -- cohort_id is changing, refuse: the children's cohort_id would no
+  -- longer match (and the section-side trigger doesn't fire on them
+  -- because we're updating the parent, not the children).
+  if tg_op = 'UPDATE' and old.cohort_id <> new.cohort_id then
+    select count(*) into v_orphan_count
+      from public.notes
+      where parent_note_id = new.id;
+    if v_orphan_count > 0 then
+      raise exception 'section_note_parent_cohort_mutation: id=%, child_count=%, old_cohort=%, new_cohort=%',
+        new.id, v_orphan_count, old.cohort_id, new.cohort_id;
+    end if;
+  end if;
+
+  -- Root documents (no parent) skip the section-side checks.
   if new.parent_note_id is null then
     return new;
   end if;
 
-  -- Self-parent prevents trivially-circular hierarchy.
+  -- (c) Self-parent (also enforced by notes_no_self_parent CHECK).
   if new.parent_note_id = new.id then
     raise exception 'section_note_self_parent: id=%', new.id;
   end if;
 
+  -- (a) Section-side check.
   select cohort_id into parent_cohort
     from public.notes
     where id = new.parent_note_id;
