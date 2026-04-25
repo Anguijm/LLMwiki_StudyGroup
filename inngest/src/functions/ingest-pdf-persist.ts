@@ -101,6 +101,15 @@ export function makeSlugCandidate(
   return base.length > 0 ? `${base}-${suffix}` : `-${suffix}`;
 }
 
+// Slug-collision retry pattern: 6-char hash → 12-char → full UUID.
+// Mirrors the single-note path (ingest-pdf.ts persist step). Council r5
+// [bugs] BLOCKER fold: previous version of this function let a 23505 on
+// notes_slug_key fail the whole job; the single-note path has retried
+// since v0. IDs are computed ONCE outside the loop because PostgreSQL
+// rolls back a failed RPC transaction completely, so re-using the same
+// IDs with new slugs is safe (no PK conflict from the earlier attempt).
+const SLUG_HASH_LENGTHS = [6, 12, 36] as const;
+
 export async function callInsertNoteWithSectionsRpc(
   deps: { supabase: SupabaseLike },
   args: SectionedPersistArgs,
@@ -114,63 +123,93 @@ export async function callInsertNoteWithSectionsRpc(
   // fallback (plan §"Open questions" #1 default: retain full body).
   const parentJoined = simplifications.filter((t) => t.length > 0).join('\n\n');
 
+  // IDs generated once outside the slug-collision retry loop.
   const parentId = (globalThis as { crypto?: { randomUUID(): string } }).crypto!.randomUUID();
-  const parent = {
-    id: parentId,
-    slug: makeSlugCandidate(title, parentId, 6),
-    title: sanitizeNoteTitle(title),
-    body_md: parentJoined,
-    tier: 'active' as const,
-    author_id: ownerId,
-    cohort_id: cohortId,
-    embedding: null as number[] | null,
-    source_ingestion_id: jobId,
-  };
+  const sectionIds = sections.map(
+    () => (globalThis as { crypto?: { randomUUID(): string } }).crypto!.randomUUID(),
+  );
 
-  const sectionPayloads = sections.map((s, i) => {
-    const sectionId = (globalThis as { crypto?: { randomUUID(): string } }).crypto!.randomUUID();
-    const titleForSlug = s.title ?? `section-${i + 1}`;
-    return {
-      id: sectionId,
-      slug: makeSlugCandidate(titleForSlug, sectionId, 6),
-      title: sanitizeNoteTitle(s.title ?? `Section ${i + 1}`),
-      body_md: simplifications[i] ?? '',
+  const buildPayload = (hashLen: number) => {
+    const parent = {
+      id: parentId,
+      slug: makeSlugCandidate(title, parentId, hashLen),
+      title: sanitizeNoteTitle(title),
+      body_md: parentJoined,
       tier: 'active' as const,
       author_id: ownerId,
       cohort_id: cohortId,
-      embedding: embeddings[i] ?? null,
-      section_path: s.path,
+      embedding: null as number[] | null,
+      source_ingestion_id: jobId,
     };
-  });
+    const sectionPayloads = sections.map((s, i) => {
+      const sid = sectionIds[i]!;
+      const titleForSlug = s.title ?? `section-${i + 1}`;
+      return {
+        id: sid,
+        slug: makeSlugCandidate(titleForSlug, sid, hashLen),
+        title: sanitizeNoteTitle(s.title ?? `Section ${i + 1}`),
+        body_md: simplifications[i] ?? '',
+        tier: 'active' as const,
+        author_id: ownerId,
+        cohort_id: cohortId,
+        embedding: embeddings[i] ?? null,
+        section_path: s.path,
+      };
+    });
+    return { parent, sections: sectionPayloads };
+  };
 
-  const { data, error } = await supabase.rpc('insert_note_with_sections', {
-    parent,
-    sections: sectionPayloads,
-  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- supabase rpc result type is loose
+  let last: { data: any; error: { code?: string; message?: string } | null } = {
+    data: null,
+    error: null,
+  };
 
-  if (error) {
-    const errMsg = String(error.message ?? '');
+  for (const hashLen of SLUG_HASH_LENGTHS) {
+    const payload = buildPayload(hashLen);
+    last = await supabase.rpc('insert_note_with_sections', payload);
+    if (!last.error) break;
+
+    const code = last.error.code;
+    const msg = String(last.error.message ?? '');
+
     // Council r2 [bugs] TOCTOU fold: a concurrent runner already
     // persisted the hierarchy. The unique constraint on
     // source_ingestion_id catches the race; treat as a successful
-    // idempotency hit by reading the existing rows.
-    if (error.code === '23505' && errMsg.includes('source_ingestion_id')) {
+    // idempotency hit by reading the existing rows. Stop retrying.
+    if (code === '23505' && msg.includes('source_ingestion_id')) {
       return await findExistingHierarchy(supabase, jobId);
     }
+
+    // Council r5 [bugs] BLOCKER fold: slug collision — keep retrying
+    // with the next-longest hash. Continue the loop.
+    if (code === '23505' && msg.includes('notes_slug_key')) {
+      continue;
+    }
+
+    // Any other error class — bail out of the retry loop and let the
+    // post-loop error handler decide what to do with it.
+    break;
+  }
+
+  if (last.error) {
+    const code = last.error.code;
+    const msg = String(last.error.message ?? '');
+
     // Council r3 [bugs] error-surfacing fold: trigger violations
     // (section_note_cohort_mismatch + parent_cohort_mutation +
     // self_parent + missing parent) raise P0001. Surface as a
     // structured log with high-signal fields ONLY (no PII). Always
     // non-retryable: a deterministic data-shape failure won't recover
     // on retry.
-    if (error.code === 'P0001' && errMsg.includes('section_note')) {
-      const errorName = errMsg.split(':')[0]?.trim() ?? 'section_note_violation';
+    if (code === 'P0001' && msg.includes('section_note')) {
+      const errorName = msg.split(':')[0]?.trim() ?? 'section_note_violation';
       // eslint-disable-next-line no-console
       console.error('[ingest-pdf] persist trigger violation', {
         alert: true,
         tier: 'ingest_pdf_persist',
         errorName,
-        errorCode: error.code,
+        errorCode: code,
         job_id: jobId,
         owner_id: ownerId,
         cohort_id: cohortId,
@@ -179,12 +218,33 @@ export async function callInsertNoteWithSectionsRpc(
         `persist trigger violation on job ${jobId}: ${errorName}`,
       );
     }
-    throw error;
+
+    // Slug collision survived all SLUG_HASH_LENGTHS attempts — this is
+    // astronomically unlikely (full-UUID hash collision), but surface
+    // as a structured error so an operator can investigate rather than
+    // letting an opaque 23505 bubble up.
+    if (code === '23505' && msg.includes('notes_slug_key')) {
+      // eslint-disable-next-line no-console
+      console.error('[ingest-pdf] slug-collision exhausted retries', {
+        alert: true,
+        tier: 'ingest_pdf_persist',
+        errorName: 'slug_collision_exhausted',
+        errorCode: code,
+        job_id: jobId,
+        owner_id: ownerId,
+        cohort_id: cohortId,
+      });
+      throw new NonRetriableError(
+        `slug collision on job ${jobId}: exhausted ${SLUG_HASH_LENGTHS.length} hash-length attempts`,
+      );
+    }
+
+    throw last.error;
   }
 
   // RPC returns `table (parent_id uuid, section_ids uuid[])`. PostgREST
   // surfaces this as a single object or an array of one — handle both.
-  const row = Array.isArray(data) ? data[0] : data;
+  const row = Array.isArray(last.data) ? last.data[0] : last.data;
   if (!row || !row.parent_id) {
     throw new Error('insert_note_with_sections returned no parent_id');
   }

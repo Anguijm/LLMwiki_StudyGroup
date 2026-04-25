@@ -184,6 +184,119 @@ describe('callInsertNoteWithSectionsRpc — happy path', () => {
   });
 });
 
+describe('callInsertNoteWithSectionsRpc — slug-collision retry (council r5 BLOCKER fold)', () => {
+  it('retries on 23505 notes_slug_key with longer hash and succeeds on second attempt', async () => {
+    const collisionErr = {
+      code: '23505',
+      message:
+        'duplicate key value violates unique constraint "notes_slug_key"',
+    };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce({ data: null, error: collisionErr })
+      .mockResolvedValueOnce({
+        data: { parent_id: 'p2', section_ids: ['s2'] },
+        error: null,
+      });
+    const result = await callInsertNoteWithSectionsRpc(
+      { supabase: { rpc } as never },
+      {
+        jobId: 'job-slug-1',
+        ownerId: 'o',
+        cohortId: 'c',
+        title: 'Doc',
+        sections: [mkSection({})],
+        simplifications: ['x'],
+        embeddings: [null],
+      },
+    );
+    expect(result.parentId).toBe('p2');
+    expect(rpc).toHaveBeenCalledTimes(2);
+    // Slugs in the second attempt should differ from the first
+    // (longer hash suffix); the IDs should be identical.
+    const firstCall = rpc.mock.calls[0]![1];
+    const secondCall = rpc.mock.calls[1]![1];
+    expect(firstCall.parent.id).toBe(secondCall.parent.id);
+    expect(firstCall.parent.slug).not.toBe(secondCall.parent.slug);
+    expect(firstCall.sections[0].id).toBe(secondCall.sections[0].id);
+    expect(firstCall.sections[0].slug).not.toBe(secondCall.sections[0].slug);
+  });
+
+  it('retries up to SLUG_HASH_LENGTHS.length attempts, then throws NonRetriableError', async () => {
+    const collisionErr = {
+      code: '23505',
+      message: 'duplicate key value violates unique constraint "notes_slug_key"',
+    };
+    const rpc = vi.fn().mockResolvedValue({ data: null, error: collisionErr });
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(
+        callInsertNoteWithSectionsRpc(
+          { supabase: { rpc } as never },
+          {
+            jobId: 'job-slug-2',
+            ownerId: 'o',
+            cohortId: 'c',
+            title: 'Doc',
+            sections: [mkSection({})],
+            simplifications: ['x'],
+            embeddings: [null],
+          },
+        ),
+      ).rejects.toBeInstanceOf(NonRetriableError);
+      expect(rpc).toHaveBeenCalledTimes(3); // 6 → 12 → 36
+      // Structured log emitted with no PII fields.
+      expect(consoleErrorSpy).toHaveBeenCalledOnce();
+      const [, ctx] = consoleErrorSpy.mock.calls[0]!;
+      expect(ctx).toMatchObject({
+        alert: true,
+        errorName: 'slug_collision_exhausted',
+        job_id: 'job-slug-2',
+      });
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  it('does NOT retry slug-collision when the 23505 is on source_ingestion_id (idempotency hit)', async () => {
+    // Mixed mock: first call fires 23505 on source_ingestion_id which
+    // should short-circuit to findExistingHierarchy, NOT retry slugs.
+    const idempotencyErr = {
+      code: '23505',
+      message: 'duplicate key value violates unique constraint on source_ingestion_id',
+    };
+    const eqSingle = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { id: 'parent-id' }, error: null });
+    const eqList = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: 's1' }], error: null });
+    const from = vi.fn(() => ({
+      select: () => ({
+        eq: (col: string) =>
+          col === 'source_ingestion_id'
+            ? { single: eqSingle }
+            : eqList(),
+      }),
+    }));
+    const rpc = vi.fn().mockResolvedValue({ data: null, error: idempotencyErr });
+    const result = await callInsertNoteWithSectionsRpc(
+      { supabase: { rpc, from } as never },
+      {
+        jobId: 'job-idem',
+        ownerId: 'o',
+        cohortId: 'c',
+        title: 'Doc',
+        sections: [mkSection({})],
+        simplifications: ['x'],
+        embeddings: [null],
+      },
+    );
+    expect(result.idempotencyHit).toBe(true);
+    expect(rpc).toHaveBeenCalledTimes(1); // no slug-retry attempts
+  });
+});
+
 describe('callInsertNoteWithSectionsRpc — idempotency (council r2 TOCTOU fold)', () => {
   it('treats 23505 on source_ingestion_id as a successful idempotency hit', async () => {
     // First call: RPC fails with unique-constraint violation.

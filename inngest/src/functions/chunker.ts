@@ -28,6 +28,13 @@ export const SECTION_TARGET_TOKENS = 30_000;  // 60% of Haiku 200k input
 export const MAX_SECTION_TOKENS = 50_000;     // hard per-section ceiling
 const CHARS_PER_TOKEN = 4;                    // conservative English estimate
 
+// Suffix appended to length-fallback continuation chunks when the
+// original section had a title. Exported (NOT inlined) per council r5
+// [a11y] non-negotiable: the chunker callsite (ingest-pdf.ts) can
+// substitute a localized string at runtime once an i18n layer exists.
+// v1: English only; the export is the externalization seam.
+export const CONTINUATION_SUFFIX = ' (cont.)';
+
 export interface Section {
   index: number;
   title: string | null;
@@ -177,7 +184,7 @@ function splitOversized(section: Section): Section[] {
         chunkIndex === 0
           ? section.title
           : section.title
-            ? `${section.title} (cont.)`
+            ? `${section.title}${CONTINUATION_SUFFIX}`
             : null,
       path: section.path,
       text,

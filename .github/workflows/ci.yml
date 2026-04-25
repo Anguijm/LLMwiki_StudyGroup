@@ -65,7 +65,40 @@ jobs:
         run: pnpm typecheck
 
       - name: Unit tests (vitest)
-        run: pnpm test
+        # Tee output for the silent-skip guardrail step that follows.
+        # set -o pipefail preserves pnpm's exit code through the pipe.
+        run: |
+          set -o pipefail
+          pnpm test 2>&1 | tee /tmp/vitest-output.log
+
+      - name: Verify expected test files were executed (council r5 [security] + #52)
+        # Asserts that specific test files appear in vitest's per-file
+        # output line. Catches the silent-skip class that bit PR #48
+        # (apps/web/app/review/actions.test.ts was missed by the include
+        # glob and 16 tests ran zero times). Issue #52 will replace this
+        # ad-hoc list with a generated manifest; until then this is the
+        # explicit allowlist for high-leverage suites.
+        run: |
+          EXPECTED=(
+            "ingest-pdf.test.ts"
+            "ingest-pdf-persist"
+            "chunker.test.ts"
+            "voyage.test.ts"
+            "flashcard-gen.test.ts"
+            "review/actions.test.ts"
+          )
+          missing=0
+          for name in "${EXPECTED[@]}"; do
+            if ! grep -q "$name" /tmp/vitest-output.log; then
+              echo "::error::Expected test file or module \"$name\" did not appear in vitest output (silently skipped?)"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ $missing -gt 0 ]; then
+            echo "::error::$missing expected test file(s) missing from vitest scope"
+            exit 1
+          fi
+          echo "All ${#EXPECTED[@]} expected test files were executed."
 
       - name: Prompt evals
         run: pnpm eval

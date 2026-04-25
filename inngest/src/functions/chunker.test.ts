@@ -4,6 +4,7 @@ import {
   MAX_SECTIONS,
   MAX_SECTION_TOKENS,
   SECTION_TARGET_TOKENS,
+  CONTINUATION_SUFFIX,
   TooManyChunksError,
   SectionTooLargeError,
 } from './chunker';
@@ -172,7 +173,11 @@ describe('chunker — caps + length fallback', () => {
     const sections = chunkParsed(mkPdf(blocks));
     expect(sections.length).toBeGreaterThan(1);
     expect(sections[0]?.title).toBe('Original Title');
-    expect(sections[1]?.title).toBe('Original Title (cont.)');
+    // Council r5 [a11y] fold: continuation suffix comes from the
+    // exported CONTINUATION_SUFFIX constant, not a hardcoded literal,
+    // so an i18n layer can substitute a localized string at runtime.
+    expect(sections[1]?.title).toBe(`Original Title${CONTINUATION_SUFFIX}`);
+    expect(CONTINUATION_SUFFIX).toBe(' (cont.)');
     // Path is preserved on continuation chunks.
     expect(sections[1]?.path).toEqual(['Original Title']);
   });
