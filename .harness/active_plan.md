@@ -7,7 +7,7 @@
 
 User-stated priority order at session close (2026-04-25):
 
-1. **#39 — semantic chunking** (highest leverage; v1 unlock for downstream handlers — flashcards, wiki-linking, gap-analysis all benefit from per-section notes vs. the current `MAX_BODY_CHARS` stopgap).
+1. **#39 — semantic chunking** (highest leverage; v1 unlock for downstream handlers — flashcards, wiki-linking, gap-analysis all benefit from per-section notes vs. the current `MAX_BODY_CHARS` stopgap). **NOTE: plan must explicitly address prompt injection** — chunked content reaches an LLM, so framing boundaries (e.g., the existing `<untrusted_content>` wrapping pattern from `packages/lib/ai/src/anthropic.ts`) must apply per chunk per `.harness/scripts/security_checklist.md`. Per PR #53 r1 security non-negotiable.
 2. **#52 — CI guardrail to prevent silently-skipped tests** (security infrastructure; PR #51 r3 security persona's strong-endorse follow-up; protects the §"Rebutting council findings" rule's "consistently passing test" requirement).
 3. **Deploy-readiness validation** (apply migrations `20260424000001` + `20260424000002` on the live Supabase project; `pnpm install` for `ts-fsrs@5.0.0`; manual end-to-end with a real PDF).
 
