@@ -79,9 +79,13 @@ jobs:
         # ad-hoc list with a generated manifest; until then this is the
         # explicit allowlist for high-leverage suites.
         run: |
+          # Test FILE names only (vitest's per-file output line). Source
+          # modules like ingest-pdf-persist.ts are covered by their
+          # adjacent *.test.ts file (ingest-pdf.test.ts in that case),
+          # so listing them here would always fail — they don't appear
+          # as standalone entries in vitest output.
           EXPECTED=(
             "ingest-pdf.test.ts"
-            "ingest-pdf-persist"
             "chunker.test.ts"
             "voyage.test.ts"
             "flashcard-gen.test.ts"

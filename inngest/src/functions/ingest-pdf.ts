@@ -306,6 +306,24 @@ export const ingestPdf = inngest.createFunction(
         );
       });
 
+      // Fan out per section. Each gets its own link + flashcards events.
+      // flashcard-gen idempotency keys on event.data.note_id, so each
+      // section fires once even on event double-delivery.
+      // Council r6 [bugs] fold: sendEvent runs BEFORE mark-completed so
+      // a sendEvent failure doesn't leave the job marked 'completed' with
+      // unfired downstream events (which would look like a successful
+      // ingest from the watchdog's perspective).
+      for (const sid of result.sectionIds) {
+        await step.sendEvent(`post-ingest-link-${sid}`, {
+          name: 'note.created.link',
+          data: { note_id: sid },
+        });
+        await step.sendEvent(`post-ingest-flashcards-${sid}`, {
+          name: 'note.created.flashcards',
+          data: { note_id: sid },
+        });
+      }
+
       await step.run('mark-completed', async () => {
         await supabase
           .from('ingestion_jobs')
@@ -317,20 +335,6 @@ export const ingestPdf = inngest.createFunction(
           count: 1 + result.sectionIds.length,
         });
       });
-
-      // Fan out per section. Each gets its own link + flashcards events.
-      // flashcard-gen idempotency keys on event.data.note_id, so each
-      // section fires once even on event double-delivery.
-      for (const sid of result.sectionIds) {
-        await step.sendEvent(`post-ingest-link-${sid}`, {
-          name: 'note.created.link',
-          data: { note_id: sid },
-        });
-        await step.sendEvent(`post-ingest-flashcards-${sid}`, {
-          name: 'note.created.flashcards',
-          data: { note_id: sid },
-        });
-      }
 
       histogram('ingestion.upload.file_size_bytes', chunks.length, { job_id });
       return {
@@ -466,15 +470,9 @@ export const ingestPdf = inngest.createFunction(
       return attempt.data.id as string;
     });
 
-    await step.run('mark-completed', async () => {
-      await supabase
-        .from('ingestion_jobs')
-        .update({ status: 'completed' })
-        .eq('id', job_id);
-      counter('ingestion.jobs.completed', { job_id });
-      counter('notes.created.count', { user_id: owner_id });
-    });
-
+    // Council r6 [bugs] fold: same ordering as the sectioned path —
+    // mark-completed runs LAST so a sendEvent failure doesn't leave a
+    // job marked 'completed' with unfired downstream events.
     await step.sendEvent('post-ingest-link', {
       name: 'note.created.link',
       data: { note_id: noteId },
@@ -482,6 +480,15 @@ export const ingestPdf = inngest.createFunction(
     await step.sendEvent('post-ingest-flashcards', {
       name: 'note.created.flashcards',
       data: { note_id: noteId },
+    });
+
+    await step.run('mark-completed', async () => {
+      await supabase
+        .from('ingestion_jobs')
+        .update({ status: 'completed' })
+        .eq('id', job_id);
+      counter('ingestion.jobs.completed', { job_id });
+      counter('notes.created.count', { user_id: owner_id });
     });
 
     histogram('ingestion.upload.file_size_bytes', chunks.length, { job_id });
