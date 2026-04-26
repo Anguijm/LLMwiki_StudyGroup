@@ -26,9 +26,13 @@ alter table public.notes
 -- and surfaces the violation with a clearer error class.
 do $$
 begin
+  -- Lookup keyed by both conname AND conrelid so the guard remains
+  -- accurate if some other table ever has a same-named constraint
+  -- (postgres-expert review polish #5).
   if not exists (
     select 1 from pg_constraint
     where conname = 'notes_no_self_parent'
+      and conrelid = 'public.notes'::regclass
   ) then
     alter table public.notes
       add constraint notes_no_self_parent
@@ -75,7 +79,11 @@ begin
   -- cohort_id is changing, refuse: the children's cohort_id would no
   -- longer match (and the section-side trigger doesn't fire on them
   -- because we're updating the parent, not the children).
-  if tg_op = 'UPDATE' and old.cohort_id <> new.cohort_id then
+  -- IS DISTINCT FROM (instead of <>) is NULL-safe — cohort_id is
+  -- NOT NULL today (initial_schema.sql:89) but the safer comparison
+  -- is cheap insurance against a future ALTER. Postgres-expert review
+  -- polish #3.
+  if tg_op = 'UPDATE' and old.cohort_id is distinct from new.cohort_id then
     select count(*) into v_orphan_count
       from public.notes
       where parent_note_id = new.id;
