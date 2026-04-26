@@ -65,7 +65,44 @@ jobs:
         run: pnpm typecheck
 
       - name: Unit tests (vitest)
-        run: pnpm test
+        # Tee output for the silent-skip guardrail step that follows.
+        # set -o pipefail preserves pnpm's exit code through the pipe.
+        run: |
+          set -o pipefail
+          pnpm test 2>&1 | tee /tmp/vitest-output.log
+
+      - name: Verify expected test files were executed (council r5 [security] + #52)
+        # Asserts that specific test files appear in vitest's per-file
+        # output line. Catches the silent-skip class that bit PR #48
+        # (apps/web/app/review/actions.test.ts was missed by the include
+        # glob and 16 tests ran zero times). Issue #52 will replace this
+        # ad-hoc list with a generated manifest; until then this is the
+        # explicit allowlist for high-leverage suites.
+        run: |
+          # Test FILE names only (vitest's per-file output line). Source
+          # modules like ingest-pdf-persist.ts are covered by their
+          # adjacent *.test.ts file (ingest-pdf.test.ts in that case),
+          # so listing them here would always fail — they don't appear
+          # as standalone entries in vitest output.
+          EXPECTED=(
+            "ingest-pdf.test.ts"
+            "chunker.test.ts"
+            "voyage.test.ts"
+            "flashcard-gen.test.ts"
+            "review/actions.test.ts"
+          )
+          missing=0
+          for name in "${EXPECTED[@]}"; do
+            if ! grep -q "$name" /tmp/vitest-output.log; then
+              echo "::error::Expected test file or module \"$name\" did not appear in vitest output (silently skipped?)"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ $missing -gt 0 ]; then
+            echo "::error::$missing expected test file(s) missing from vitest scope"
+            exit 1
+          fi
+          echo "All ${#EXPECTED[@]} expected test files were executed."
 
       - name: Prompt evals
         run: pnpm eval
@@ -84,6 +121,15 @@ jobs:
     # changes. Kept running but non-blocking in CI so a fixture-setup bug
     # doesn't hold the whole PR; local runs catch real RLS regressions in
     # the meantime.
+    #
+    # PR #54 try-split investigation (2026-04-26): postgres-expert review
+    # diagnosed SQLSTATE 42601 on migration 4 as a supabase CLI statement-
+    # splitter quirk. Splitting file 4's GRANT into a separate file (see
+    # 20260426000003) advanced the failure past the splitter; next blocker
+    # was supabase_pooler (supavisor) container failing to bring up its
+    # ulimit on the runner. Both fixes ultimately deferred to a dedicated
+    # #7 PR — the work-effort vs progress-on-#39 tradeoff didn't justify
+    # iterating CI on this PR. See issue #7 for the diagnosis details.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

@@ -7,5 +7,5 @@ export {
   type ParsedPdf,
   type ParserKind,
 } from './pdfparser';
-export { AiResponseShapeError, AiRequestTimeoutError } from './errors';
+export { AiResponseShapeError, AiRequestTimeoutError, AiUpstreamError } from './errors';
 export { DEFAULT_TIMEOUT_MS } from './with-timeout';
