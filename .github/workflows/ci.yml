@@ -115,26 +115,30 @@ jobs:
   db-tests:
     runs-on: ubuntu-latest
     needs: [validate]
-    # Issue #7 — kept continue-on-error for one validation cycle while the
-    # CLI version pin (below) is verified. Postgres-expert review on PR #54
-    # diagnosed the recurring SQLSTATE 42601 ("cannot insert multiple
-    # commands into a prepared statement") as a supabase CLI statement-
-    # splitter regression on `version: latest`, NOT a SQL bug — file 4's
-    # `RETURNS TABLE (col …)` + `col := value; RETURN NEXT;` plpgsql
-    # pattern is uniquely affected. Pinning the CLI eliminates the
-    # latest-version-floats-and-regresses class. If db-tests goes green
-    # on the next run, the next push removes continue-on-error and makes
-    # this a real gate.
+    # v0 TODO (issue #7): flip to blocking once pgTAP fixtures run clean in
+    # CI. The suite is the canonical RLS / trigger / publication-lockfile
+    # gate and must pass locally (`supabase test db`) for schema-affecting
+    # changes. Kept running but non-blocking in CI so a fixture-setup bug
+    # doesn't hold the whole PR; local runs catch real RLS regressions in
+    # the meantime.
+    #
+    # PR #54 try-split investigation (2026-04-26): postgres-expert review
+    # diagnosed SQLSTATE 42601 on migration 4 as a supabase CLI statement-
+    # splitter quirk. Splitting file 4's GRANT into a separate file (see
+    # 20260426000003) advanced the failure past the splitter; next blocker
+    # was supabase_pooler (supavisor) container failing to bring up its
+    # ulimit on the runner. Both fixes ultimately deferred to a dedicated
+    # #7 PR — the work-effort vs progress-on-#39 tradeoff didn't justify
+    # iterating CI on this PR. See issue #7 for the diagnosis details.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      # Official Supabase CLI installer. Pinned to a known version
-      # (was: `latest`) per the postgres-expert review on PR #54 — a
-      # floating `latest` was tripping a splitter regression on
-      # multi-statement plpgsql bodies. Bump deliberately + verify.
+      # Official Supabase CLI installer — handles release-asset naming
+      # (the .deb filename embeds the version, so downloading via the
+      # generic /latest/download/... path yields a 404).
       - uses: supabase/setup-cli@v1
         with:
-          version: 1.219.2
+          version: latest
       - name: Start Supabase
         run: supabase start
       - name: Apply migrations

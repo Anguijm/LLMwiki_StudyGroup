@@ -36,11 +36,4 @@ begin
 end;
 $$;
 
--- GRANT moved to 20260426000003_atomic_null_reserved_tokens_grant.sql.
--- Postgres-expert review on PR #54 + try-split test for issue #7:
--- the supabase CLI's statement splitter (used by `supabase start`'s
--- embedded migration apply) was mishandling this file's CREATE
--- FUNCTION + GRANT combination, causing SQLSTATE 42601. Splitting the
--- file into single-statement files is the cheapest test of that
--- hypothesis. If db-tests goes green after this split, the same
--- pattern will be applied to files 5, 24-2, and 26-1.
+grant execute on function public.atomic_null_reserved_tokens(uuid) to service_role;
