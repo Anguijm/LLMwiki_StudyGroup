@@ -115,57 +115,64 @@ See the **Deploy runbook** section — every step is explicit, account-by-accoun
 
 ## Project Structure
 
+The repo is a pnpm workspace monorepo. The actual layout (current as of 2026-04-26):
+
 ```
 LLMwiki_StudyGroup/
-├── app/                           # Next.js App Router
-│   ├── api/
-│   │   ├── ingest/               # Multipart upload endpoint
-│   │   ├── notes/                # CRUD operations
-│   │   ├── search/               # Semantic search
-│   │   ├── reviews/              # SRS card generation
-│   │   ├── graph/                # Knowledge graph data
-│   │   └── webhooks/
-│   │       ├── discord/          # Receive discussion prompts
-│   │       └── inngest/          # Inngest event sink
-│   ├── (auth)/                   # Auth layout (Supabase magic links)
-│   ├── (dashboard)/
-│   │   ├── layout.tsx
-│   │   ├── page.tsx              # Main wiki view
-│   │   ├── notes/                # Note detail + edit
-│   │   ├── review/               # SRS session
-│   │   └── graph/                # Knowledge graph visualization
-│   └── page.tsx                  # Landing / login
-├── components/
-│   ├── Editor.tsx                # Markdown editor w/ real-time sync
-│   ├── NoteCard.tsx
-│   ├── KnowledgeGraph.tsx        # React Flow wrapper
-│   ├── ReviewSession.tsx         # SRS UI
-│   └── ...
-├── lib/
-│   ├── db.ts                     # Supabase client + typed queries
-│   ├── claude.ts                 # Wrapper for Opus/Haiku
-│   ├── embeddings.ts             # Voyage or OpenAI embeddings
-│   ├── inngest.ts                # Inngest client + event definitions
-│   ├── srs.ts                    # FSRS algorithm implementation
-│   └── auth.ts
-├── inngest/                      # Inngest function definitions
-│   ├── ingest.ts                 # Multi-modal ingestion pipeline
-│   ├── generate-links.ts         # Auto-link generation
-│   ├── gap-analysis.ts           # Weekly gap analysis + prompt generation
-│   ├── scheduled-review.ts       # SRS card scheduling
-│   └── ...
-├── public/                       # Static assets
+├── apps/
+│   └── web/                      # Next.js App Router app
+│       ├── app/                  # Routes: /auth, /review, /note/[slug], etc.
+│       ├── components/           # ReviewDeck, ErrorBoundary, etc.
+│       ├── lib/                  # supabase client wrappers, env, etc.
+│       └── tests/                # Playwright a11y suite
+├── inngest/
+│   └── src/
+│       ├── client.ts
+│       └── functions/            # ingest-pdf, chunker, ingest-pdf-persist,
+│                                 # flashcard-gen, on-failure (each with .test.ts)
+├── packages/
+│   ├── db/                       # Supabase client factories, sanitize, types
+│   ├── lib/
+│   │   ├── ai/                   # anthropic + voyage + pdfparser + errors + with-timeout
+│   │   ├── metrics/              # counter / histogram / withDuration / errorMetric
+│   │   ├── ratelimit/            # 5-tier limiters (A=ingest, B=token-budget,
+│   │   │                         # C=magic-link, D=auth-callback, E=rating)
+│   │   ├── srs/                  # FSRS scheduler wrapper (ts-fsrs v5)
+│   │   └── utils/                # env, structured logger
+│   └── prompts/                  # SIMPLIFIER_V1, FLASHCARD_GEN_V1, INGEST_PDF_V1
 ├── supabase/
-│   ├── migrations/               # SQL migration files
-│   └── config.toml
-├── .env.local                    # (git-ignored) Local secrets
-├── .env.example                  # Template for new developers
-├── next.config.ts
-├── tsconfig.json
-├── package.json
-├── tailwind.config.ts            # Styling
+│   ├── config.toml
+│   ├── migrations/               # SQL migrations (linear timestamp order)
+│   ├── tests/                    # pgTAP suites (rls, fn_review_card,
+│   │                             # notes_section_hierarchy, publications)
+│   └── seed.sql
+├── docs/
+│   ├── architecture/             # Pipeline + design notes
+│   └── security/                 # rate-limiter-audit.md, dependency-vetting.md
+├── .claude/
+│   └── agents/                   # postgres-expert subagent definition (project-scoped)
+├── .github/workflows/
+│   ├── ci.yml                    # validate + db-tests + a11y + council + watch
+│   ├── council.yml               # Multi-persona Gemini review on each PR push
+│   └── env-example-scrub.yml
+├── .harness/                     # Plan-first protocol scaffolding (see CLAUDE.md)
+│   ├── README.md
+│   ├── active_plan.md            # The current plan (overwritten per arc)
+│   ├── learnings.md              # Per-session KEEP/IMPROVE/INSIGHT/COUNCIL log
+│   ├── session_state.json
+│   ├── yolo_log.jsonl
+│   ├── council/                  # Persona definitions
+│   └── scripts/                  # council.py, security_checklist.md
+├── BACKLOG.md                    # Living priority tracker
+├── SESSION_HANDOFF.md            # "Start here next session" pointer
+├── CLAUDE.md                     # Operating manual for Claude Code sessions
+├── CONTRIBUTING.md
+├── package.json                  # Workspace root
+├── pnpm-workspace.yaml
 └── README.md
 ```
+
+The plan-first protocol scaffolding under `.harness/` is the operating layer: every non-trivial change writes a plan there, opens a PR for council review, and reflects per-session in `learnings.md`. See `CLAUDE.md` for the full protocol.
 
 ---
 
@@ -176,11 +183,11 @@ Users upload files via the web UI. The ingestion pipeline:
 1. Receives the file via Next.js API route
 2. Enqueues an Inngest job (async, durable)
 3. Parses the file (PDF → Reducto, video → yt-dlp + AssemblyAI, etc.)
-4. Summarizes with Claude (Haiku for individual chunks, Opus for final summary)
-5. Generates embeddings with Voyage-3
-6. Stores the Markdown in Supabase Storage
-7. Inserts metadata into Postgres
-8. Triggers automatic linking
+4. **Semantic chunking** (PR #54): splits the parse into per-section units (chapter/heading boundaries with length fallback). One section = one `notes` row with hierarchical `section_path`, persisted via the atomic `insert_note_with_sections` RPC. Single-section docs flow through the original single-row path unchanged for backwards compatibility.
+5. Summarizes each section with Claude Haiku (Opus reserved for complex reasoning later)
+6. Generates per-section embeddings with Voyage-3 (3-attempt exponential backoff on transient upstream)
+7. Stores the Markdown in `notes.body_md` (the parent retains the joined body; children carry per-section bodies for retrieval granularity)
+8. Triggers automatic linking + flashcard generation per section
 
 ### Knowledge Graph & Semantic Linking
 - Each note is embedded using `text-embedding-3-large` or Voyage-3
